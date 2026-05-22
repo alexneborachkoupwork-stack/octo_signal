@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+dist/
+.env
+exports/
+*.har
+prompts/
+doc/
+*.txt
+analyze_har.py
+detail_analysis.py
+check_*.py
+/data/__pycache__

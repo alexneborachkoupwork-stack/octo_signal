@@ -1,0 +1,19 @@
+name            = "octo-mail-recv"
+main            = "worker.js"
+compatibility_date = "2024-09-23"
+
+# KV namespace for inbox storage.
+# Create it once with:  wrangler kv namespace create MAIL_KV
+# Then paste the returned id below.
+[[kv_namespaces]]
+binding = "MAIL_KV"
+id      = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+# API_SECRET is a runtime secret — never put it here.
+# Set it with:  wrangler secret put API_SECRET
+# (Cloudflare will prompt you for the value.)
+
+# Optional: bind the worker to a custom subdomain instead of workers.dev.
+# [env.production.routes]
+# pattern = "mail-recv.yourdomain.com/*"
+# zone_name = "yourdomain.com"
