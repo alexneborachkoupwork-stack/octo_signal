@@ -606,13 +606,14 @@ async function F2_register(person, emailAcct) {
   _runLog.entry(`F2: person=${person.name} ${person.surname} email=${emailAcct.email}`);
   await sendTabCmd("cmd-register-open-form");
   _runLog.entry("F2: form opened");
-  await sendTabCmd("cmd-register-fill", {person, email: emailAcct.email});
+  const fillResult = await sendTabCmd("cmd-register-fill", {person, email: emailAcct.email});
+  if (fillResult?.status === "form_incomplete") throw new Error("F2: form_incomplete — AJAX fields not loaded");
   _runLog.entry("F2: form filled");
 
   // Arm BEFORE the submit loop — the server redirect to the token page can arrive
   // within milliseconds of the RGPD submit, before the loop exits and we could call
   // waitForPageReady.  If we armed it after, the page-ready signal would be lost.
-  const tokenPageReady = waitForPageReady(180000);
+  const tokenPageReady = waitForPageReady(360000);
 
   // 2-attempt retry is handled inside cmd-register-submit (_registerSubmit).
   _runLog.entry("F2: captcha submit (up to 2 attempts internally)");
@@ -693,9 +694,27 @@ async function F4_formFilling() {
     await sendTabCmd("cmd-fill-questionnaire").catch(() => {});
     ({state: fState} = await pageReady);
     if (fState === "form") break;
+    if (fState === "auth") break;  // server-side session expiry — handle below
     if (fState !== "questionnaire") throw new Error(`F4: expected form, got ${fState}`);
     // questionnaire page reloaded — retry
   }
+
+  if (fState === "auth") {
+    // Server redirected to auth mid-questionnaire (session expired within ~24s).
+    // Re-login once using stored credentials and retry questionnaire.
+    const {"register-person": creds} = await chrome.storage.local.get("register-person");
+    if (!creds?.username || !creds?.password)
+      throw new Error("F4: session expired, no stored credentials for re-login");
+    await F3_login({username: creds.username, password: creds.password});
+    pageReady = waitForPageReady(30000);
+    await sendTabCmd("cmd-go-questionnaire").catch(() => {});
+    const {state: qState2} = await pageReady;
+    if (qState2 !== "questionnaire") throw new Error(`F4: after re-login, expected questionnaire, got ${qState2}`);
+    pageReady = waitForPageReady(90000);
+    await sendTabCmd("cmd-fill-questionnaire").catch(() => {});
+    ({state: fState} = await pageReady);
+  }
+
   if (fState !== "form") throw new Error(`F4: questionnaire never reached form after retries`);
 
   pageReady = waitForPageReady(90000);

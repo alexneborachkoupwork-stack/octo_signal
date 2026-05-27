@@ -506,6 +506,14 @@ async function _refillMissing(missing, person, email) {
 }
 
 async function fillRegisterForm(person, email) {
+  // Wait for AJAX-loaded fields before touching anything (slow proxies load skeleton
+  // first, then inject fields after a network round-trip).
+  const nameField = await waitFor(() => document.querySelector("#name"), 15000);
+  if (!nameField) {
+    console.warn("[OctoProbe] Registration form fields did not load (form_incomplete)");
+    return false;
+  }
+
   // Field order mirrors natural reading / tab order; inter-field pauses are randomised.
   const textFields = [
     ["#name",        person.name],
@@ -1029,7 +1037,7 @@ async function visaStepGoToQuestionnaire() {
   if (document.readyState !== "complete") {
     await waitFor(() => document.readyState === "complete" ? true : null, 15000, 200);
   }
-  await sleep(1500 + Math.random() * 500); // dwell after window.onload scripts finish
+  await sleep(3000 + Math.random() * 1000); // dwell after window.onload scripts finish
 
   // Prefer clicking the nav link (most natural interaction for logged-in users).
   const navLink = document.querySelector("a[href*='Questionario']");
@@ -1076,7 +1084,7 @@ async function visaStepQuestionnaire() {
 
   // Wait for #questForm (the questionnaire form) to be present.
   // The form is injected via AJAX after DOMContentLoaded — can take 15+ s.
-  const questForm = await waitFor(() => document.querySelector("#questForm"), 60000);
+  const questForm = await waitFor(() => document.querySelector("#questForm"), 90000);
   if (!questForm) {
     // Form never appeared — session may be invalid even though URL is /Questionario.
     // Navigate to auth so the dispatch loop re-runs login from scratch.
@@ -1477,7 +1485,8 @@ async function visaStepSchedule() {
 
   const scheduleAction = document.querySelector("[data-sitekey][data-action]")?.dataset?.action
                       ?? document.querySelector("[data-action]")?.dataset?.action
-                      ?? null;
+                      ?? "SCHEDULE_EVISA";
+  console.log("[OctoProbe] Schedule captcha: action=" + scheduleAction);
   const result = await sendBgMessage({
     type: "solve-recaptcha-api",
     pageUrl: location.href,
@@ -1489,9 +1498,11 @@ async function visaStepSchedule() {
     return;
   }
   const elapsed = Date.now() - solveStart;
-  if (elapsed < 8000) await sleep(8000 - elapsed);
+  console.log("[OctoProbe] Schedule captcha: solved in " + elapsed + "ms");
+  if (elapsed < 12000) await sleep(12000 - elapsed);
   const captchaToken = result.token;
-  await sendBgMessage({type: "inject-recaptcha-token", token: captchaToken}).catch(() => null);
+  // Do NOT inject-recaptcha-token — that fires the page's own callback which also
+  // POSTs to /slots, consuming the token before our direct fetch can use it.
 
   // Fetch slots directly (bypasses window.data MAIN world issue).
   setBadge("Visa: fetching slots…", "#9060cc");
@@ -1512,20 +1523,25 @@ async function visaStepSchedule() {
 
   console.log("[OctoProbe] Slots response:", JSON.stringify(slotsData).slice(0, 500));
 
+  // Server wraps slot data as {"data": {<date>: [periods]}} — unwrap before use.
+  const rawSlots = (slotsData && typeof slotsData === "object" && !Array.isArray(slotsData) && slotsData.data !== undefined)
+    ? slotsData.data
+    : slotsData;
+
   // Inject window.data so MAIN world functions (ajaxFunctionPeriodos) work.
-  await _callPageFn(`window.data = ${JSON.stringify(slotsData)};`);
+  await _callPageFn(`window.data = ${JSON.stringify(rawSlots)};`);
 
   // Parse available dates and pick earliest valid slot.
-  // Server returns [{date: "YYYY-MM-DD", periods: [...]}, ...] (dashes).
-  // Normalise all entries to "YYYY/MM/DD" (slashes) for internal use.
+  // Server returns {"YYYY-MM-DD": [periods], ...} (dashes) inside the data wrapper.
+  // Normalise all keys to "YYYY/MM/DD" (slashes) for internal use.
   let availableDates = [];
-  if (Array.isArray(slotsData)) {
-    availableDates = slotsData.map(d => {
+  if (Array.isArray(rawSlots)) {
+    availableDates = rawSlots.map(d => {
       const raw = typeof d === "string" ? d : (d?.date ?? "");
       return raw.replace(/-/g, "/");
     }).filter(Boolean);
-  } else if (slotsData && typeof slotsData === "object") {
-    availableDates = Object.keys(slotsData).map(k => k.replace(/-/g, "/"));
+  } else if (rawSlots && typeof rawSlots === "object") {
+    availableDates = Object.keys(rawSlots).map(k => k.replace(/-/g, "/"));
   }
 
   const today = new Date();
@@ -1590,6 +1606,8 @@ async function visaStepSchedule() {
         var form = document.vistoForm || document.querySelector("form");
         if(!form) { window.postMessage({type:"octo-pdf-error",error:"no form"},"*"); return; }
         var data = new FormData(form);
+        data.set("g-recaptcha-response", "${captchaToken}");
+        data.set("captcha", "${captchaToken}");
         var body = new URLSearchParams(data).toString();
         try {
           var resp = await fetch("/VistosOnline/SubmeterVistoCriaPDF?posto_id=${POSTO}", {
@@ -2025,7 +2043,8 @@ const _CMD_HANDLERS = {
   "cmd-register-open-form": async ()    => _registerOpenForm(),
   "cmd-register-fill":      async (msg) => {
     setBadge("Register: filling form…", "#f0c040");
-    await fillRegisterForm(msg.person, msg.email);
+    const filled = await fillRegisterForm(msg.person, msg.email);
+    if (filled === false) return {ok: false, status: "form_incomplete"};
     return {ok: true};
   },
   "cmd-register-submit":    async ()    => _registerSubmit(),
