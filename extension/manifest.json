@@ -1,10 +1,10 @@
 {
   "manifest_version": 3,
   "name": "Octo Probe",
-  "version": "2.0.2",
+  "version": "3.0.0",
   "description": "Runs login and registration workflows on the E-VISA site inside an Octo Browser profile.",
 
-  "permissions": ["storage", "activeTab", "scripting", "tabs", "downloads"],
+  "permissions": ["storage", "activeTab", "scripting", "tabs", "downloads", "alarms"],
   "host_permissions": ["<all_urls>"],
 
   "background": {
@@ -12,6 +12,12 @@
   },
 
   "content_scripts": [
+    {
+      "matches": ["*://pedidodevistos.mne.gov.pt/*"],
+      "js": ["antidetect.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
     {
       "matches": ["<all_urls>"],
       "js": ["content.js"],

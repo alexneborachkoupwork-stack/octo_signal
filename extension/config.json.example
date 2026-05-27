@@ -1,0 +1,6 @@
+{
+  "managerWsUrl": "ws://localhost:9000",
+  "cfMailDomain": "",
+  "cfWorkerUrl": "",
+  "cfWorkerSecret": ""
+}

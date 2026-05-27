@@ -74,44 +74,20 @@
     <button id="btn-register">Register (auto)</button>
   </div>
 
-  <div style="margin-top:6px">
-    <label style="margin:0 0 2px">Idle Warmup</label>
-    <div class="toggle-pair">
-      <button id="btn-warmup-on">On</button>
-      <button id="btn-warmup-off" class="active">Off</button>
-    </div>
-  </div>
-
-  <div style="margin-top:6px">
-    <label style="margin:0 0 2px">After Register</label>
-    <div class="toggle-pair">
-      <button id="btn-chain-none" class="active">Save only</button>
-      <button id="btn-chain-visa">&#x2192; Login + Visa</button>
-    </div>
-  </div>
-
   <p id="status"></p>
 
   <hr />
 
-  <label>reCAPTCHA Mode</label>
-  <div class="toggle-pair">
-    <button id="btn-human">Human</button>
-    <button id="btn-api" class="active">API</button>
-  </div>
-
-  <div id="api-opts" style="display:none">
-    <label for="sel-solver" style="margin-top:8px">Solver</label>
-    <select id="sel-solver" class="dark">
-      <option value="capsolver">CapSolver</option>
-      <option value="anti-captcha">Anti-Captcha</option>
-      <option value="capmonster">CapMonster</option>
-      <option value="2captcha">2Captcha</option>
-    </select>
-    <div class="chk-row">
-      <input type="checkbox" id="chk-parallel" />
-      <span>Parallel mode (race all solvers)</span>
-    </div>
+  <label for="sel-solver">reCAPTCHA Solver</label>
+  <select id="sel-solver" class="dark">
+    <option value="capsolver">CapSolver</option>
+    <option value="anti-captcha">Anti-Captcha</option>
+    <option value="capmonster">CapMonster</option>
+    <option value="2captcha">2Captcha</option>
+  </select>
+  <div class="chk-row">
+    <input type="checkbox" id="chk-parallel" />
+    <span>Parallel mode (race all solvers)</span>
   </div>
 
   <hr />
@@ -120,15 +96,6 @@
   <div class="toggle-pair">
     <button id="btn-email-mailtm" class="active">mail.tm</button>
     <button id="btn-email-cf">Cloudflare</button>
-  </div>
-
-  <div id="cf-opts" style="display:none;margin-top:8px">
-    <label for="cf-domain">Email Domain</label>
-    <input id="cf-domain" type="text" placeholder="mail.yourdomain.com" autocomplete="off" />
-    <label for="cf-worker">Worker URL</label>
-    <input id="cf-worker" type="text" placeholder="https://octo-mail-recv.yourname.workers.dev" autocomplete="off" />
-    <label for="cf-secret">API Secret</label>
-    <input id="cf-secret" type="password" placeholder="your-api-secret" autocomplete="off" />
   </div>
 
   <hr />
@@ -168,23 +135,8 @@
       <option value="M">M — Male</option>
     </select>
 
-    <label for="rp-nationality">Nationality</label>
-    <input id="rp-nationality" type="text" placeholder="CABO-VERDIANA" autocomplete="off" />
-
     <label for="rp-traveldoc">Passport / Travel Doc</label>
     <input id="rp-traveldoc" type="text" placeholder="PA551574" autocomplete="off" />
-
-    <label for="rp-surname-birth">Surname(s) at Birth</label>
-    <input id="rp-surname-birth" type="text" placeholder="BRITO SOARES" autocomplete="off" />
-
-    <label for="rp-place-birth">Place of Birth (city)</label>
-    <input id="rp-place-birth" type="text" placeholder="PRAIA" autocomplete="off" />
-
-    <label for="rp-passport-issue">Passport Issue Date (yyyy/mm/dd)</label>
-    <input id="rp-passport-issue" type="text" placeholder="2020/03/15" autocomplete="off" />
-
-    <label for="rp-passport-expiry">Passport Valid Until (yyyy/mm/dd)</label>
-    <input id="rp-passport-expiry" type="text" placeholder="2030/03/14" autocomplete="off" />
 
     <div class="row" style="margin-top:10px">
       <button id="btn-reg-real" style="background:#2a1a4a;color:#d4a0ff;border:1px solid #9060cc;flex:2">Register</button>

@@ -1,7 +1,28 @@
 // Service worker — credential storage, workflow dispatch, mail.tm email polling.
 
-const TARGET_URL = "https://pedidodevistos.mne.gov.pt/VistosOnline/";
+importScripts('communication.js');
+
+// Load static config into storage so CF email settings are available without popup interaction.
+(async () => {
+  try {
+    const cfg = await fetch(chrome.runtime.getURL("config.json")).then(r => r.json());
+    const update = {};
+    if (cfg.cfMailDomain)   update["cf-mail-domain"]   = cfg.cfMailDomain;
+    if (cfg.cfWorkerUrl)    update["cf-worker-url"]    = cfg.cfWorkerUrl;
+    if (cfg.cfWorkerSecret) update["cf-worker-secret"] = cfg.cfWorkerSecret;
+    if (Object.keys(update).length) await chrome.storage.local.set(update);
+  } catch (e) {
+    console.warn("[OctoProbe] config.json CF load failed:", e);
+  }
+})();
+
+const TARGET_URL  = "https://pedidodevistos.mne.gov.pt/VistosOnline/";
+const TARGET_HOST = new URL(TARGET_URL).hostname;
 const MAILTM    = "https://api.mail.tm";
+
+// In-memory active tab ID; persisted to storage for SW restart survival.
+let _activeTabId = null;
+chrome.storage.local.get("active-tab-id").then(d => { if (d["active-tab-id"]) _activeTabId = d["active-tab-id"]; });
 
 // ---------------------------------------------------------------------------
 // Fake person generator (JS port of data/person.py)
@@ -11,7 +32,7 @@ const _FIRST = ["Ana","Maria","João","Carlos","Pedro","Sofia","Luísa","Miguel"
                  "Sara","Rui","Inês","Tiago","Beatriz","André","Catarina","Nuno","Mariana","Diogo"];
 const _LAST  = ["Silva","Santos","Oliveira","Costa","Ferreira","Pereira","Rodrigues","Alves",
                  "Martins","Carvalho","Gomes","Lopes","Sousa","Marques","Mendes","Correia"];
-const _NAT   = ["BRA","IND","CHN","MOZ","ANG","CPV","PHL","PAK","MAR","COL"];
+const _NAT   = ["CPV"];
 
 function _pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
 
@@ -87,9 +108,9 @@ function _parseDOB(raw) {
 function generatePerson() {
   const first = _pick(_FIRST);
   const last  = _pick(_LAST);
-  const uname = (first.slice(0,3) + last.slice(0,3) + (100 + _rand(9900))).toLowerCase()
+  const uname = (first.slice(0,3) + last.slice(0,3) + (1000000 + _rand(99000000))).toLowerCase()
                 .normalize("NFD").replace(/[̀-ͯ]/g,"");
-  const traveldoc = Array.from({length:16}, () => _rand(10)).join("");
+  const traveldoc = "PA" + Array.from({length:6}, () => _rand(10)).join("");
   return {
     name:        first,
     surname:     last,
@@ -140,6 +161,11 @@ async function _pollMailTM(jwt) {
   const r = await fetch(`${MAILTM}/messages`, {
     headers: {"Authorization": `Bearer ${jwt}`},
   });
+  if (r.status === 401) {
+    const err = new Error("mail.tm JWT expired (401)");
+    err.authExpired = true;
+    throw err;
+  }
   const d = await r.json();
   const items = d["hydra:member"] ?? [];
   if (!items.length) return null;
@@ -157,10 +183,11 @@ async function _createCloudflareMail() {
   const {"cf-mail-domain": domain} = await chrome.storage.local.get("cf-mail-domain");
   if (!domain) throw new Error("Cloudflare email domain not configured (cf-mail-domain)");
   const local = Math.random().toString(36).slice(2, 12);
-  return {email: `${local}@${domain}`, password: "", jwt: local};
+  const email = `${local}@${domain}`;
+  return {email, password: "", jwt: email};  // jwt = full address used as polling key
 }
 
-async function _pollCloudflare(localPart) {
+async function _pollCloudflare(fullEmail) {
   const {
     "cf-worker-url":    workerUrl,
     "cf-worker-secret": secret,
@@ -168,16 +195,13 @@ async function _pollCloudflare(localPart) {
 
   if (!workerUrl || !secret) throw new Error("Cloudflare Worker not configured");
 
-  const r = await fetch(`${workerUrl.replace(/\/$/, "")}/${localPart}`, {
-    headers: {"X-Secret": secret},
-  });
+  const url = `${workerUrl.replace(/\/$/, "")}?email=${encodeURIComponent(fullEmail)}`;
+  const r = await fetch(url, {headers: {"x-secret": secret}});
   if (!r.ok) throw new Error(`CF Worker error ${r.status}`);
 
-  const messages = await r.json();
-  if (!messages.length) return null;
-
-  // Return in the same shape _extractToken expects.
-  return {text: messages[0].text, html: ""};
+  const data = await r.json();
+  if (!data.found) return null;
+  return data;  // {found, linkToken, codeToken}
 }
 
 // ---- unified facade --------------------------------------------------------
@@ -216,6 +240,28 @@ function _extractToken(msg) {
 // ---------------------------------------------------------------------------
 // reCAPTCHA API solvers
 // ---------------------------------------------------------------------------
+
+const _SOLVER_URLS = {
+  "anti-captcha": "https://api.anti-captcha.com",
+  "2captcha":     "https://api.2captcha.com",
+  "capmonster":   "https://api.capmonster.cloud",
+  "capsolver":    "https://api.capsolver.com",
+};
+
+// All four services share the same getBalance request/response shape.
+// Returns null if the API is unreachable or returns an error — caller must not skip on null.
+async function _fetchBalance(baseUrl, apiKey) {
+  try {
+    const r = await fetch(`${baseUrl}/getBalance`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({clientKey: apiKey}),
+    });
+    const d = await r.json();
+    if (d.errorId === 0) return +(d.balance ?? 0);
+  } catch (_) {}
+  return null;
+}
 
 const _ANTICAPTCHA_KEYS = [
   "4b3f3ddf9569d07d3e66c47faa76f84b","f7772963b2e9974ee7e91c1da18e274f",
@@ -291,41 +337,68 @@ function _raceSolvers(pageUrl, siteKey, action) {
 }
 
 // ---------------------------------------------------------------------------
-// Tab helper — reuse an existing target tab rather than always opening a new one.
+// Tab helper + page-ready signaling
 // ---------------------------------------------------------------------------
 
 // Tear down any in-flight workflow completely before starting a new one.
-// Closes all target tabs, cancels email polling, and wipes workflow storage.
-// Awaiting this guarantees a clean slate regardless of how many times the
-// user clicked the button or what state a previous run left behind.
 async function _resetWorkflow() {
+  stopF6();
   clearInterval(_pollInterval);
   _pollInterval = null;
 
-  const {"active-tab-id": savedTabId} = await chrome.storage.local.get("active-tab-id");
+  const savedTabId = _activeTabId;
+  _activeTabId = null;
 
   await chrome.storage.local.remove([
     "workflow-type", "workflow-step",
     "register-person", "register-email",
-    "email-token", "emailPoll",
+    "email-token", "email-code-token", "emailPoll",
     "login-pending", "pending-account",
     "active-tab-id", "register-retried",
+    "warmup-idle-state",
   ]);
 
-  // Primary: close by stored tab ID (reliable — survives any URL change during workflow).
-  if (savedTabId) {
-    await chrome.tabs.remove(savedTabId).catch(() => {});
-  }
+  if (savedTabId) await chrome.tabs.remove(savedTabId).catch(() => {});
 
-  // Sweep: URL-based fallback catches tabs from crashed/untracked runs.
-  const targetHost = new URL(TARGET_URL).hostname;
-  const allTabs    = await chrome.tabs.query({});
+  // Sweep: close any stray target tabs.
+  const allTabs = await chrome.tabs.query({});
   const stragglers = allTabs.filter(t => {
-    try { return new URL(t.url ?? "").hostname === targetHost; } catch (_) { return false; }
+    try { return new URL(t.url ?? "").hostname === TARGET_HOST; } catch (_) { return false; }
   });
-  if (stragglers.length > 0) {
-    await chrome.tabs.remove(stragglers.map(t => t.id)).catch(() => {});
+  if (stragglers.length > 0) await chrome.tabs.remove(stragglers.map(t => t.id)).catch(() => {});
+}
+
+async function _getActiveTab() {
+  if (_activeTabId != null) {
+    try { await chrome.tabs.get(_activeTabId); return _activeTabId; } catch (_) {}
   }
+  const [found] = await chrome.tabs.query({url: `*://${TARGET_HOST}/*`});
+  if (found) { _activeTabId = found.id; }
+  else {
+    const tab = await chrome.tabs.create({url: TARGET_URL, active: true});
+    _activeTabId = tab.id;
+  }
+  await chrome.storage.local.set({"active-tab-id": _activeTabId});
+  return _activeTabId;
+}
+
+let _pageReadyResolve = null, _pageReadyReject = null, _pageReadyTimer = null;
+
+function waitForPageReady(timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    if (_pageReadyTimer) clearTimeout(_pageReadyTimer);
+    _pageReadyTimer = setTimeout(() => {
+      _pageReadyResolve = _pageReadyReject = null;
+      reject(new Error("page-ready timeout"));
+    }, timeoutMs);
+    _pageReadyResolve = (data) => { clearTimeout(_pageReadyTimer); _pageReadyResolve = _pageReadyReject = null; resolve(data); };
+    _pageReadyReject  = (err)  => { clearTimeout(_pageReadyTimer); _pageReadyResolve = _pageReadyReject = null; reject(err); };
+  });
+}
+
+async function sendTabCmd(type, params = {}) {
+  const tabId = await _getActiveTab();
+  return chrome.tabs.sendMessage(tabId, {type, ...params});
 }
 
 // ---------------------------------------------------------------------------
@@ -345,20 +418,375 @@ async function _doPollTick() {
       : await _pollMailTM(emailPoll.jwt);
     if (!msg) return;
 
-    const token = _extractToken(msg);
-    if (!token) return;
+    let linkToken, codeToken;
+    if (provider === "cloudflare") {
+      // CF worker returns codeToken (UUID form code) and linkToken (URL hex).
+      // Use codeToken as the primary token — it is the value the form expects.
+      // The linkToken URL hex is already in location.search on the token page.
+      codeToken = msg.codeToken ?? null;
+      linkToken  = codeToken ?? (msg.linkToken ?? null);  // fall back to linkToken only when no codeToken
+    } else {
+      linkToken = _extractToken(msg);
+      codeToken = null;
+    }
+    if (!linkToken && !codeToken) return;
 
     clearInterval(_pollInterval);
     _pollInterval = null;
     await chrome.storage.local.remove("emailPoll");
-    await chrome.storage.local.set({"email-token": token});
+    const storageUpdate = {};
+    if (linkToken) storageUpdate["email-token"]      = linkToken;
+    if (codeToken) storageUpdate["email-code-token"] = codeToken;
+    await chrome.storage.local.set(storageUpdate);
 
-    // Notify content script in the target tab
-    chrome.tabs.sendMessage(emailPoll.tabId, {type: "email-token", token})
-      .catch(() => {}); // tab may have navigated
+    // Notify content script — prefer codeToken (UUID) over linkToken (hex).
+    if (_activeTabId) chrome.tabs.sendMessage(_activeTabId, {type: "email-token", token: codeToken ?? linkToken}).catch(() => {});
   } catch (e) {
-    console.error("[OctoProbe BG] email poll error:", e);
+    if (e.authExpired) {
+      clearInterval(_pollInterval);
+      _pollInterval = null;
+      await chrome.storage.local.remove("emailPoll");
+      console.warn("[OctoProbe BG] mail.tm JWT expired — poll stopped");
+    } else {
+      console.error("[OctoProbe BG] email poll error:", e);
+    }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Email poll helpers (used by F2)
+// ---------------------------------------------------------------------------
+
+function _startEmailPoll(jwt) {
+  chrome.storage.local.set({emailPoll: {jwt}});
+  if (!_pollInterval) _pollInterval = setInterval(_doPollTick, 6000);
+}
+
+async function _waitForEmailCodeToken(maxMs = 120000) {
+  const deadline = Date.now() + maxMs;
+  while (Date.now() < deadline) {
+    const d = await chrome.storage.local.get(["email-code-token", "email-token"]);
+    if (d["email-code-token"]) return d["email-code-token"];
+    if (d["email-token"]) return d["email-token"];
+    await new Promise(r => setTimeout(r, 2000));
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// F1–F6 orchestration functions
+// ---------------------------------------------------------------------------
+
+async function F1_openAuthPage() {
+  let state;
+  try { ({state} = await sendTabCmd("cmd-get-state")); } catch (_) { state = "unknown"; }
+
+  if (state === "auth") return {ok: true, status: "ready"};
+
+  if (state !== "not-logged-in") {
+    // Set up listener BEFORE navigation so page-ready can't arrive before we're listening.
+    const pageReady = waitForPageReady(30000);
+    const tabId = await _getActiveTab();
+    await chrome.tabs.update(tabId, {url: TARGET_URL});
+    ({state} = await pageReady);
+  }
+
+  if (state === "auth") return {ok: true, status: "ready"};
+
+  // not-logged-in: language switch may navigate (if not already English); click login always navigates.
+  // Fire lang-switch without awaiting so we can arm the listener before the navigation fires.
+  const langCmd = sendTabCmd("cmd-switch-lang").catch(() => {});
+  const langReady = waitForPageReady(6000); // short timeout — no nav if already English
+  await langCmd;
+  await langReady.catch(() => {}); // ignore timeout = page was already English
+
+  // Login-link click always navigates — arm listener first.
+  const authReady = waitForPageReady(20000);
+  await sendTabCmd("cmd-click-login-link").catch(() => {});
+  const {state: authState} = await authReady;
+  if (authState !== "auth") throw new Error(`F1: expected auth, got ${authState}`);
+  return {ok: true, status: "ready"};
+}
+
+async function F2_register(person, emailAcct) {
+  await sendTabCmd("cmd-register-open-form");
+  await sendTabCmd("cmd-register-fill", {person, email: emailAcct.email});
+
+  // Arm BEFORE the submit loop — the server redirect to the token page can arrive
+  // within milliseconds of the RGPD submit, before the loop exits and we could call
+  // waitForPageReady.  If we armed it after, the page-ready signal would be lost.
+  const tokenPageReady = waitForPageReady(180000);
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const result = await sendTabCmd("cmd-register-submit").catch(() => ({ok: true, status: "navigated"}));
+    if (result.status === "navigated" || result.status === "submitted") break;
+    if (result.status !== "captcha_fail") throw new Error(`F2 register-submit: ${result.status}`);
+    if (attempt >= 2) throw new Error("F2: captcha failed after 3 attempts");
+    await new Promise(r => setTimeout(r, 4000));
+  }
+
+  _startEmailPoll(emailAcct.jwt);
+  await tokenPageReady; // wait for token page navigation
+
+  const codeToken = await _waitForEmailCodeToken(120000);
+  if (!codeToken) throw new Error("F2: email code token timeout");
+
+  // Write pending-account BEFORE submit click — page navigates on success,
+  // killing the content script; main() on the next page picks this up and saves the CSV.
+  await chrome.storage.local.set({
+    "pending-account": {
+      username:      person.username,
+      password:      person.password,
+      name:          person.name,
+      surname:       person.surname,
+      email:         emailAcct.email,
+      birth_date:    person.birth_date,
+      gender:        person.gender,
+      nationality:   person.nationality ?? "CPV",
+      traveldoc:     person.traveldoc,
+      registered_at: new Date().toISOString(),
+    }
+  });
+
+  await sendTabCmd("cmd-token-fill", {token: codeToken});
+  const verifyReady = waitForPageReady(30000); // arm before submit navigates
+  await sendTabCmd("cmd-token-submit").catch(() => {});
+  const {state: finalState} = await verifyReady;
+  return {ok: true, status: finalState === "auth" ? "verified" : finalState};
+}
+
+async function F3_login(creds) {
+  let state;
+  try { ({state} = await sendTabCmd("cmd-get-state")); } catch (_) { state = "unknown"; }
+  if (state === "logged-in") return {ok: true, status: "already-logged-in"};
+
+  await sendTabCmd("cmd-login-fill", creds);
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    // Port-closed error = tab navigated mid-command; wait briefly for new page-ready.
+    // Normal "navigated" return = _loginSubmit already waited 5s + session probe,
+    // new page is fully loaded — no additional wait needed.
+    const result = await sendTabCmd("cmd-login-submit").catch(async () => {
+      await waitForPageReady(15000).catch(() => {});
+      return {ok: true, status: "navigated"};
+    });
+    if (result.status === "logged-in" || result.status === "navigated") {
+      return {ok: true, status: "logged-in"};
+    }
+    if (result.status === "rejected") return {ok: false, status: "rejected"};
+    if (attempt < 2) await new Promise(r => setTimeout(r, 4000));
+  }
+  return {ok: false, status: "login_failed"};
+}
+
+async function F4_formFilling() {
+  // Arm each listener BEFORE the command that triggers navigation.
+  let pageReady = waitForPageReady(30000);
+  await sendTabCmd("cmd-go-questionnaire").catch(() => {});
+  const {state: qState} = await pageReady;
+  if (qState !== "questionnaire") throw new Error(`F4: expected questionnaire, got ${qState}`);
+
+  pageReady = waitForPageReady(60000);
+  await sendTabCmd("cmd-fill-questionnaire").catch(() => {});
+  const {state: fState} = await pageReady;
+  if (fState !== "form") throw new Error(`F4: expected form, got ${fState}`);
+
+  pageReady = waitForPageReady(90000);
+  await sendTabCmd("cmd-fill-form").catch(() => {});
+  const {state: sState} = await pageReady;
+  if (sState !== "schedule") throw new Error(`F4: expected schedule, got ${sState}`);
+
+  return {ok: true, status: "form-ready"};
+}
+
+async function F5_scheduling(config) {
+  return sendTabCmd("cmd-schedule", config).catch(e => ({ok: false, error: e.message}));
+}
+
+let _f6Interval = null;
+
+function F6_keepSession() {
+  if (_f6Interval) clearInterval(_f6Interval);
+  _f6Interval = setInterval(() => sendTabCmd("cmd-keep-tick").catch(() => {}), 30000);
+}
+
+function stopF6() {
+  if (_f6Interval) { clearInterval(_f6Interval); _f6Interval = null; }
+}
+
+async function F_warmup(config) {
+  stopF6();
+  await _resetWorkflow();
+  await chrome.storage.local.set({"warmup-idle-state": config.idleStep ?? "login"});
+
+  await F1_openAuthPage();
+  await F3_login({username: config.username, password: config.password});
+
+  const idleStep = config.idleStep ?? "login";
+
+  if (idleStep === "login") {
+    F6_keepSession();
+    return {ok: true, idleStep: "login"};
+  }
+
+  let pageReady = waitForPageReady(30000);
+  await sendTabCmd("cmd-go-questionnaire").catch(() => {});
+  const {state: qState} = await pageReady;
+  if (qState !== "questionnaire") throw new Error(`F_warmup: expected questionnaire, got ${qState}`);
+
+  pageReady = waitForPageReady(60000);
+  await sendTabCmd("cmd-fill-questionnaire").catch(() => {});
+  const {state: fState} = await pageReady;
+  if (fState !== "form") throw new Error(`F_warmup: expected form, got ${fState}`);
+
+  if (idleStep === "form") {
+    await sendTabCmd("cmd-fill-form-tabs").catch(() => {});
+    F6_keepSession();
+    return {ok: true, idleStep: "form"};
+  }
+
+  if (idleStep === "schedule") {
+    pageReady = waitForPageReady(90000);
+    await sendTabCmd("cmd-fill-form").catch(() => {});
+    const {state: sState} = await pageReady;
+    if (sState !== "schedule") throw new Error(`F_warmup: expected schedule, got ${sState}`);
+    F6_keepSession();
+    return {ok: true, idleStep: "schedule"};
+  }
+
+  throw new Error(`F_warmup: unknown idleStep "${idleStep}"`);
+}
+
+async function F_apply() {
+  stopF6();
+  const {"warmup-idle-state": idleState = "login"} =
+    await chrome.storage.local.get("warmup-idle-state");
+
+  if (idleState === "login") {
+    await F4_formFilling();
+    return F5_scheduling({});
+  }
+
+  if (idleState === "form") {
+    const pageReady = waitForPageReady(30000);
+    await sendTabCmd("cmd-submit-form").catch(() => {});
+    const {state: sState} = await pageReady;
+    if (sState !== "schedule") throw new Error(`F_apply: expected schedule, got ${sState}`);
+    return F5_scheduling({});
+  }
+
+  if (idleState === "schedule") {
+    return F5_scheduling({});
+  }
+
+  throw new Error(`F_apply: unknown idleState "${idleState}"`);
+}
+
+async function F_allInOne(config) {
+  stopF6();
+  await _resetWorkflow();
+
+  let person;
+  if (config.realPerson) {
+    const acct = generatePerson();
+    const rp   = config.realPerson;
+    const gRaw = String(rp.gender ?? "").trim().toUpperCase();
+    person = {
+      name:        String(rp.firstName ?? "").trim(),
+      surname:     String(rp.lastName  ?? "").trim(),
+      username:    acct.username,
+      password:    acct.password,
+      birth_date:  _parseDOB(rp.dob),
+      gender:      gRaw === "F" || gRaw === "FEMALE" || gRaw === "FEMININO" ? "F" : "M",
+      nationality: String(rp.nationality ?? "CPV").trim(),
+      traveldoc:   String(rp.traveldoc  ?? "").trim(),
+    };
+  } else {
+    person = generatePerson();
+  }
+
+  const emailAcct = await createTempEmail();
+  await chrome.storage.local.set({
+    "register-person":  person,
+    "register-email":   emailAcct,
+    "email-token":      null,
+    "email-code-token": null,
+  });
+
+  await F1_openAuthPage();
+  await F2_register(person, emailAcct);
+
+  await F1_openAuthPage();
+  await F3_login({username: person.username, password: person.password});
+
+  await F4_formFilling();
+  return F5_scheduling({});
+}
+
+// ---------------------------------------------------------------------------
+// Direct-call helpers — used by communication.js to avoid service-worker
+// self-messaging (chrome.runtime.sendMessage does not loop back to the same SW).
+// ---------------------------------------------------------------------------
+
+function _runCheckProxy() {
+  if (_activeTabId) chrome.tabs.sendMessage(_activeTabId, {type: "run-proxy-check"}).catch(() => {});
+}
+
+function _runDispatchAbort() {
+  stopF6();
+  if (_activeTabId) chrome.tabs.sendMessage(_activeTabId, {type: "abort"}).catch(() => {});
+}
+
+function _runCheckSolverBalances() {
+  const solverKeys = {
+    "anti-captcha": _pick(_ANTICAPTCHA_KEYS),
+    "2captcha":     _pick(_TWOCAPTCHA_KEYS),
+    "capmonster":   _pick(_CAPMONSTER_KEYS),
+    "capsolver":    _CAPSOLVER_KEY,
+  };
+  const balances = {};
+  Promise.all(Object.entries(_SOLVER_URLS).map(async ([name, url]) => {
+    balances[name] = await _fetchBalance(url, solverKeys[name]);
+  })).then(() => self.Comm?.send({type: "solver-balances", balances, ts: new Date().toISOString()}));
+}
+
+function _runRegister(realPerson) {
+  (async () => {
+    try {
+      stopF6();
+      await _resetWorkflow();
+      let person;
+      if (realPerson) {
+        const acct = generatePerson();
+        const gRaw = String(realPerson.gender ?? "").trim().toUpperCase();
+        person = {
+          name:        String(realPerson.firstName ?? "").trim(),
+          surname:     String(realPerson.lastName  ?? "").trim(),
+          username:    acct.username,
+          password:    acct.password,
+          birth_date:  _parseDOB(realPerson.dob),
+          gender:      gRaw === "F" || gRaw === "FEMALE" || gRaw === "FEMININO" ? "F" : "M",
+          nationality: String(realPerson.nationality ?? "").trim(),
+          traveldoc:   String(realPerson.traveldoc  ?? "").trim(),
+        };
+      } else {
+        person = generatePerson();
+      }
+      const emailAcct = await createTempEmail();
+      await chrome.storage.local.set({
+        "register-person":  person,
+        "register-email":   emailAcct,
+        "email-token":      null,
+        "email-code-token": null,
+      });
+      F1_openAuthPage()
+        .then(() => F2_register(person, emailAcct))
+        .then(r => self.Comm?.send({type: "register-done", ...r, email: emailAcct.email, username: person.username, password: person.password}))
+        .catch(e => self.Comm?.send({type: "error", reason: e.message}));
+    } catch(e) {
+      self.Comm?.send({type: "error", reason: String(e)});
+    }
+  })();
 }
 
 // ---------------------------------------------------------------------------
@@ -370,9 +798,28 @@ chrome.runtime.onInstalled.addListener(() => {
   console.log("[OctoProbe] Extension installed.");
 });
 
+// WS keepalive alarm — prevents service worker suspension while WS is open.
+chrome.alarms.create("ws-ping", {periodInMinutes: 0.4});
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === "ws-ping" && self.Comm?.isConnected()) {
+    self.Comm.send({type: "ping"});
+  }
+});
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
-  if (msg.type === "ping") {
+  if (msg.type === "page-ready") {
+    if (sender.tab?.id === _activeTabId) _pageReadyResolve?.({state: msg.state, url: msg.url});
+    sendResponse({ok: true});
+
+  } else if (msg.type === "comm-dispatch") {
+    // Route a popup or internal caller through the same command layer as the manager.
+    if (self.Comm) {
+      self.Comm.dispatch(msg.payload).catch(e => console.error("[OctoProbe BG] comm-dispatch error:", e));
+    }
+    sendResponse({ok: true});
+
+  } else if (msg.type === "ping") {
     sendResponse({type: "pong", version: chrome.runtime.getManifest().version});
 
   } else if (msg.type === "get-creds") {
@@ -387,87 +834,35 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     });
     return true;
 
-  } else if (msg.type === "go-to-site") {
-    (async () => {
-      await _resetWorkflow();
-      await chrome.storage.local.set({"workflow-type":"login","workflow-step":"home"});
-      const tab = await chrome.tabs.create({url: TARGET_URL});
-      await chrome.storage.local.set({"active-tab-id": tab.id});
-      sendResponse({ok: true});
-    })();
-    return true;
+  } else if (msg.type === "run-register") {
+    _runRegister(msg.realPerson);
+    sendResponse({ok: true});
 
-  } else if (msg.type === "go-visa") {
-    (async () => {
-      await _resetWorkflow();
-      await chrome.storage.local.set({"workflow-type": "visa"});
-      // Navigate directly to Questionario — if the session cookie is still valid the
-      // content script lands on the questionnaire immediately and skips login entirely.
-      // If the session has expired the server redirects to the auth page and the
-      // content script detects "auth" state and logs in from there.
-      const tab = await chrome.tabs.create({url: TARGET_URL + "Questionario"});
-      await chrome.storage.local.set({"active-tab-id": tab.id});
-      sendResponse({ok: true});
-    })();
-    return true;
-
-  } else if (msg.type === "start-register") {
-    (async () => {
-      try {
-        await _resetWorkflow();
-        let person;
-        if (msg.realPerson) {
-          // Real passport data from popup form — generate only account credentials.
-          const acct = generatePerson();
-          const rp   = msg.realPerson;
-          const gRaw = String(rp.gender ?? "").trim().toUpperCase();
-          person = {
-            name:        String(rp.firstName ?? "").trim(),
-            surname:     String(rp.lastName  ?? "").trim(),
-            username:    acct.username,
-            password:    acct.password,
-            birth_date:  _parseDOB(rp.dob),
-            gender:      gRaw === "F" || gRaw === "FEMALE" || gRaw === "FEMININO" ? "F" : "M",
-            nationality: String(rp.nationality ?? "").trim(),
-            traveldoc:   String(rp.traveldoc  ?? "").trim(),
-          };
-        } else {
-          person = generatePerson();
-        }
-        const emailAcct = await createTempEmail();
-        const {["warmup-enabled"]: warmupEnabled = false} =
-          await new Promise(r => chrome.storage.local.get("warmup-enabled", r));
-        await chrome.storage.local.set({
-          "workflow-type":     warmupEnabled ? "warmup"  : "register",
-          "workflow-step":     warmupEnabled ? null      : "home",
-          "warmup-end-time":   warmupEnabled ? Date.now() + 10 * 60 * 1000 : null,
-          "warmup-site-index": 0,
-          "register-person":   person,
-          "register-email":    emailAcct,
-          "email-token":       null,
-        });
-        const tab = await chrome.tabs.create({url: TARGET_URL});
-        await chrome.storage.local.set({"active-tab-id": tab.id});
-        sendResponse({ok: true, email: emailAcct.email, password: person.password, username: person.username});
-      } catch (e) {
-        sendResponse({ok: false, error: String(e)});
-      }
-    })();
+  } else if (msg.type === "run-F6") {
+    F6_keepSession();
+    sendResponse({ok: true});
     return true;
 
   } else if (msg.type === "start-email-poll") {
-    const tabId = sender.tab?.id;
-    const {jwt} = msg;
-    chrome.storage.local.set({emailPoll: {jwt, tabId}});
-    if (!_pollInterval) {
-      _pollInterval = setInterval(_doPollTick, 6000);
-    }
+    _startEmailPoll(msg.jwt);
     sendResponse({ok: true});
 
   } else if (msg.type === "stop-email-poll") {
     clearInterval(_pollInterval);
     _pollInterval = null;
     chrome.storage.local.remove("emailPoll");
+    sendResponse({ok: true});
+
+  } else if (msg.type === "sleep") {
+    setTimeout(() => sendResponse({ok: true}), msg.ms);
+    return true;
+
+  } else if (msg.type === "dispatch-proxy-check") {
+    _runCheckProxy();
+    sendResponse({ok: !!_activeTabId});
+
+  } else if (msg.type === "dispatch-abort") {
+    _runDispatchAbort();
     sendResponse({ok: true});
 
   } else if (msg.type === "save-account") {
@@ -501,7 +896,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   } else if (msg.type === "clear-workflow") {
     chrome.storage.local.remove([
-      "workflow-type","workflow-step","register-person","register-email","email-token","emailPoll"
+      "workflow-type","workflow-step","register-person","register-email","email-token","email-code-token","emailPoll","warmup-idle-state"
     ]);
     sendResponse({ok: true});
 
@@ -628,30 +1023,49 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           "captcha-parallel": parallel = false,
         } = await chrome.storage.local.get(["captcha-solver","captcha-parallel"]);
 
-        const solverFns = {
-          "anti-captcha": () => _solveACFormat("https://api.anti-captcha.com", _pick(_ANTICAPTCHA_KEYS), pageUrl, siteKey, action),
-          "2captcha":     () => _solveACFormat("https://api.2captcha.com",     _pick(_TWOCAPTCHA_KEYS),  pageUrl, siteKey, action),
-          "capmonster":   () => _solveACFormat("https://api.capmonster.cloud", _pick(_CAPMONSTER_KEYS),  pageUrl, siteKey, action),
-          "capsolver":    () => _solveCapSolver(pageUrl, siteKey, action),
-        };
         let token;
         if (parallel) {
           token = await _raceSolvers(pageUrl, siteKey, action);
         } else {
-          const primary = solverFns[solver] ? solver : "capsolver";
-          try {
-            token = await solverFns[primary]();
-          } catch(primaryErr) {
-            // Primary solver failed (e.g. CapSolver 1001 "Failed to solve") —
-            // race the remaining solvers as fallback rather than giving up.
-            console.warn(`[OctoProbe BG] Primary solver "${primary}" failed: ${primaryErr.message} — trying fallback`);
-            const fallbackFns = Object.entries(solverFns)
-              .filter(([k]) => k !== primary)
-              .map(([, fn]) => fn);
+          const primary = (solver in _SOLVER_URLS) ? solver : "capsolver";
+          // Pick key once — same key used for balance check and solve call.
+          const pickedKey = primary === "anti-captcha" ? _pick(_ANTICAPTCHA_KEYS)
+            : primary === "2captcha"   ? _pick(_TWOCAPTCHA_KEYS)
+            : primary === "capmonster" ? _pick(_CAPMONSTER_KEYS)
+            : _CAPSOLVER_KEY;
+
+          // Check primary solver balance; skip to fallbacks only on confirmed zero.
+          // null means the balance API was unreachable — proceed with primary anyway.
+          const bal = await _fetchBalance(_SOLVER_URLS[primary], pickedKey);
+          if (bal !== null) self.Comm?.send({type: "solver-balance", solver: primary, balance: bal, ts: new Date().toISOString()});
+          if (bal !== null && bal < 0.01) console.warn(`[OctoProbe BG] ${primary} balance $${bal.toFixed(4)} — skipping to fallbacks`);
+
+          let usePrimary = bal === null || bal >= 0.01;
+          if (usePrimary) {
+            try {
+              token = primary === "capsolver"
+                ? await _solveCapSolver(pageUrl, siteKey, action)
+                : await _solveACFormat(_SOLVER_URLS[primary], pickedKey, pageUrl, siteKey, action);
+            } catch (primaryErr) {
+              console.warn(`[OctoProbe BG] Primary solver "${primary}" failed: ${primaryErr.message} — trying fallback`);
+              usePrimary = false;
+            }
+          }
+
+          if (!usePrimary) {
+            // Race all remaining solvers as fallback.
+            const fallbackEntries = Object.entries(_SOLVER_URLS).filter(([k]) => k !== primary);
             token = await new Promise((resolve, reject) => {
-              let remaining = fallbackFns.length;
+              let remaining = fallbackEntries.length;
               let settled = false;
-              for (const fn of fallbackFns) {
+              for (const [k] of fallbackEntries) {
+                const fn = k === "capsolver"
+                  ? () => _solveCapSolver(pageUrl, siteKey, action)
+                  : () => _solveACFormat(_SOLVER_URLS[k],
+                      k === "anti-captcha" ? _pick(_ANTICAPTCHA_KEYS)
+                        : k === "2captcha" ? _pick(_TWOCAPTCHA_KEYS)
+                        : _pick(_CAPMONSTER_KEYS),
+                      pageUrl, siteKey, action);
                 fn().then(t => {
                   if (!settled && t) { settled = true; resolve(t); }
                 }).catch(() => {
@@ -787,6 +1201,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     .then(([r]) => sendResponse({ok: true, result: r?.result ?? null}))
     .catch(e => sendResponse({ok: false, error: String(e)}));
     return true;
+
+  } else if (msg.type === "ws-send") {
+    // Relay a message from content.js to the manager via WebSocket.
+    if (self.Comm) self.Comm.send(msg.data);
+    sendResponse({ok: true});
+
+  } else if (msg.type === "check-solver-balances") {
+    _runCheckSolverBalances();
+    sendResponse({ok: true});
 
   } else if (msg.type === "inject-recaptcha-watcher") {
     // Inject reCAPTCHA solve watcher into MAIN world via scripting API (bypasses CSP).

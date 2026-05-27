@@ -76,10 +76,40 @@ const TOKEN_SUBMIT_SELECTORS = [
 ];
 
 // ---------------------------------------------------------------------------
+// Error codes
+// ---------------------------------------------------------------------------
+
+const E = Object.freeze({
+  NETWORK_SLOW:        1,
+  REGISTER_IP_BLOCK:   2,
+  REGISTER_LINK:       3,
+  REGISTER_FORM:       4,
+  REGISTER_INCOMPLETE: 5,
+  REGISTER_WAF:        6,
+  REGISTER_CAPTCHA:    7,
+  LOGIN_FAILED:        8,
+  LOGIN_CAPTCHA:       9,
+  REGISTER_TOKEN:      10,
+  REGISTER_TOKEN_FORM: 11,
+  REGISTER_SAVE:       12,
+  VISA_FAILED:         13,
+});
+
+// ---------------------------------------------------------------------------
 // Utilities
 // ---------------------------------------------------------------------------
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+let _abortFlag = false;
+function sleep(ms) {
+  return new Promise((resolve, reject) => {
+    if (_abortFlag) { reject(new DOMException("Aborted", "AbortError")); return; }
+    chrome.runtime.sendMessage({type: "sleep", ms}, () => {
+      if (_abortFlag) reject(new DOMException("Aborted", "AbortError"));
+      else if (chrome.runtime.lastError) setTimeout(resolve, ms);
+      else resolve();
+    });
+  });
+}
 
 function isVisible(el) {
   if (!el) return false;
@@ -146,11 +176,22 @@ async function humanMoveTo(el) {
   const cp1y   = sy + (ty-sy)*0.33 + (Math.random()-.5)*spread;
   const cp2x   = sx + (tx-sx)*0.66 + (Math.random()-.5)*spread;
   const cp2y   = sy + (ty-sy)*0.66 + (Math.random()-.5)*spread;
+  let prevHover = document.elementFromPoint(sx, sy);
   for (let i = 0; i <= steps; i++) {
     const t  = i / steps;
     const cx = Math.round(_bezier(t, sx, cp1x, cp2x, tx));
     const cy = Math.round(_bezier(t, sy, cp1y, cp2y, ty));
-    document.dispatchEvent(new MouseEvent("mousemove", {bubbles: true, clientX: cx, clientY: cy}));
+    const under = document.elementFromPoint(cx, cy) ?? document.body;
+    if (under !== prevHover) {
+      if (prevHover) {
+        prevHover.dispatchEvent(new MouseEvent("mouseout",   {bubbles: true,  cancelable: true,  clientX: cx, clientY: cy, relatedTarget: under}));
+        prevHover.dispatchEvent(new MouseEvent("mouseleave", {bubbles: false, cancelable: false, clientX: cx, clientY: cy, relatedTarget: under}));
+      }
+      under.dispatchEvent(new MouseEvent("mouseover",  {bubbles: true,  cancelable: true,  clientX: cx, clientY: cy, relatedTarget: prevHover}));
+      under.dispatchEvent(new MouseEvent("mouseenter", {bubbles: false, cancelable: false, clientX: cx, clientY: cy, relatedTarget: prevHover}));
+      prevHover = under;
+    }
+    under.dispatchEvent(new MouseEvent("mousemove", {bubbles: true, cancelable: true, clientX: cx, clientY: cy}));
     window._mX = cx; window._mY = cy;
     await sleep(7 + Math.random() * 12);
   }
@@ -167,6 +208,11 @@ async function humanClick(el) {
   await sleep(30 + Math.random() * 60);
   el.dispatchEvent(new MouseEvent("mouseup",   opts));
   el.dispatchEvent(new MouseEvent("click",     opts));
+  const prev = document.activeElement;
+  if (prev && prev !== el && prev !== document.body && prev !== document.documentElement) {
+    prev.dispatchEvent(new FocusEvent("blur",     {bubbles: false, cancelable: false, relatedTarget: el}));
+    prev.dispatchEvent(new FocusEvent("focusout", {bubbles: true,  cancelable: false, relatedTarget: el}));
+  }
   el.focus();
 }
 
@@ -174,15 +220,25 @@ async function humanType(el, text) {
   await humanClick(el);
   await sleep(100 + Math.random() * 150);
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+  if (el.value) {
+    el.dispatchEvent(new KeyboardEvent("keydown", {key: "a", keyCode: 65, which: 65, ctrlKey: true, bubbles: true, cancelable: true}));
+    el.dispatchEvent(new KeyboardEvent("keyup",   {key: "a", keyCode: 65, which: 65, ctrlKey: true, bubbles: true, cancelable: true}));
+    await sleep(30 + Math.random() * 40);
+    if (setter) setter.call(el, ""); else el.value = "";
+    el.dispatchEvent(new InputEvent("input", {data: null, inputType: "deleteContentBackward", bubbles: true}));
+    await sleep(40 + Math.random() * 40);
+  }
   for (const ch of text) {
     // Base typing speed 60-180 ms; rare 7% chance of a longer pause (hesitation)
     const delay = 60 + Math.random() * 120 + (Math.random() < 0.07 ? 280 + Math.random() * 400 : 0);
     await sleep(delay);
-    el.dispatchEvent(new KeyboardEvent("keydown",  {key: ch, bubbles: true}));
+    const cc = ch.charCodeAt(0);
+    el.dispatchEvent(new KeyboardEvent("keydown",  {key: ch, keyCode: cc, which: cc, charCode: 0,  bubbles: true, cancelable: true}));
+    el.dispatchEvent(new KeyboardEvent("keypress", {key: ch, keyCode: cc, which: cc, charCode: cc, bubbles: true, cancelable: true}));
     const cur = el.value;
     if (setter) setter.call(el, cur + ch); else el.value = cur + ch;
     el.dispatchEvent(new InputEvent("input",  {data: ch, inputType: "insertText", bubbles: true}));
-    el.dispatchEvent(new KeyboardEvent("keyup", {key: ch, bubbles: true}));
+    el.dispatchEvent(new KeyboardEvent("keyup",    {key: ch, keyCode: cc, which: cc, charCode: 0,  bubbles: true, cancelable: true}));
   }
   await sleep(80 + Math.random() * 100);
   el.dispatchEvent(new Event("change", {bubbles: true}));
@@ -190,10 +246,66 @@ async function humanType(el, text) {
 
 async function humanSelect(el, value) {
   await humanClick(el);
-  await sleep(180 + Math.random() * 250);
-  el.value = value;
-  el.dispatchEvent(new Event("change", {bubbles: true}));
-  await sleep(80 + Math.random() * 120);
+
+  const opts      = Array.from(el.options ?? []);
+  const targetIdx = opts.findIndex(o => o.value === value);
+  const setter    = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")?.set;
+
+  function _setTo(v) {
+    if (setter) setter.call(el, v); else el.value = v;
+    el.dispatchEvent(new Event("input", {bubbles: true}));
+  }
+
+  if (targetIdx < 0) {
+    _setTo(value);
+    el.dispatchEvent(new Event("change",   {bubbles: true}));
+    el.dispatchEvent(new FocusEvent("blur",     {bubbles: false, cancelable: false}));
+    el.dispatchEvent(new FocusEvent("focusout", {bubbles: true,  cancelable: false}));
+    await sleep(80 + Math.random() * 80);
+    return;
+  }
+
+  const currentIdx = Math.max(0, opts.findIndex(o => o.value === el.value));
+  const delta      = targetIdx - currentIdx;
+  const absDelta   = Math.abs(delta);
+
+  // Eyes scanning visible options — longer pause when target is farther away.
+  await sleep(500 + Math.random() * (absDelta <= 5 ? 500 : 900));
+
+  if (absDelta > 0 && absDelta <= 5) {
+    // Close by: arrow-key navigation with realistic hold time.
+    const key     = delta > 0 ? "ArrowDown" : "ArrowUp";
+    const keyCode = delta > 0 ? 40 : 38;
+    for (let i = 0; i < absDelta; i++) {
+      el.dispatchEvent(new KeyboardEvent("keydown", {key, keyCode, which: keyCode, bubbles: true, cancelable: true}));
+      await sleep(120 + Math.random() * 130);
+      _setTo(opts[currentIdx + (delta > 0 ? i + 1 : -(i + 1))].value);
+      el.dispatchEvent(new KeyboardEvent("keyup",   {key, keyCode, which: keyCode, bubbles: true, cancelable: true}));
+      await sleep(220 + Math.random() * 200 + (i === 0 ? 120 : 0));
+    }
+  } else if (absDelta > 5) {
+    // Far away: type first 1–2 chars of option text to jump, like a real user.
+    const chars = opts[targetIdx].text.trim().slice(0, 2);
+    for (const ch of chars) {
+      const cc = ch.toUpperCase().charCodeAt(0);
+      el.dispatchEvent(new KeyboardEvent("keydown",  {key: ch, keyCode: cc, which: cc, bubbles: true, cancelable: true}));
+      el.dispatchEvent(new KeyboardEvent("keypress", {key: ch, keyCode: cc, which: cc, charCode: cc, bubbles: true, cancelable: true}));
+      await sleep(130 + Math.random() * 130);
+      el.dispatchEvent(new KeyboardEvent("keyup",    {key: ch, keyCode: cc, which: cc, bubbles: true, cancelable: true}));
+      await sleep(200 + Math.random() * 180);
+    }
+    _setTo(value);
+    await sleep(250 + Math.random() * 250);
+  }
+
+  // "I've found it" pause before committing.
+  await sleep(380 + Math.random() * 380);
+
+  // Commit: change + blur mirrors Tab or clicking away to close the dropdown.
+  el.dispatchEvent(new Event("change",   {bubbles: true}));
+  el.dispatchEvent(new FocusEvent("blur",     {bubbles: false, cancelable: false}));
+  el.dispatchEvent(new FocusEvent("focusout", {bubbles: true,  cancelable: false}));
+  await sleep(200 + Math.random() * 150);
 }
 
 function storageGet(keys) {
@@ -212,31 +324,8 @@ function sendBgMessage(msg) {
 // Badge
 // ---------------------------------------------------------------------------
 
-let badge = null;
-
-function injectBadge() {
-  badge = document.getElementById("octo-probe-badge");
-  if (badge) return;
-  badge = document.createElement("div");
-  badge.id = "octo-probe-badge";
-  Object.assign(badge.style, {
-    position: "fixed", top: "8px", right: "8px", zIndex: "2147483647",
-    background: "#1a1a2e", color: "#00d4aa",
-    font: "bold 11px monospace", padding: "4px 10px",
-    borderRadius: "4px", boxShadow: "0 2px 6px rgba(0,0,0,0.5)",
-    pointerEvents: "none", userSelect: "none",
-    letterSpacing: "0.5px", transition: "color 0.3s",
-  });
-  const _ver = chrome.runtime.getManifest().version;
-  setBadge(`Octo Probe v${_ver}`, "#00d4aa");
-  (document.body ?? document.documentElement).appendChild(badge);
-}
-
-function setBadge(text, color = "#00d4aa") {
-  if (!badge) return;
-  badge.textContent = text;
-  badge.style.color  = color;
-}
+function injectBadge() {}
+function setBadge() {}
 
 // ---------------------------------------------------------------------------
 // Shared: language switch
@@ -252,9 +341,8 @@ async function switchToEnglish() {
   if (langSel.value === "ENG") { console.log("[OctoProbe] Already English."); return; }
 
   setBadge("Switching to English…", "#f0c040");
-  langSel.value = "ENG";
-  langSel.dispatchEvent(new Event("change", {bubbles: true}));
-  await sleep(1500);
+  await humanSelect(langSel, "ENG");
+  await sleep(1200 + Math.random() * 600);
 }
 
 // ---------------------------------------------------------------------------
@@ -269,7 +357,7 @@ async function clickLoginLink() {
   );
   if (!el) { setBadge("Login button not found", "#ff6b6b"); return; }
   setBadge("Clicking Login…", "#f0c040");
-  el.click();
+  await humanClick(el);
 }
 
 // ---------------------------------------------------------------------------
@@ -285,203 +373,8 @@ const LOGIN_SUBMIT_SELECTORS = [
   ".btn-login",
 ];
 
-// Step 1 — home page: language switch + navigate to auth page.
-async function loginStepHome() {
-  setBadge("Login: language…", "#f0c040");
-  await switchToEnglish();
-  setBadge("Login: finding login button…", "#f0c040");
-  await clickLoginLink();
-  await storageSet({"workflow-step": "auth"});
-  // Page navigates; new content script instance picks up step "auth".
-}
-
-// Step 2 — auth page: fill credentials, solve reCAPTCHA, submit.
-//
-// Two-phase approach to beat the bd.js WAF challenge + reCAPTCHA 2-minute expiry race:
-//
-// Attempt 0 — real form POST with a dummy captchaResponse.
-//   bd.js fires (WAF layer, before app code), validates the browser, sets the challenge
-//   cookie, then replays the POST. The server rejects the dummy token and the browser
-//   lands on /VistosOnline/login. Dispatch detects /login, navigates back to auth.
-//   No real captcha credit is spent and the challenge cookie is now valid.
-//
-// Attempt 1+ — jQuery AJAX via humanClick (the site's own doLogin()).
-//   Challenge cookie already set → no bd.js → server processes the request directly.
-//   Page stays alive on failure so the next retry starts from captcha, not from scratch.
-//   Captcha is solved immediately before submit — no extra sleep — so the 2-min window
-//   is not wasted waiting for bd.js.
-async function loginStepAuth(creds) {
-  const net = await checkNetworkQuality();
-  if (!net.good) {
-    await _clearWorkflowFailed(`Network too slow (${net.avg}ms) — check proxy`);
-    return;
-  }
-
-  const {"login-form-attempt": prevAttempt = 0} = await storageGet("login-form-attempt");
-  if (prevAttempt >= 3) {
-    await storageSet({"login-form-attempt": 0});
-    await _clearWorkflowFailed("Login: failed after 3 attempts — check credentials");
-    return;
-  }
-
-  setBadge("Login: waiting for form…", "#f0c040");
-  const userEl = await waitFor(() => findBySelectors(USERNAME_SELECTORS), 10000);
-  if (!userEl) { await _clearWorkflowFailed("Login: username field not found"); return; }
-
-  setBadge("Login: filling credentials…", "#f0c040");
-  await humanType(userEl, creds.username);
-  await sleep(500 + Math.random() * 500);
-
-  const passEl = await waitFor(() => findBySelectors(PASSWORD_SELECTORS), 4000);
-  if (!passEl) { await _clearWorkflowFailed("Login: password field not found"); return; }
-  await humanType(passEl, creds.password);
-  await sleep(500 + Math.random() * 500);
-
-  await storageSet({"login-pending": true, "login-form-attempt": prevAttempt + 1});
-
-  if (prevAttempt >= 1) {
-    // doLogin() success calls location.reload() — page reloads to Authentication.jsp with
-    // the session cookie already set. Detect this before re-filling the form.
-    try {
-      const probe = await fetch("/VistosOnline/Questionario", {
-        method: "GET", credentials: "include", redirect: "follow", cache: "no-store",
-      });
-      if (probe.ok && !/Authentication|authentication/i.test(probe.url)) {
-        await storageSet({"workflow-type": null, "workflow-step": null, "login-pending": false, "login-form-attempt": 0});
-        setBadge("Logged in!", "#00d4aa");
-        location.href = "/VistosOnline/Questionario";
-        return;
-      }
-    } catch(e) { console.warn("[OctoProbe] Early session probe error:", e); }
-  }
-
-  if (prevAttempt === 0) {
-    // Phase 1: trigger bd.js challenge with a dummy token. No captcha credit spent.
-    setBadge("Login: triggering WAF challenge…", "#f0c040");
-    await _callPageFn(`
-      (function() {
-        var uEl = document.querySelector('input[name="username"], #username');
-        var pEl = document.querySelector('input[name="password"], #password');
-        var f = document.createElement('form');
-        f.method = 'POST';
-        f.action = '/VistosOnline/login';
-        [['username',        uEl ? uEl.value : ''],
-         ['password',        pEl ? pEl.value : ''],
-         ['language',        'ENG'],
-         ['rgpd',            'Y'],
-         ['captchaResponse', 'challenge_pass']
-        ].forEach(function(kv) {
-          var i = document.createElement('input'); i.type = 'hidden';
-          i.name = kv[0]; i.value = kv[1]; f.appendChild(i);
-        });
-        document.body.appendChild(f);
-        console.log('[OctoProbe] Phase-1 login POST (challenge trigger)');
-        f.submit();
-      })();
-    `);
-    // Browser navigates away. Dispatch handles /login bounce → back to auth → attempt 1.
-    return;
-  }
-
-  // Phase 2: challenge cookie set. Solve fresh captcha and submit via jQuery AJAX.
-  // Page stays alive so the next retry (if needed) starts from captcha, not scratch.
-  setBadge("Login: checking for reCAPTCHA…", "#f0c040");
-  const rcEl = await waitFor(
-    () => document.querySelector("[data-sitekey], iframe[src*='recaptcha'], .g-recaptcha"),
-    8000
-  );
-  if (rcEl) {
-    setBadge("Login: solving reCAPTCHA…", "#f0c040");
-    const solved = await waitForRecaptcha();
-    if (!solved) { await _clearWorkflowFailed("Login: reCAPTCHA failed"); return; }
-    const r = rcEl.getBoundingClientRect();
-    window._mX = Math.round(r.left + r.width  * 0.5);
-    window._mY = Math.round(r.top  + r.height * 0.5);
-    // No extra sleep — submit immediately while the token is fresh
-  } else {
-    await sleep(800 + Math.random() * 600);
-  }
-
-  await injectAlertCapture();
-
-  const submitBtn = await waitFor(() => findBySelectors(LOGIN_SUBMIT_SELECTORS), 4000);
-  if (!submitBtn) { await _clearWorkflowFailed("Login: submit button not found"); return; }
-
-  setBadge("Login: submitting…", "#f0c040");
-  await humanClick(submitBtn);
-
-  // RGPD consent popup — only on the first login of a new session.
-  const rgpdEl = await waitFor(() => {
-    const el = document.querySelector("#loginMsg");
-    return isVisible(el) ? el : null;
-  }, 12000);
-  if (rgpdEl) {
-    setBadge("Login: accepting RGPD…", "#f0c040");
-    const cb1 = document.querySelector("#loginCheckbox1");
-    const cb2 = document.querySelector("#loginCheckbox2");
-    const cb3 = document.querySelector("#loginCheckbox3");
-    if (cb3?.checked) await humanClick(cb3);
-    await sleep(200 + Math.random() * 200);
-    if (cb1 && !cb1.checked) await humanClick(cb1);
-    await sleep(300 + Math.random() * 300);
-    if (cb2 && !cb2.checked) await humanClick(cb2);
-    await sleep(400 + Math.random() * 300);
-    const rgpdSubmit = await waitFor(() => {
-      const btn = document.querySelector("#loginSubmit");
-      return btn && !btn.disabled ? btn : null;
-    }, 5000);
-    if (rgpdSubmit) await humanClick(rgpdSubmit);
-    await sleep(1000 + Math.random() * 1000);
-  }
-
-  // If the page navigated on its own (jQuery followed the redirect), script is destroyed.
-  // Still alive here means the browser stayed on Authentication.jsp.
-  setBadge("Login: waiting for response…", "#f0c040");
-  await sleep(5000);
-  if (!/Authentication|authentication/i.test(location.pathname + location.search)) return;
-
-  // Silent session probe — doLogin() sets the cookie even when jQuery stays on auth URL.
-  setBadge("Login: probing session…", "#f0c040");
-  let sessionOk = false;
-  try {
-    const probe = await fetch("/VistosOnline/Questionario", {
-      method: "GET", credentials: "include", redirect: "follow", cache: "no-store",
-    });
-    sessionOk = probe.ok && !/Authentication|authentication/i.test(probe.url);
-    console.log(`[OctoProbe] Login session probe: ${probe.url} — ${sessionOk ? "OK" : "FAIL"}`);
-  } catch(e) {
-    console.warn("[OctoProbe] Session probe error:", e);
-  }
-
-  if (sessionOk) {
-    await storageSet({"workflow-type": null, "workflow-step": null, "login-pending": false, "login-form-attempt": 0});
-    setBadge("Logged in!", "#00d4aa");
-    location.href = "/VistosOnline/Questionario";
-    return;
-  }
-
-  // Captcha or credentials rejected — reload for a fresh reCAPTCHA widget on next attempt.
-  await storageSet({"login-pending": false});
-  setBadge("Login: retrying…", "#f0c040");
-  await sleep(2000 + Math.random() * 1000);
-  location.reload();
-}
-
 // ---------------------------------------------------------------------------
-// Register workflow — home page step
-// ---------------------------------------------------------------------------
-
-async function registerStepHome() {
-  setBadge("Register: language…", "#f0c040");
-  await switchToEnglish();
-  setBadge("Register: login page…", "#f0c040");
-  await clickLoginLink();
-  await storageSet({"workflow-step": "auth"});
-  // page will navigate, new content script picks up step "auth"
-}
-
-// ---------------------------------------------------------------------------
-// Register workflow — auth page step (click Register link -> fill form)
+// Warmup (legacy — kept only for WARMUP_SITES / WARMUP_DWELL_MS constants)
 // ---------------------------------------------------------------------------
 
 async function warmupStep() {
@@ -523,234 +416,17 @@ async function warmupStep() {
   }, WARMUP_DWELL_MS);
 }
 
-async function _clearWorkflowFailed(reason) {
+async function _clearWorkflowFailed(reason, code = 0) {
   setBadge(reason, "#ff6b6b");
-  await storageSet({"workflow-type": null, "workflow-step": null, "email-token": null, "register-retried": null, "login-form-attempt": 0, "register-partial-attempt": 0, "register-submit-attempt": 0, "register-post-submitted": false, "warmup-end-time": null, "warmup-site-index": 0});
-  chrome.runtime.sendMessage({type: "stop-email-poll"});
-}
-
-async function registerStepAuth(person, emailAcct) {
-  // Fail fast if the proxy connection is too slow — poor network dramatically
-  // increases reCAPTCHA rejection rate and wastes API solver credits.
-  const net = await checkNetworkQuality();
-  if (!net.good) {
-    await _clearWorkflowFailed(`Network too slow (${net.avg}ms avg) — check proxy`);
-    return;
-  }
-
-  // Guard against the partial-challenge loop: clicking Register triggers
-  // $.load('/VistosOnline/partials/registration.jsp'); if that returns the bd.js
-  // challenge page, the script runs in the main page context and navigates the whole
-  // page to Authentication.jsp — killing the registration flow silently. Our
-  // challenge-count detector doesn't see AJAX-level challenges, so we track Register
-  // clicks across restarts with a separate counter.
-  const {"register-partial-attempt": partialAttempt = 0} = await storageGet("register-partial-attempt");
-  if (partialAttempt >= 3) {
-    await storageSet({"register-partial-attempt": 0});
-    await _clearWorkflowFailed("Register form blocked — IP challenged on partial load, switch proxy");
-    return;
-  }
-
-  setBadge("Register: finding link…", "#f0c040");
-
-  const regEl = await waitFor(
-    () => findBySelectors(REGISTER_LINK_SELECTORS)
-       || findByText(["span","a","button","div"], REGISTER_LINK_TEXTS),
-    8000
-  );
-  if (!regEl) { await _clearWorkflowFailed("Register link not found"); return; }
-
-  await storageSet({"register-partial-attempt": partialAttempt + 1});
-  await sleep(900 + Math.random() * 1000);
-  await humanClick(regEl);
-  await sleep(300 + Math.random() * 300);
-
-  setBadge("Register: waiting for form…", "#f0c040");
-  const form = await waitFor(() => document.querySelector("#formReg"), 12000);
-  if (!form) { await _clearWorkflowFailed("Register form: partial blocked by bot challenge — switch proxy"); return; }
-
-  // Form loaded — reset the partial-challenge counter.
-  await storageSet({"register-partial-attempt": 0});
-
-  setBadge("Register: filling form…", "#f0c040");
-  await fillRegisterForm(person, emailAcct.email);
-
-  // Verify every required field is filled before we ask the user to solve reCAPTCHA.
-  // If any field is blank, re-fill only those fields, then check one more time.
-  setBadge("Register: validating form…", "#f0c040");
-  const missingFirst = _checkFormFields();
-  if (missingFirst.length) {
-    console.warn("[OctoProbe] Blank fields after fill — re-filling:", missingFirst);
-    setBadge("Register: re-filling fields…", "#f0c040");
-    await _refillMissing(missingFirst, person, emailAcct.email);
-    await sleep(400 + Math.random() * 300);
-    const missingFinal = _checkFormFields();
-    if (missingFinal.length) {
-      await _clearWorkflowFailed(`Form incomplete: ${missingFinal.join(", ")}`);
-      return;
-    }
-  }
-  console.log("[OctoProbe] All form fields verified — two-phase WAF submit");
-
-  // Two-phase approach (mirrors loginStepAuth) to beat the bd.js WAF challenge
-  // that now fires on every POST /VistosOnline/register:
-  //
-  // Phase 0 — real form POST with dummy captcha. bd.js executes in browser context,
-  //   validates fingerprint, sets challenge cookie, replays the POST. Server rejects
-  //   the dummy token. Browser navigates somewhere. Challenge cookie is now set.
-  //   No captcha credit spent. register-post-submitted stays false.
-  //
-  // Phase 1+ — fill fields, solve fresh captcha, submit immediately. Challenge
-  //   cookie is set → no bd.js → server processes registration → email sent.
-  //   register-post-submitted=true so dispatch advances to email polling wherever
-  //   the browser lands after the navigation.
-  const {"register-submit-attempt": submitAttempt = 0} = await storageGet("register-submit-attempt");
-  if (submitAttempt >= 3) {
-    await _clearWorkflowFailed("Register: WAF persists after 3 attempts — switch proxy");
-    return;
-  }
-  await storageSet({"register-submit-attempt": submitAttempt + 1});
-
-  if (submitAttempt === 0) {
-    // Phase 0: trigger WAF challenge — no captcha token spent.
-    setBadge("Register: triggering WAF challenge…", "#f0c040");
-    await _callPageFn(`
-      (function() {
-        var f = document.querySelector('#formReg');
-        if (!f) return;
-        var rgpd = f.querySelector('[name="rgpd"]');
-        if (!rgpd) { rgpd = document.createElement('input'); rgpd.type = 'hidden'; rgpd.name = 'rgpd'; f.appendChild(rgpd); }
-        rgpd.value = 'Y';
-        var cap = f.querySelector('[name="captchaResponse"]');
-        if (cap) cap.value = 'challenge_pass';
-        console.log('[OctoProbe] Phase-0 register POST (challenge trigger)');
-        f.submit();
-      })();
-    `);
-    // Browser navigates away — script destroyed.
-    // Dispatch detects no register-post-submitted → calls registerStepAuth(submitAttempt=1).
-    return;
-  }
-
-  // Phase 1+: challenge cookie set. Solve fresh captcha and submit immediately.
-  // Fields are already filled from fillRegisterForm() above — don't re-fill.
-  setBadge("Register: solving reCAPTCHA…", "#f0c040");
-  const solved = await waitForRecaptcha();
-  if (!solved) { await _clearWorkflowFailed("reCAPTCHA not solved — timed out"); return; }
-
-  // Inject alert capture AFTER captcha solve (before: reCAPTCHA checks native toString).
-  await injectAlertCapture();
-  document.addEventListener("octo-alert", (e) => {
-    console.log(`[OctoProbe] Register alert: "${e.detail.msg}"`);
-  }, {once: true});
-
-  // Anchor mouse at reCAPTCHA widget for natural Bézier trajectory.
-  const rcEl = document.querySelector(
-    "iframe[src*='recaptcha'], .g-recaptcha, #recaptcha, [class*='recaptcha']"
-  );
-  if (rcEl) {
-    const r = rcEl.getBoundingClientRect();
-    window._mX = Math.round(r.left + r.width  * 0.5);
-    window._mY = Math.round(r.top  + r.height * 0.5);
-  }
-  // No extra sleep — submit while token is fresh (2-min expiry window).
-
-  // Start email polling before navigating — success may navigate away immediately.
-  await storageSet({"register-post-submitted": true, "workflow-step": "token"});
-  chrome.runtime.sendMessage({type: "start-email-poll", jwt: emailAcct.jwt});
-
-  setBadge("Register: submitting…", "#f0c040");
-  await _callPageFn(`
-    (function() {
-      var f = document.querySelector('#formReg');
-      if (!f) return;
-      var rgpd = f.querySelector('[name="rgpd"]');
-      if (!rgpd) { rgpd = document.createElement('input'); rgpd.type = 'hidden'; rgpd.name = 'rgpd'; f.appendChild(rgpd); }
-      rgpd.value = 'Y';
-      console.log('[OctoProbe] Phase-1 register POST (real captcha + rgpd=Y)');
-      f.submit();
-    })();
-  `);
-  // Browser navigates away. Dispatch reads register-post-submitted=true on landing
-  // page and advances to email verification regardless of landing URL.
-}
-
-// Pick a nationality from the dropdown's live options and persist the resolved value.
-// Known nationality adjective → Portuguese country-name keyword.
-// Keys are lowercased substrings found in passport nationality field.
-// Match values are substrings expected in the form's dropdown option text.
-const _NAT_ALIASES = [
-  { keys: ["cabo-verd", "caboverd", "cape verd"],                          match: "cabo verde"   },
-  { keys: ["guineense", "guiné-bissau", "guinea-biss", "guinea-biss"],     match: "guiné-bissau" },
-  { keys: ["guinéenne", "guineenne", "guinéen"],                           match: "guiné"        },
-  { keys: ["senegal"],                                                      match: "senegal"      },
-  { keys: ["brasil", "brazil", "brasileir"],                               match: "brasil"       },
-  { keys: ["india", "índi", "indian"],                                     match: "índi"         },
-  { keys: ["china", "chinês", "chines"],                                   match: "chin"         },
-  { keys: ["moçambique", "mozambique", "moçambic"],                        match: "moçambique"   },
-  { keys: ["angola"],                                                       match: "angola"       },
-  { keys: ["filipin", "philippin"],                                        match: "filipin"      },
-  { keys: ["pakist", "paquistã"],                                          match: "pakist"       },
-  { keys: ["marrocos", "morocc", "marroquin"],                             match: "marrocos"     },
-  { keys: ["colômbi", "colombi"],                                          match: "colômbi"      },
-];
-
-function _norm(s) {
-  return s.toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[-\s]+/g, " ").trim();
-}
-
-// Match a raw nationality string (from passport) against form dropdown options.
-// Returns the matching option element, or null if no confident match.
-function _matchNationality(nat, validOpts) {
-  const n = _norm(nat);
-  // Alias map — checked in priority order; Guinea-Bissau before generic Guinea.
-  for (const {keys, match} of _NAT_ALIASES) {
-    if (keys.some(k => n.includes(_norm(k)))) {
-      const matchNorm = _norm(match);
-      for (const opt of validOpts) {
-        if (_norm(opt.text).includes(matchNorm)) return opt;
-      }
-    }
-  }
-  // Direct contains as last resort
-  for (const opt of validOpts) {
-    const t = _norm(opt.text);
-    if (t.includes(n) || n.includes(t)) return opt;
-  }
-  return null;
+  throw Object.assign(new Error(reason), {errorCode: code, isWorkflowError: true});
 }
 
 async function _selectNationality(natEl, person) {
-  const validOpts = [...natEl.options].filter(o =>
-    o.value && o.value.trim() !== "" &&
-    !/^(-+|select|choose|pick|all|\?\?)/i.test(o.text.trim())
-  );
-
-  if (!validOpts.length) {
-    console.warn("[OctoProbe] No valid nationality options — using stored:", person.nationality);
-    await humanSelect(natEl, person.nationality);
-    return;
-  }
-
-  let chosen;
-  // Real person nationality is a word/phrase (length > 4); try to match it.
-  if (person.nationality && person.nationality.length > 4) {
-    chosen = _matchNationality(person.nationality, validOpts);
-    if (chosen) {
-      console.log(`[OctoProbe] Nationality matched: "${chosen.text.trim()}" (${chosen.value})`);
-    } else {
-      console.warn(`[OctoProbe] Nationality "${person.nationality}" unmatched — picking random`);
-    }
-  }
-  // Auto-generated or unmatched: random pick.
-  if (!chosen) {
-    chosen = validOpts[Math.floor(Math.random() * validOpts.length)];
-    console.log(`[OctoProbe] Nationality (random): "${chosen.text.trim()}" (${chosen.value})`);
-  }
-
-  person.nationality = chosen.value;
+  // Nationality is always CPV (Cape Verde) — select directly by option value.
+  person.nationality = "CPV";
   await storageSet({"register-person": Object.assign({}, person)});
-  await humanSelect(natEl, person.nationality);
+  await humanSelect(natEl, "CPV");
+  console.log("[OctoProbe] Nationality selected: CPV (Cape Verde)");
 }
 
 // Returns selectors of fields that are visibly present but have an empty value.
@@ -826,63 +502,8 @@ async function fillRegisterForm(person, email) {
   await sleep(300 + Math.random() * 400);
 }
 
-// Dispatcher — routes to human or API path based on captcha-mode storage key.
-async function waitForRecaptcha() {
-  const { "captcha-mode": mode } = await storageGet(["captcha-mode"]);
-  return mode === "human" ? _waitForRecaptchaHuman() : _waitForRecaptchaApi();
-}
-
-// Human mode — inject the watcher and wait for the user to solve manually.
-async function _waitForRecaptchaHuman(maxMs = 300000) {
-  const r = await sendBgMessage({type: "inject-recaptcha-watcher"}).catch(() => null);
-  if (r?.ok) {
-    console.log("[OctoProbe] reCAPTCHA watcher injected via scripting API");
-  } else {
-    console.warn("[OctoProbe] Watcher injection failed:", r?.error, "— DOM fallback");
-    const reset = document.createElement("script");
-    reset.textContent = `window._octoRcpWatcher = false; window._octoRcpToken = null;`;
-    (document.head || document.documentElement).appendChild(reset);
-    reset.remove();
-    const s = document.createElement("script");
-    s.textContent = `(function(){
-      if (window._octoRcpWatcher) return;
-      window._octoRcpWatcher = true;
-      function check() {
-        try {
-          const r = typeof grecaptcha !== "undefined" &&
-            (grecaptcha.enterprise?.getResponse?.() || grecaptcha.getResponse?.());
-          if (r && r.length > 0) {
-            window._octoRcpToken = r;
-            document.dispatchEvent(new CustomEvent("octo-recaptcha-pass", {detail:{token:r}}));
-            return;
-          }
-        } catch(_) {}
-        setTimeout(check, 800);
-      }
-      check();
-    })();`;
-    (document.head || document.documentElement).appendChild(s);
-    s.remove();
-  }
-
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => { console.warn("[OctoProbe] reCAPTCHA timeout."); resolve(false); }, maxMs);
-    function onPass() {
-      clearTimeout(timer); clearInterval(poll);
-      console.log("[OctoProbe] reCAPTCHA solved (human).");
-      resolve(true);
-    }
-    document.addEventListener("octo-recaptcha-pass", onPass, {once: true});
-    const poll = setInterval(() => {
-      const el = document.querySelector("#g-recaptcha-response-1, #g-recaptcha-response");
-      if (el?.value?.length > 0) {
-        document.removeEventListener("octo-recaptcha-pass", onPass);
-        clearInterval(poll); clearTimeout(timer);
-        console.log("[OctoProbe] reCAPTCHA solved (textarea fallback).");
-        resolve(true);
-      }
-    }, 800);
-  });
+function waitForRecaptcha() {
+  return _waitForRecaptchaApi();
 }
 
 // Extract the reCAPTCHA site key from the current page.
@@ -899,7 +520,7 @@ async function _extractSiteKey() {
 // Minimum elapsed time before a solver token is accepted.
 // Tokens arriving faster than this are padded with a sleep — an instant solve
 // is a strong bot signal even if the token itself is valid.
-const _MIN_API_SOLVE_MS = 8000;
+const _MIN_API_SOLVE_MS = 12000;
 
 // API mode — send to solver service, inject token, resolve when widget confirms.
 async function _waitForRecaptchaApi() {
@@ -981,153 +602,58 @@ async function injectAlertCapture(confirmToo = false) {
 }
 
 // ---------------------------------------------------------------------------
-// Register workflow — token page step
+// Email token wait helper (used by cmd-token-fill handler)
 // ---------------------------------------------------------------------------
 
-async function registerStepToken(emailAcct) {
-  setBadge("Token: polling email…", "#f0c040");
 
-  // Suppress alert() now — the format-error alert fires in MAIN world and
-  // blocks script execution as a native dialog if not suppressed first.
-  await injectAlertCapture();
-
-  // Poll email first — the form stays on screen while we wait
-  let token = await waitForEmailToken(emailAcct?.jwt, 120000);
-
-  const urlToken = new URLSearchParams(location.search).get("token");
-  console.log("[OctoProbe] URL ?token param:", urlToken);
-
-  if (!token) {
-    console.warn("[OctoProbe] Email token not found — no fallback available");
-    setBadge("No token found", "#ff6b6b");
-    return;
-  }
-
-  // The site's validation regex has no 'i' flag — all hex must be lowercase.
-  token = token.toLowerCase();
-  console.log("[OctoProbe] Token to submit (lowercased):", token);
-  setBadge(`Token: ${token.slice(0, 12)}…`, "#f0c040");
-
-  // Re-query the token input fresh AFTER email polling to avoid stale references
-  // and to allow the AJAX form time to fully load
-  const findTokenInput = () => {
-    for (const sel of TOKEN_INPUT_SELECTORS) {
-      const el = document.querySelector(sel);
-      if (isVisible(el)) return el;
-    }
-    return null;
-  };
-
-  const tokenInput = await waitFor(findTokenInput, 15000);
-  if (!tokenInput) { setBadge("Token form not found", "#ff6b6b"); return; }
-
-  // Log all inputs for diagnostics
-  const allInputs = [...document.querySelectorAll("#mainContent input, form input")];
-  console.log("[OctoProbe] Inputs on page:", allInputs.map(i =>
-    `type=${i.type} id=${i.id} name=${i.name} visible=${isVisible(i)}`
-  ));
-  console.log("[OctoProbe] Selected token input:", tokenInput.outerHTML.slice(0, 200));
-
-  // Scroll into view and give the user a moment to "read" the form
-  tokenInput.scrollIntoView({behavior: "smooth", block: "center"});
-  await sleep(900 + Math.random() * 800);
-
-  // Human-like click into the field (cursor curves to it)
-  await humanClick(tokenInput);
-  await sleep(150 + Math.random() * 200);
-
-  // Type the token character by character in MAIN world — jQuery sees each keystroke
-  // through its own event system, same as a real user typing.
-  setBadge("Typing token…", "#f0c040");
-  const fillResult = await sendBgMessage({type: "fill-token", token}).catch(() => null);
-  console.log("[OctoProbe] Type-token result:", fillResult);
-
-  await sleep(300 + Math.random() * 300);
-  console.log("[OctoProbe] Field value after fill:", tokenInput.value);
-
-  // Isolated-world fallback if scripting API failed or left no value
-  if (!tokenInput.value) {
-    console.warn("[OctoProbe] Scripting API fill failed — isolated-world humanType fallback");
-    // Re-query fresh: the AJAX load may have re-rendered the form element
-    const freshInput = findTokenInput();
-    const target = freshInput ?? tokenInput;
-    // Clear any partial content before re-typing
-    target.focus();
-    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
-    if (setter) setter.call(target, ""); else target.value = "";
-    target.dispatchEvent(new Event("input", {bubbles: true}));
-    await humanType(target, token);
-  }
-
-  const submitBtn = TOKEN_SUBMIT_SELECTORS
-    .map(sel => document.querySelector(sel))
-    .find(el => isVisible(el));
-
-  if (!submitBtn) { setBadge("Token submit not found", "#ff6b6b"); return; }
-
-  // Store account as pending BEFORE clicking submit — the page navigates on success
-  // which kills this script, so we must commit the data before the click.
-  // Authentication.jsp picks it up on the next load.
-  const {"register-person": savedPerson} = await storageGet("register-person");
-  if (savedPerson) {
-    const pendingAccount = {
-      username:      savedPerson.username,
-      password:      savedPerson.password,
-      name:          savedPerson.name,
-      surname:       savedPerson.surname,
-      email:         emailAcct?.email ?? "",
-      birth_date:    savedPerson.birth_date,
-      gender:        savedPerson.gender,
-      nationality:   savedPerson.nationality,
-      traveldoc:     savedPerson.traveldoc,
-      registered_at: new Date().toISOString(),
-    };
-    await storageSet({"pending-account": pendingAccount});
-    console.log("[OctoProbe] Pending account stored pre-submit:", pendingAccount.username);
-  }
-
-  console.log("[OctoProbe] Submitting token form:", submitBtn.outerHTML.slice(0, 120));
-  setBadge("Verifying token…", "#f0c040");
-  await sleep(1100 + Math.random() * 1000);
-  await humanClick(submitBtn);
-
-  // Page navigates to Authentication.jsp on success — script is destroyed here.
-  // The pending-account is picked up by main() on the next page load.
-  setBadge("Awaiting verification…", "#f0c040");
-}
-
-function _normaliseToken(t) {
-  // Convert bare 32-char hex to hyphenated UUID if needed
-  if (t && /^[0-9a-f]{32}$/i.test(t))
-    return `${t.slice(0,8)}-${t.slice(8,12)}-${t.slice(12,16)}-${t.slice(16,20)}-${t.slice(20,32)}`;
-  return t;
-}
-
+// Returns {linkToken, codeToken} where linkToken is the short-hex from the email URL
+// and codeToken is the UUID code to enter in the form — or null if not found in time.
 async function waitForEmailToken(jwt, maxMs = 120000) {
   const deadline = Date.now() + maxMs;
 
-  let bgToken = null;
-  const bgListener = (msg) => { if (msg.type === "email-token") bgToken = msg.token; };
+  const {"email-provider": emailProvider = "mailtm"} = await storageGet("email-provider");
+  const isMailTm = emailProvider === "mailtm";
+
+  let bgRawToken = null;
+  const bgListener = (msg) => { if (msg.type === "email-token") bgRawToken = msg.token; };
   chrome.runtime.onMessage.addListener(bgListener);
 
   while (Date.now() < deadline) {
-    const {["email-token"]: stored} = await storageGet("email-token");
+    // Check email-code-token first (CF mode stores UUID there); fall back to email-token (mail.tm).
+    const {["email-code-token"]: storedCode, ["email-token"]: storedLink} = await storageGet(["email-code-token", "email-token"]);
+    const stored = storedCode ?? storedLink;
     if (stored) {
-      const tok = _normaliseToken(stored);
-      console.log("[OctoProbe] Email token from storage:", stored, "→", tok);
+      console.log("[OctoProbe] Email token from bg-storage:", stored);
       chrome.runtime.onMessage.removeListener(bgListener);
-      return tok;
+      const isHex32 = /^[0-9a-f]{32}$/i.test(stored);
+      return isHex32
+        ? {linkToken: stored.toLowerCase(), codeToken: null}
+        : {linkToken: null, codeToken: stored.toLowerCase()};
     }
 
-    if (bgToken) {
-      const tok = _normaliseToken(bgToken);
-      console.log("[OctoProbe] Email token from background:", bgToken, "→", tok);
+    if (bgRawToken) {
+      console.log("[OctoProbe] Email token from bg-message:", bgRawToken);
       chrome.runtime.onMessage.removeListener(bgListener);
-      return tok;
+      // bg sends codeToken ?? linkToken — prefer UUID, fall back to hex linkToken
+      const isHex32 = /^[0-9a-f]{32}$/i.test(bgRawToken);
+      return isHex32
+        ? {linkToken: bgRawToken.toLowerCase(), codeToken: null}
+        : {linkToken: null, codeToken: bgRawToken.toLowerCase()};
+    }
+
+    if (!isMailTm) {
+      // CF email: background poller is the only delivery path — just wait.
+      await sleep(5000);
+      continue;
     }
 
     try {
-      const r     = await fetch(`${MAILTM}/messages`, {headers: {Authorization: `Bearer ${jwt}`}});
+      const r = await fetch(`${MAILTM}/messages`, {headers: {Authorization: `Bearer ${jwt}`}});
+      if (r.status === 401) {
+        console.warn("[OctoProbe] mail.tm JWT expired (401) — aborting email poll");
+        chrome.runtime.onMessage.removeListener(bgListener);
+        return null;
+      }
       const data  = await r.json();
       const items = data["hydra:member"] ?? [];
 
@@ -1144,11 +670,11 @@ async function waitForEmailToken(jwt, maxMs = 120000) {
           htmlPreview: (Array.isArray(msg.html) ? msg.html.join(" ") : (msg.html ?? "")).replace(/<[^>]+>/g, " ").slice(0, 400),
         });
 
-        const tok = extractTokenFromMsg(msg);
-        if (tok) {
-          console.log("[OctoProbe] Token extracted:", tok);
+        const tokens = extractTokenFromMsg(msg);
+        if (tokens) {
+          console.log("[OctoProbe] Tokens extracted:", tokens);
           chrome.runtime.onMessage.removeListener(bgListener);
-          return tok;
+          return tokens;
         }
         console.warn("[OctoProbe] No token pattern matched in this email.");
       }
@@ -1163,42 +689,38 @@ async function waitForEmailToken(jwt, maxMs = 120000) {
   return null;
 }
 
-function _hexToUUID(h) {
-  // Convert 32-char hex to xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-  return `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20,32)}`;
-}
 
+// Returns {linkToken, codeToken} where:
+//   linkToken  = raw 32-char hex from the email's verification URL (?token=…)
+//   codeToken  = UUID with dashes displayed as the entry code in the email body
+// Either field may be null if not found in the email.
 function extractTokenFromMsg(msg) {
   const text = msg?.text ?? "";
-  // mail.tm returns html as an array of strings or a single string
   const rawHtml = Array.isArray(msg?.html) ? msg.html.join(" ") : (msg?.html ?? "");
   const html = rawHtml.replace(/<[^>]+>/g, " ");
-  const body  = text || html;
+  const body = text || html;
 
-  const patterns = [
-    [/\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/i, "UUID with hyphens"],
-    [/\b([0-9a-f]{32})\b/i,                        "32-char hex (UUID no hyphens)"],
-    [/[?&]token=([A-Za-z0-9\-]{6,})/,              "URL ?token param"],
-    [/token[=:\s]+([A-Za-z0-9\-]{6,})/i,            "token= assignment"],
-    [/c[oó]digo[:\s]+([A-Za-z0-9\-]{4,})/i,         "Portuguese 'código'"],
-    [/code[:\s]+([A-Za-z0-9\-]{4,})/i,               "English 'code'"],
-    [/\b([0-9]{4,8})\b/,                              "standalone digits"],
-  ];
+  // Link token: 32-char hex embedded in a ?token= URL query parameter.
+  const linkMatch = body.match(/[?&]token=([0-9a-f]{32})\b/i);
+  const linkToken = linkMatch ? linkMatch[1].toLowerCase() : null;
 
-  for (const [re, label] of patterns) {
-    const m = body.match(re);
-    if (!m) continue;
+  // Code token: UUID-with-dashes in body text, NOT inside a URL.
+  // Strip all URLs first so ?token=<32-hex> expansions aren't caught here.
+  const bodyNoUrls = body.replace(/https?:\/\/[^\s<>"]+/gi, " ");
+  const codeMatch  = bodyNoUrls.match(/\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/i);
+  const codeToken  = codeMatch ? codeMatch[1].toLowerCase() : null;
 
-    let token = m[1];
-    // If matched a raw 32-char hex, convert to hyphenated UUID format
-    if (/^[0-9a-f]{32}$/i.test(token)) {
-      token = _hexToUUID(token);
-      console.log(`[OctoProbe] Token converted hex→UUID: ${token}`);
-    }
-    console.log(`[OctoProbe] Token match via "${label}": ${token}`);
-    return token;
+  if (!linkToken && !codeToken) {
+    // Last-resort fallback: any UUID or hex in body.
+    const uuidM = body.match(/\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/i);
+    if (uuidM) return {linkToken: null, codeToken: uuidM[1].toLowerCase()};
+    const hexM  = body.match(/\b([0-9a-f]{32})\b/i);
+    if (hexM)  return {linkToken: hexM[1].toLowerCase(), codeToken: null};
+    return null;
   }
-  return null;
+
+  console.log(`[OctoProbe] Email tokens — link: ${linkToken ?? "?"}, code: ${codeToken ?? "?"}`);
+  return {linkToken, codeToken};
 }
 
 // ---------------------------------------------------------------------------
@@ -1206,32 +728,56 @@ function extractTokenFromMsg(msg) {
 // ---------------------------------------------------------------------------
 
 // Ping Google's dedicated connectivity endpoint twice and return the average RTT.
-// Returns {avg, good} — "good" means avg RTT is below the threshold.
+// Returns {avg, good} — "good" means both probes completed within threshold.
 const _NET_BAD_MS  = 2000;  // avg RTT above this = poor proxy, stop workflow
+const _NET_TIMEOUT = 2500;  // per-probe abort timeout — exceeding this already proves bad proxy
 const _NET_PROBE   = "https://www.google.com/generate_204";
 
 async function checkNetworkQuality() {
   setBadge("Checking network…", "#f0c040");
   const times = [];
+  let timedOut = false;
   for (let i = 0; i < 2; i++) {
     const t0 = performance.now();
     try {
       const ctrl = new AbortController();
-      const tid  = setTimeout(() => ctrl.abort(), 5000);
+      const tid  = setTimeout(() => ctrl.abort(), _NET_TIMEOUT);
       await fetch(_NET_PROBE, {method:"HEAD", mode:"no-cors", cache:"no-store", signal: ctrl.signal});
       clearTimeout(tid);
       times.push(performance.now() - t0);
     } catch(_) {
-      times.push(5000); // treat timeout/failure as worst-case
+      timedOut = true;
+      times.push(_NET_TIMEOUT);
+      break; // first probe timed out — proxy is dead, no need for second probe
     }
     if (i === 0) await sleep(300); // small gap between probes
   }
   const avg = Math.round(times.reduce((a,b) => a+b,0) / times.length);
-  const good = avg < _NET_BAD_MS;
+  const good = !timedOut && avg < _NET_BAD_MS;
   console.log(`[OctoProbe] Network RTT: ${times.map(t=>Math.round(t)).join(", ")}ms — avg ${avg}ms — ${good ? "OK" : "POOR"}`);
   setBadge(`Network: ${avg}ms ${good ? "OK" : "POOR"}`, good ? "#00d4aa" : "#ff6b6b");
   await sleep(600); // brief pause so the badge is readable
   return {avg, good};
+}
+
+async function _checkProxyQuality() {
+  const net = await checkNetworkQuality();
+  let proxy = {queryOk: false};
+  try {
+    const r = await fetch(
+      "http://ip-api.com/json?fields=status,query,countryCode,isp,org,proxy,hosting,mobile",
+      {cache: "no-store"}
+    );
+    if (r.ok) {
+      const d = await r.json();
+      if (d.status === "success") {
+        proxy = {queryOk: true, ip: d.query, country: d.countryCode,
+                 isp: d.isp, org: d.org, isProxy: d.proxy,
+                 isHosting: d.hosting, isMobile: d.mobile};
+      }
+    }
+  } catch (_) {}
+  return {network: {avgRtt: net.avg, good: net.good}, proxy};
 }
 
 // ---------------------------------------------------------------------------
@@ -1321,7 +867,7 @@ function _detectPageState() {
     return "schedule";
   }
   if (/Authentication|authentication/i.test(path + location.search)) {
-    return "auth";
+    return location.search.includes("token=") ? "token" : "auth";
   }
 
   // Home/dashboard or any other page: detect login by authenticated-only nav elements.
@@ -1351,166 +897,6 @@ async function visaStepGoToQuestionnaire() {
   }
   // Direct navigation fallback — works even if nav isn't rendered yet.
   location.href = "/VistosOnline/Questionario";
-}
-
-// ---------------------------------------------------------------------------
-// Visa workflow — login step (runs on auth page)
-// ---------------------------------------------------------------------------
-
-async function visaStepAuth(creds) {
-  const net = await checkNetworkQuality();
-  if (!net.good) { await _clearWorkflowFailed(`Network too slow (${net.avg}ms)`); return; }
-
-  setBadge("Visa: waiting for login form…", "#9060cc");
-  const userEl = await waitFor(() => findBySelectors(USERNAME_SELECTORS), 10000);
-  if (!userEl) {
-    const state = _detectPageState();
-    console.warn(`[OctoProbe] Auth: login form not found, detected state=${state}`);
-    if (state === "logged-in")     { await visaStepGoToQuestionnaire(); return; }
-    if (state === "questionnaire") { await visaStepQuestionnaire();     return; }
-    await _clearWorkflowFailed("Visa: login form not found");
-    return;
-  }
-
-  await humanType(userEl, creds.username);
-  await sleep(400 + Math.random() * 400);
-  const passEl = await waitFor(() => findBySelectors(PASSWORD_SELECTORS), 4000);
-  if (!passEl) { await _clearWorkflowFailed("Visa login: password field not found"); return; }
-  await humanType(passEl, creds.password);
-  await sleep(400 + Math.random() * 400);
-
-  const submitBtn = findBySelectors(LOGIN_SUBMIT_SELECTORS);
-  if (!submitBtn) { await _clearWorkflowFailed("Visa login: submit not found"); return; }
-
-  // XHR intercept — set up once before the retry loop, logs every POST body.
-  sendBgMessage({type: "exec-page-script", code: `
-    if (!window._octoXhrLog) {
-      window._octoXhrLog = true;
-      const _open = XMLHttpRequest.prototype.open;
-      XMLHttpRequest.prototype.open = function(m, url, ...a) { this._octoUrl = url; return _open.call(this, m, url, ...a); };
-      const _send = XMLHttpRequest.prototype.send;
-      XMLHttpRequest.prototype.send = function(body) {
-        if (typeof body === 'string' && body.length > 0)
-          document.dispatchEvent(new CustomEvent('octo-xhr-log', {detail:{url: this._octoUrl, body: body.slice(0,600)}}));
-        return _send.call(this, body);
-      };
-    }
-  `}).catch(() => null);
-  document.addEventListener('octo-xhr-log', e => {
-    console.log('[OctoProbe XHR send]', e.detail.url, '|', e.detail.body);
-  }, {capture: true, once: false});
-
-  // Capture any server-side alert fired by the site after the login AJAX response.
-  // A server alert means the server explicitly rejected the request (wrong credentials,
-  // captcha score, account issue). Retrying blindly risks blocking the account.
-  let _visaServerAlert = null;
-  document.addEventListener("octo-alert", (e) => {
-    _visaServerAlert = e.detail.msg;
-    console.log(`[OctoProbe] Visa login alert: "${_visaServerAlert}"`);
-  }, {once: false});
-
-  // Retry loop — up to 3 attempts on the same page without navigating away.
-  // This mirrors human behaviour: solve captcha, submit, if rejected solve again.
-  const MAX_ATTEMPTS = 3;
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const rcEl = await waitFor(
-      () => document.querySelector("[data-sitekey], iframe[src*='recaptcha'], .g-recaptcha"),
-      8000
-    );
-    if (rcEl) {
-      setBadge(`Visa: solving reCAPTCHA (${attempt}/${MAX_ATTEMPTS})…`, "#9060cc");
-      const solved = await waitForRecaptcha();
-      if (!solved) { await _clearWorkflowFailed("Visa login: reCAPTCHA failed"); return; }
-      await injectAlertCapture();
-      const r = rcEl.getBoundingClientRect();
-      window._mX = Math.round(r.left + r.width * 0.5);
-      window._mY = Math.round(r.top + r.height * 0.5);
-      await sleep(2000 + Math.random() * 2000);
-    } else {
-      await injectAlertCapture();
-      await sleep(800 + Math.random() * 600);
-    }
-
-    setBadge(`Visa: logging in (${attempt}/${MAX_ATTEMPTS})…`, "#9060cc");
-    await storageSet({"login-pending": true});
-    await humanClick(submitBtn);
-
-    // RGPD consent popup — only on the first login of a new session.
-    // Use a shorter timeout on retries since it won't reappear once accepted.
-    const rgpdEl = await waitFor(() => {
-      const el = document.querySelector("#loginMsg");
-      return isVisible(el) ? el : null;
-    }, attempt === 1 ? 12000 : 3000);
-    if (rgpdEl) {
-      setBadge("Visa: accepting RGPD…", "#9060cc");
-      const cb1 = document.querySelector("#loginCheckbox1");
-      const cb2 = document.querySelector("#loginCheckbox2");
-      const cb3 = document.querySelector("#loginCheckbox3");
-      if (cb3?.checked) await humanClick(cb3);
-      await sleep(200 + Math.random() * 200);
-      if (cb1 && !cb1.checked) await humanClick(cb1);
-      await sleep(300 + Math.random() * 300);
-      if (cb2 && !cb2.checked) await humanClick(cb2);
-      await sleep(400 + Math.random() * 300);
-      const rgpdSubmit = await waitFor(() => {
-        const btn = document.querySelector("#loginSubmit");
-        return btn && !btn.disabled ? btn : null;
-      }, 5000);
-      if (rgpdSubmit) await humanClick(rgpdSubmit);
-      await sleep(1000 + Math.random() * 1000);
-    }
-
-    // doLogin() is jQuery AJAX — success: server 302 → jQuery follows → portal HTML →
-    // AjaxSucceeded (JSON.parse throws) — page URL stays on auth but session cookie IS set.
-    // Probe the session silently via fetch so we don't navigate the browser.
-    setBadge("Visa: waiting for login response…", "#9060cc");
-    await sleep(5000);
-
-    // If the page navigated away on its own, the content script was destroyed; still
-    // alive here means the browser is still on Authentication.jsp.
-    if (!/Authentication|authentication/i.test(location.pathname + location.search)) return;
-
-    // Server-side rejection (wrong credentials, captcha score, account issue).
-    // The alert was already shown to the user via the status badge; stop immediately —
-    // further retries risk account blocking.
-    if (_visaServerAlert) {
-      await storageSet({"login-pending": false});
-      setBadge("Visa: server rejected login", "#ff6b6b");
-      await _clearWorkflowFailed(`Visa login: server error — "${_visaServerAlert}"`);
-      return;
-    }
-
-    // Silent session probe — fetch /Questionario without navigating the browser.
-    // Server redirects to auth if session is invalid; stays on Questionario if valid.
-    setBadge("Visa: probing session…", "#9060cc");
-    let sessionOk = false;
-    try {
-      const probe = await fetch("/VistosOnline/Questionario", {
-        method: "GET", credentials: "include", redirect: "follow", cache: "no-store",
-      });
-      sessionOk = probe.ok && !/Authentication|authentication/i.test(probe.url);
-      console.log(`[OctoProbe] Session probe (attempt ${attempt}): ${probe.url} — ${sessionOk ? "OK" : "FAIL"}`);
-    } catch(e) {
-      console.warn("[OctoProbe] Session probe error:", e);
-    }
-
-    if (sessionOk) {
-      await storageSet({"login-pending": false});
-      setBadge("Visa: logged in → questionnaire…", "#9060cc");
-      location.href = "/VistosOnline/Questionario";
-      return;
-    }
-
-    await storageSet({"login-pending": false});
-    if (attempt >= MAX_ATTEMPTS) break;
-
-    console.log(`[OctoProbe] Login attempt ${attempt} failed — re-solving reCAPTCHA`);
-    setBadge(`Visa: retry ${attempt + 1}/${MAX_ATTEMPTS} — re-solving captcha…`, "#9060cc");
-    // Give the reCAPTCHA widget a moment to reset before the next solve.
-    await sleep(3000 + Math.random() * 2000);
-  }
-
-  await _clearWorkflowFailed("Visa login: failed after 3 attempts");
 }
 
 // ---------------------------------------------------------------------------
@@ -1594,7 +980,7 @@ async function visaStepQuestionnaire() {
     await _callPageFn(`if(typeof goNext==='function') goNext(1,'CPV');`);
 
     firstQ = await _waitForQSelect("cb_question_21", 15000);
-    if (!firstQ) { await _clearWorkflowFailed("Visa: Q21 not appeared after goNext(1,'CPV')"); return; }
+    if (!firstQ) { await _clearWorkflowFailed("Visa: Q21 not appeared after goNext(1,'CPV')", E.VISA_FAILED); return; }
   } else {
     console.log("[OctoProbe] Q1 auto-fired — Q21 already present");
   }
@@ -1640,9 +1026,8 @@ async function visaStepQuestionnaire() {
     },
     20000, 500
   );
-  if (!continueBtn) { await _clearWorkflowFailed("Visa: Form button did not appear"); return; }
+  if (!continueBtn) { await _clearWorkflowFailed("Visa: Form button did not appear", E.VISA_FAILED); return; }
 
-  await storageSet({"workflow-step": "form"});
   await sleep(600 + Math.random() * 600);
   setBadge("Visa: submitting questionnaire…", "#9060cc");
   await humanClick(continueBtn);
@@ -1661,12 +1046,8 @@ async function _setField(name, value) {
 
   if (el.tagName === "SELECT") {
     await humanSelect(el, value);
-    el.dispatchEvent(new Event("change", {bubbles: true}));
   } else {
-    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
-    if (setter) setter.call(el, value); else el.value = value;
-    el.dispatchEvent(new Event("input",  {bubbles: true}));
-    el.dispatchEvent(new Event("change", {bubbles: true}));
+    await humanType(el, value);
   }
   return true;
 }
@@ -1677,12 +1058,41 @@ async function _switchToTab(prevTab, nextTab) {
   await sleep(800 + Math.random() * 500);
 }
 
-async function visaStepForm() {
+async function _submitVisaForm() {
+  setBadge("Visa: submitting form…", "#9060cc");
+  await injectAlertCapture(true);
+  await _callPageFn(`(function(){ if(typeof mudarTab==="function") mudarTab(5,6); })();`);
+  await sleep(1500 + Math.random() * 500);
+  const formSubmitBtn = await waitFor(
+    () => {
+      const cands = [
+        document.querySelector("#btnSubmit"),
+        document.querySelector("input[type='submit'][value*='Submit' i]"),
+        document.querySelector("input[type='submit'][value*='Enviar' i]"),
+        document.querySelector("button[type='submit']"),
+      ];
+      return cands.find(el => el && isVisible(el)) ?? null;
+    },
+    10000
+  );
+  if (!formSubmitBtn) throw new Error("Visa: form submit button not found");
+  await sleep(800 + Math.random() * 600);
+  await humanClick(formSubmitBtn);
+  const alertMsg = await new Promise(resolve => {
+    const tid = setTimeout(() => resolve(null), 8000);
+    document.addEventListener("octo-alert", (e) => { clearTimeout(tid); resolve(e.detail.msg); }, {once: true});
+  });
+  if (alertMsg) console.warn("[OctoProbe] Form submit alert:", alertMsg);
+  setBadge("Visa: form submitted…", "#9060cc");
+  return {ok: true};
+}
+
+async function visaStepForm({submitAfter = true} = {}) {
   setBadge("Visa: waiting for form…", "#9060cc");
 
   // Wait for the form element.
   const form = await waitFor(() => document.querySelector("form[name='vistoForm'], #vistoForm, form"), 20000);
-  if (!form) { await _clearWorkflowFailed("Visa: form not found"); return; }
+  if (!form) { await _clearWorkflowFailed("Visa: form not found", E.VISA_FAILED); return; }
 
   // ── Storage: pull person data, visa config ───────────────────────────────
   const {
@@ -1697,11 +1107,12 @@ async function visaStepForm() {
   const genderVal = (person.gender ?? "F").toUpperCase() === "M" ? "MALE" : "FEMALE";
   const postoId   = storedPostoId ?? "5088";
 
-  // ── Auto-generate passport dates if not supplied ──────────────────────────
-  // Field 14: issue date — random day 3–7 years before today.
+  // ── Passport dates from config.json ──────────────────────────────────────
   const _today = new Date();
   const _fmt   = d => `${d.getFullYear()}/${String(d.getMonth()+1).padStart(2,"0")}/${String(d.getDate()).padStart(2,"0")}`;
-  let passportIssueDate = person.passportIssue;
+  const _cfg = await fetch(chrome.runtime.getURL("config.json")).then(r => r.json()).catch(() => ({}));
+  let passportIssueDate  = _cfg.passportIssue;
+  let passportExpiryDate = _cfg.passportExpiry;
   if (!passportIssueDate) {
     const d = new Date(_today);
     d.setFullYear(d.getFullYear() - (3 + Math.floor(Math.random() * 5)));
@@ -1709,8 +1120,6 @@ async function visaStepForm() {
     d.setDate(1 + Math.floor(Math.random() * 28));
     passportIssueDate = _fmt(d);
   }
-  // Field 15: valid until — issue date + 10 years.
-  let passportExpiryDate = person.passportExpiry;
   if (!passportExpiryDate) {
     const d = new Date(passportIssueDate.replace(/\//g, "-"));
     d.setFullYear(d.getFullYear() + 10);
@@ -1837,50 +1246,7 @@ async function visaStepForm() {
   // Tab 6 is skipped entirely per specification.
 
   // ── Submit the form ───────────────────────────────────────────────────────
-  setBadge("Visa: submitting form…", "#9060cc");
-  await injectAlertCapture(true); // confirm/prompt safe here — captcha already solved
-
-  // Click the last "Next" / submit button to advance from tab 5 and submit.
-  // The form page uses a single submit button that becomes active after tab 5.
-  await _callPageFn(`
-    (function(){
-      // Try mudarTab to tab 6 to trigger server validation, then submit.
-      if(typeof mudarTab==="function") mudarTab(5,6);
-    })();
-  `);
-  await sleep(1500 + Math.random() * 500);
-
-  const formSubmitBtn = await waitFor(
-    () => {
-      const cands = [
-        document.querySelector("#btnSubmit"),
-        document.querySelector("input[type='submit'][value*='Submit' i]"),
-        document.querySelector("input[type='submit'][value*='Enviar' i]"),
-        document.querySelector("button[type='submit']"),
-      ];
-      return cands.find(el => el && isVisible(el)) ?? null;
-    },
-    10000
-  );
-  if (!formSubmitBtn) { await _clearWorkflowFailed("Visa: form submit button not found"); return; }
-
-  await sleep(800 + Math.random() * 600);
-  await humanClick(formSubmitBtn);
-
-  // Capture any alert (server-side validation errors).
-  const alertMsg = await new Promise(resolve => {
-    const tid = setTimeout(() => resolve(null), 8000);
-    document.addEventListener("octo-alert", (e) => {
-      clearTimeout(tid);
-      resolve(e.detail.msg);
-    }, {once: true});
-  });
-  if (alertMsg) {
-    console.warn("[OctoProbe] Form submit alert:", alertMsg);
-  }
-
-  await storageSet({"workflow-step": "schedule"});
-  setBadge("Visa: form submitted…", "#9060cc");
+  if (submitAfter) await _submitVisaForm();
 }
 
 // ---------------------------------------------------------------------------
@@ -1902,44 +1268,34 @@ async function visaStepSchedule() {
     },
     20000
   );
-  if (!captchaDiv) { await _clearWorkflowFailed("Visa: schedule captcha not found"); return; }
+  if (!captchaDiv) { await _clearWorkflowFailed("Visa: schedule captcha not found", E.VISA_FAILED); return; }
 
   // Solve reCAPTCHA for the schedule page.
   setBadge("Visa: solving schedule reCAPTCHA…", "#9060cc");
   const SCHEDULE_SITEKEY = "6LdOB9crAAAAADT4RFruc5sPmzLKIgvJVfL830d4";
   const solveStart = Date.now();
 
-  const {"captcha-mode": captchaMode} = await storageGet("captcha-mode");
   let captchaToken = null;
 
-  if (captchaMode === "human") {
-    const solved = await waitForRecaptcha();
-    if (!solved) { await _clearWorkflowFailed("Visa: schedule reCAPTCHA not solved"); return; }
-    // Extract token from the hidden textarea.
-    const ta = document.querySelector("#g-recaptcha-response-1, #g-recaptcha-response");
-    captchaToken = ta?.value ?? null;
-  } else {
-    const scheduleAction = document.querySelector("[data-sitekey][data-action]")?.dataset?.action
-                        ?? document.querySelector("[data-action]")?.dataset?.action
-                        ?? null;
-    const result = await sendBgMessage({
-      type: "solve-recaptcha-api",
-      pageUrl: location.href,
-      siteKey: SCHEDULE_SITEKEY,
-      action: scheduleAction,
-    }).catch(() => null);
-    if (!result?.ok || !result.token) {
-      await _clearWorkflowFailed("Visa: schedule reCAPTCHA API failed");
-      return;
-    }
-    const elapsed = Date.now() - solveStart;
-    if (elapsed < 8000) await sleep(8000 - elapsed);
-    captchaToken = result.token;
-    // Inject token into page fields.
-    await sendBgMessage({type: "inject-recaptcha-token", token: captchaToken}).catch(() => null);
+  const scheduleAction = document.querySelector("[data-sitekey][data-action]")?.dataset?.action
+                      ?? document.querySelector("[data-action]")?.dataset?.action
+                      ?? null;
+  const result = await sendBgMessage({
+    type: "solve-recaptcha-api",
+    pageUrl: location.href,
+    siteKey: SCHEDULE_SITEKEY,
+    action: scheduleAction,
+  }).catch(() => null);
+  if (!result?.ok || !result.token) {
+    await _clearWorkflowFailed("Visa: schedule reCAPTCHA API failed", E.VISA_FAILED);
+    return;
   }
+  const elapsed = Date.now() - solveStart;
+  if (elapsed < 8000) await sleep(8000 - elapsed);
+  captchaToken = result.token;
+  await sendBgMessage({type: "inject-recaptcha-token", token: captchaToken}).catch(() => null);
 
-  if (!captchaToken) { await _clearWorkflowFailed("Visa: no captcha token obtained"); return; }
+  if (!captchaToken) { await _clearWorkflowFailed("Visa: no captcha token obtained", E.VISA_FAILED); return; }
 
   // Fetch slots directly (bypasses window.data MAIN world issue).
   setBadge("Visa: fetching slots…", "#9060cc");
@@ -1948,13 +1304,13 @@ async function visaStepSchedule() {
     const resp = await fetch(`/VistosOnline/slots?posto_id=${POSTO}`, {
       method: "POST",
       headers: {"Content-Type": "application/x-www-form-urlencoded"},
-      body: `captcha=${encodeURIComponent(captchaToken)}`,
+      body: `posto_id=${encodeURIComponent(POSTO)}&captcha=${encodeURIComponent(captchaToken)}`,
       credentials: "include",
     });
     slotsData = await resp.json();
   } catch (e) {
     console.error("[OctoProbe] Slots fetch error:", e);
-    await _clearWorkflowFailed("Visa: slots API failed");
+    await _clearWorkflowFailed("Visa: slots API failed", E.VISA_FAILED);
     return;
   }
 
@@ -1964,12 +1320,16 @@ async function visaStepSchedule() {
   await _callPageFn(`window.data = ${JSON.stringify(slotsData)};`);
 
   // Parse available dates and pick earliest valid slot.
-  // Format: slotsData is array of "yyyy/mm/dd" strings OR an object with date keys.
+  // Server returns [{date: "YYYY-MM-DD", periods: [...]}, ...] (dashes).
+  // Normalise all entries to "YYYY/MM/DD" (slashes) for internal use.
   let availableDates = [];
   if (Array.isArray(slotsData)) {
-    availableDates = slotsData;
+    availableDates = slotsData.map(d => {
+      const raw = typeof d === "string" ? d : (d?.date ?? "");
+      return raw.replace(/-/g, "/");
+    }).filter(Boolean);
   } else if (slotsData && typeof slotsData === "object") {
-    availableDates = Object.keys(slotsData);
+    availableDates = Object.keys(slotsData).map(k => k.replace(/-/g, "/"));
   }
 
   const today = new Date();
@@ -1982,7 +1342,6 @@ async function visaStepSchedule() {
   cutoff.setDate(cutoff.getDate() + 90);
 
   const validDates = availableDates
-    .map(d => d.trim())
     .filter(d => /^\d{4}\/\d{2}\/\d{2}$/.test(d))
     .filter(d => {
       const dt = new Date(d.replace(/\//g, "-"));
@@ -1997,7 +1356,7 @@ async function visaStepSchedule() {
   console.log("[OctoProbe] Valid slot dates:", validDates);
 
   if (!validDates.length) {
-    await _clearWorkflowFailed("Visa: no valid slots available");
+    await _clearWorkflowFailed("Visa: no valid slots available", E.VISA_FAILED);
     return;
   }
 
@@ -2026,11 +1385,11 @@ async function visaStepSchedule() {
     return el && el.options.length > 1 ? el : null;
   }, 15000);
 
-  if (!periodSel) { await _clearWorkflowFailed("Visa: no period options loaded"); return; }
+  if (!periodSel) { await _clearWorkflowFailed("Visa: no period options loaded", E.VISA_FAILED); return; }
 
   // Pick first valid period option.
   const firstPeriod = [...periodSel.options].find(o => o.value && o.value.trim() !== "");
-  if (!firstPeriod) { await _clearWorkflowFailed("Visa: no valid period option"); return; }
+  if (!firstPeriod) { await _clearWorkflowFailed("Visa: no valid period option", E.VISA_FAILED); return; }
 
   await humanSelect(periodSel, firstPeriod.value);
   periodSel.dispatchEvent(new Event("change", {bubbles: true}));
@@ -2052,8 +1411,15 @@ async function visaStepSchedule() {
             headers:{"Content-Type":"application/x-www-form-urlencoded"},
             credentials:"include"
           });
-          var html = await resp.text();
-          window.postMessage({type:"octo-pdf-html", html:html}, "*");
+          var ct = resp.headers.get("content-type") ?? "";
+          if (ct.includes("pdf")) {
+            var blob = await resp.blob();
+            var blobUrl = URL.createObjectURL(blob);
+            window.postMessage({type:"octo-pdf-html", html:null, blobUrl:blobUrl}, "*");
+          } else {
+            var html = await resp.text();
+            window.postMessage({type:"octo-pdf-html", html:html}, "*");
+          }
         } catch(e) {
           window.postMessage({type:"octo-pdf-error", error:String(e)}, "*");
         }
@@ -2066,7 +1432,7 @@ async function visaStepSchedule() {
   // Click the schedule submit button.
   setBadge("Visa: submitting schedule…", "#9060cc");
   const schedSubmit = document.querySelector("#btnSubmit");
-  if (!schedSubmit) { await _clearWorkflowFailed("Visa: schedule submit button not found"); return; }
+  if (!schedSubmit) { await _clearWorkflowFailed("Visa: schedule submit button not found", E.VISA_FAILED); return; }
   await humanClick(schedSubmit);
 
   // Wait for pre-visto confirmation popup.
@@ -2086,50 +1452,403 @@ async function visaStepSchedule() {
   setBadge("Visa: waiting for PDF…", "#9060cc");
   const pdfMsg = await _waitPageMessage("octo-pdf-html", 45000);
 
-  if (!pdfMsg?.html) {
+  if (!pdfMsg?.html && !pdfMsg?.blobUrl) {
     const errMsg = pdfMsg?.error ?? "timeout";
-    await _clearWorkflowFailed(`Visa: PDF failed — ${errMsg}`);
+    await _clearWorkflowFailed(`Visa: PDF failed — ${errMsg}`, E.VISA_FAILED);
     return;
   }
 
-  // Download the PDF: extract it from the HTML blob response.
-  // The server returns raw PDF bytes embedded in the page via document.write() — the
-  // response Content-Type is application/pdf but we got the HTML wrapper.
-  // Instead, re-fetch the URL with same body to get the binary PDF.
   setBadge("Visa: downloading PDF…", "#9060cc");
-  try {
-    const form = document.querySelector("form[name='vistoForm'], form");
-    const formData = form ? new URLSearchParams(new FormData(form)).toString() : "";
-    const pdfResp = await fetch(`/VistosOnline/SubmeterVistoCriaPDF?posto_id=${POSTO}`, {
-      method: "POST",
-      headers: {"Content-Type": "application/x-www-form-urlencoded"},
-      body: formData,
-      credentials: "include",
-    });
-    const contentType = pdfResp.headers.get("content-type") ?? "";
-    if (contentType.includes("pdf")) {
-      const blob = await pdfResp.blob();
-      const url  = URL.createObjectURL(blob);
-      const a    = document.createElement("a");
-      a.href     = url;
-      a.download = `visa_appointment_${chosenDate.replace(/\//g,"-")}.pdf`;
-      document.body.appendChild(a);
-      a.click();
-      setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 5000);
-      setBadge("Visa: PDF downloaded!", "#00d4aa");
-    } else {
-      console.warn("[OctoProbe] PDF response not PDF content-type:", contentType);
-      setBadge("Visa: PDF response received (check downloads)", "#00d4aa");
+  const _pdfFilename = `visa_appointment_${chosenDate.replace(/\//g,"-")}.pdf`;
+  const _triggerDownload = (url) => {
+    const a = document.createElement("a");
+    a.href = url; a.download = _pdfFilename;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 5000);
+  };
+
+  if (pdfMsg.blobUrl) {
+    _triggerDownload(pdfMsg.blobUrl);
+    setBadge("Visa: PDF downloaded!", "#00d4aa");
+  } else {
+    try {
+      const form = document.querySelector("form[name='vistoForm'], form");
+      const formData = form ? new URLSearchParams(new FormData(form)).toString() : "";
+      const pdfResp = await fetch(`/VistosOnline/SubmeterVistoCriaPDF?posto_id=${POSTO}`, {
+        method: "POST",
+        headers: {"Content-Type": "application/x-www-form-urlencoded"},
+        body: formData,
+        credentials: "include",
+      });
+      const contentType = pdfResp.headers.get("content-type") ?? "";
+      if (contentType.includes("pdf")) {
+        _triggerDownload(URL.createObjectURL(await pdfResp.blob()));
+        setBadge("Visa: PDF downloaded!", "#00d4aa");
+      } else {
+        console.warn("[OctoProbe] PDF response not PDF content-type:", contentType);
+        setBadge("Visa: PDF response received (check downloads)", "#00d4aa");
+      }
+    } catch (e) {
+      console.error("[OctoProbe] PDF download error:", e);
+      setBadge("Visa: PDF fetch error", "#ff6b6b");
     }
-  } catch (e) {
-    console.error("[OctoProbe] PDF download error:", e);
-    setBadge("Visa: PDF fetch error", "#ff6b6b");
   }
 
-  // Workflow complete.
-  await storageSet({"workflow-type": null, "workflow-step": null, "login-pending": false});
-  console.log("[OctoProbe] Visa workflow complete");
+  console.log("[OctoProbe] Visa: schedule complete");
 }
+
+// ---------------------------------------------------------------------------
+// cmd-* handler helpers
+// ---------------------------------------------------------------------------
+
+async function _loginFillCredentials(creds) {
+  setBadge("Login: waiting for form…", "#f0c040");
+  const userEl = await waitFor(() => findBySelectors(USERNAME_SELECTORS), 10000);
+  if (!userEl) return {ok: false, status: "form_not_found"};
+  setBadge("Login: filling credentials…", "#f0c040");
+  await humanType(userEl, creds.username);
+  await sleep(500 + Math.random() * 500);
+  const passEl = await waitFor(() => findBySelectors(PASSWORD_SELECTORS), 4000);
+  if (!passEl) return {ok: false, status: "pass_not_found"};
+  await humanType(passEl, creds.password);
+  await sleep(500 + Math.random() * 500);
+  return {ok: true};
+}
+
+async function _loginSubmit() {
+  const rcEl = await waitFor(
+    () => document.querySelector("[data-sitekey], iframe[src*='recaptcha'], .g-recaptcha"),
+    8000
+  );
+  if (rcEl) {
+    rcEl.scrollIntoView({behavior: "smooth", block: "center"});
+    await sleep(800 + Math.random() * 600);
+    setBadge("Login: solving reCAPTCHA…", "#f0c040");
+    const solved = await waitForRecaptcha();
+    if (!solved) return {ok: false, status: "captcha_fail"};
+    const r = rcEl.getBoundingClientRect();
+    window._mX = Math.round(r.left + r.width * 0.5);
+    window._mY = Math.round(r.top + r.height * 0.5);
+  } else {
+    await sleep(800 + Math.random() * 600);
+  }
+  await injectAlertCapture();
+  const submitBtn = await waitFor(() => findBySelectors(LOGIN_SUBMIT_SELECTORS), 4000);
+  if (!submitBtn) return {ok: false, status: "submit_not_found"};
+  setBadge("Login: submitting…", "#f0c040");
+  await humanClick(submitBtn);
+  // RGPD consent popup
+  const rgpdEl = await waitFor(() => {
+    const el = document.querySelector("#loginMsg");
+    return isVisible(el) ? el : null;
+  }, 12000);
+  if (rgpdEl) {
+    setBadge("Login: accepting RGPD…", "#f0c040");
+    const cb1 = document.querySelector("#loginCheckbox1");
+    const cb2 = document.querySelector("#loginCheckbox2");
+    const cb3 = document.querySelector("#loginCheckbox3");
+    if (cb3?.checked) await humanClick(cb3);
+    await sleep(200 + Math.random() * 200);
+    if (cb1 && !cb1.checked) await humanClick(cb1);
+    await sleep(300 + Math.random() * 300);
+    if (cb2 && !cb2.checked) await humanClick(cb2);
+    await sleep(400 + Math.random() * 300);
+    const rgpdSubmit = await waitFor(() => {
+      const btn = document.querySelector("#loginSubmit");
+      return btn && !btn.disabled ? btn : null;
+    }, 5000);
+    if (rgpdSubmit) await humanClick(rgpdSubmit);
+    await sleep(1000 + Math.random() * 1000);
+  }
+  setBadge("Login: waiting for response…", "#f0c040");
+  await sleep(5000);
+  if (!/Authentication|authentication/i.test(location.pathname + location.search)) {
+    return {ok: true, status: "navigated"};
+  }
+  setBadge("Login: probing session…", "#f0c040");
+  let sessionOk = false;
+  try {
+    const probe = await fetch("/VistosOnline/Questionario", {
+      method: "GET", credentials: "include", redirect: "follow", cache: "no-store",
+    });
+    sessionOk = probe.ok && !/Authentication|authentication/i.test(probe.url);
+    console.log(`[OctoProbe] Login session probe: ${probe.url} — ${sessionOk ? "OK" : "FAIL"}`);
+  } catch(e) {
+    console.warn("[OctoProbe] Session probe error:", e);
+  }
+  if (sessionOk) {
+    setBadge("Logged in!", "#00d4aa");
+    location.href = "/VistosOnline/Questionario";
+    return {ok: true, status: "navigated"};
+  }
+  await sendBgMessage({type: "reset-recaptcha"});
+  setBadge("Login: rejected — will retry…", "#f0a030");
+  return {ok: false, status: "rejected"};
+}
+
+async function _registerOpenForm() {
+  const net = await checkNetworkQuality();
+  if (!net.good) return {ok: false, status: "network_poor", avg: net.avg};
+  setBadge("Register: finding link…", "#f0c040");
+  const regEl = await waitFor(
+    () => findBySelectors(REGISTER_LINK_SELECTORS) || findByText(["span","a","button","div"], REGISTER_LINK_TEXTS),
+    8000
+  );
+  if (!regEl) return {ok: false, status: "link_not_found"};
+  await sleep(900 + Math.random() * 1000);
+  await humanClick(regEl);
+  await sleep(300 + Math.random() * 300);
+  setBadge("Register: waiting for form…", "#f0c040");
+  const form = await waitFor(() => document.querySelector("#formReg"), 12000);
+  if (!form) return {ok: false, status: "form_blocked"};
+  await sleep(2500 + Math.random() * 2000);
+  return {ok: true, status: "form_ready"};
+}
+
+async function _registerSubmit() {
+  setBadge("Register: validating form…", "#f0c040");
+  const missing = _checkFormFields();
+  if (missing.length) return {ok: false, status: "form_incomplete", fields: missing};
+
+  const rcEl = document.querySelector("iframe[src*='recaptcha'], .g-recaptcha, #recaptcha, [class*='recaptcha']");
+  if (rcEl) {
+    rcEl.scrollIntoView({behavior: "smooth", block: "center"});
+    await sleep(800 + Math.random() * 600);
+    const r = rcEl.getBoundingClientRect();
+    window._mX = Math.round(r.left + r.width * 0.5);
+    window._mY = Math.round(r.top + r.height * 0.5);
+  }
+  setBadge("Register: solving reCAPTCHA…", "#f0c040");
+  const solved = await waitForRecaptcha();
+  if (!solved) return {ok: false, status: "captcha_fail"};
+
+  await injectAlertCapture();
+  document.addEventListener("octo-alert", (e) => {
+    console.log(`[OctoProbe] Register alert: "${e.detail.msg}"`);
+  }, {once: true});
+
+  const formSubmitBtn = document.querySelector(
+    "#formReg button[type='submit'], #formReg input[type='submit'], #formReg button[type='button']"
+  );
+  if (!formSubmitBtn) return {ok: false, status: "submit_not_found"};
+
+  setBadge("Register: opening privacy popup…", "#f0c040");
+  await humanClick(formSubmitBtn);
+
+  const MAX_RGPD = 2;
+  for (let rgpdAttempt = 1; rgpdAttempt <= MAX_RGPD; rgpdAttempt++) {
+    const rgpdPopup = await waitFor(() => {
+      const el = document.querySelector("#registroMsg");
+      return el && isVisible(el) ? el : null;
+    }, 10000);
+
+    if (!rgpdPopup) {
+      setBadge("Register: waiting for response…", "#f0c040");
+      return {ok: true, status: "submitted"};
+    }
+
+    setBadge(`Register: accepting privacy (${rgpdAttempt}/${MAX_RGPD})…`, "#f0c040");
+    await sleep(600 + Math.random() * 500);
+    const rgpdSubmit = document.querySelector("#registroSubmit");
+    if (!rgpdSubmit) return {ok: false, status: "rgpd_not_found"};
+
+    setBadge(`Register: submitting (${rgpdAttempt}/${MAX_RGPD})…`, "#f0c040");
+    await humanClick(rgpdSubmit);
+
+    const outcome = await new Promise(resolve => {
+      const checkBtn = setInterval(() => {
+        const btn = document.querySelector("#registroSubmit");
+        if (btn && !btn.disabled) { clearInterval(checkBtn); clearTimeout(navTimer); resolve("failed"); }
+      }, 300);
+      const navTimer = setTimeout(() => { clearInterval(checkBtn); resolve("timeout"); }, 20000);
+      window.addEventListener("beforeunload", () => {
+        clearInterval(checkBtn); clearTimeout(navTimer); resolve("navigated");
+      }, {once: true});
+    });
+
+    if (outcome === "navigated") return {ok: true, status: "navigated"};
+    if (rgpdAttempt >= MAX_RGPD) return {ok: false, status: "captcha_fail"};
+
+    const closeBtn = document.querySelector("#closepopupRegistro");
+    if (closeBtn && isVisible(closeBtn)) await humanClick(closeBtn);
+    await sleep(1500 + Math.random() * 1500);
+
+    await sendBgMessage({type: "reset-recaptcha"});
+    setBadge(`Register: re-solving captcha (${rgpdAttempt + 1}/${MAX_RGPD})…`, "#f0c040");
+    await sleep(4000 + Math.random() * 3000);
+
+    const reSolved = await waitForRecaptcha();
+    if (!reSolved) return {ok: false, status: "captcha_fail"};
+    await injectAlertCapture();
+    await sleep(800 + Math.random() * 1200);
+
+    setBadge(`Register: re-opening popup (${rgpdAttempt + 1}/${MAX_RGPD})…`, "#f0c040");
+    await humanClick(formSubmitBtn);
+  }
+  return {ok: false, status: "captcha_fail"};
+}
+
+async function _tokenFill(codeToken) {
+  if (!codeToken) return {ok: false, status: "no_token"};
+  await injectAlertCapture();
+  const findTokenInput = () => {
+    for (const sel of TOKEN_INPUT_SELECTORS) {
+      const el = document.querySelector(sel);
+      if (isVisible(el)) return el;
+    }
+    return null;
+  };
+  const tokenInput = await waitFor(findTokenInput, 15000);
+  if (!tokenInput) return {ok: false, status: "input_not_found"};
+  await sleep(1200 + Math.random() * 600);
+  const isUUID = v => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v ?? "");
+  const preFilled = tokenInput.value?.trim();
+  if (preFilled && isUUID(preFilled)) {
+    console.log("[OctoProbe] Token input pre-filled by server:", preFilled);
+    return {ok: true, prefilled: true};
+  }
+  tokenInput.scrollIntoView({behavior: "smooth", block: "center"});
+  await sleep(900 + Math.random() * 800);
+  const fillResult = await sendBgMessage({type: "fill-token", token: codeToken}).catch(() => null);
+  console.log("[OctoProbe] Type-token result:", fillResult);
+  await sleep(300 + Math.random() * 300);
+  if (!tokenInput.value) {
+    console.warn("[OctoProbe] Scripting API fill failed — isolated-world humanType fallback");
+    const target = findTokenInput() ?? tokenInput;
+    target.focus();
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+    if (setter) setter.call(target, ""); else target.value = "";
+    target.dispatchEvent(new Event("input", {bubbles: true}));
+    await humanType(target, codeToken);
+  }
+  return {ok: true};
+}
+
+async function _tokenSubmit() {
+  const submitBtn = TOKEN_SUBMIT_SELECTORS
+    .map(sel => document.querySelector(sel))
+    .find(el => isVisible(el));
+  if (!submitBtn) return {ok: false, status: "submit_not_found"};
+  setBadge("Verifying token…", "#f0c040");
+  await sleep(1100 + Math.random() * 1000);
+  await humanClick(submitBtn);
+  setBadge("Awaiting verification…", "#f0c040");
+  const outcome = await Promise.race([
+    new Promise(resolve => window.addEventListener("beforeunload", () => resolve("navigated"), {once: true})),
+    new Promise(resolve => document.addEventListener("octo-alert", (e) => resolve({alert: e.detail.msg}), {once: true})),
+    sleep(12000).then(() => "timeout"),
+  ]);
+  if (outcome === "navigated") return {ok: true, status: "navigated"};
+  if (outcome && typeof outcome === "object" && outcome.alert !== undefined) {
+    console.log("[OctoProbe] VerificarEmail alert:", outcome.alert);
+    await sleep(2000);
+    location.href = "/VistosOnline/Authentication.jsp";
+    return {ok: true, status: "navigated"};
+  }
+  // Timeout: try direct fetch
+  console.warn("[OctoProbe] No response from token form — trying direct VerificarEmail fetch");
+  try {
+    const urlToken = new URLSearchParams(location.search).get("token")?.toLowerCase() ?? null;
+    const {"email-code-token": storedCode} = await storageGet("email-code-token");
+    const params = new URLSearchParams({
+      language: "ENG",
+      token: storedCode ?? urlToken,
+      tokenSearchParams: urlToken ?? storedCode,
+    });
+    const resp = await fetch("/VistosOnline/VerificarEmail", {
+      method: "POST",
+      headers: {"Content-Type": "application/x-www-form-urlencoded"},
+      credentials: "include",
+      body: params.toString(),
+    });
+    const text = await resp.text();
+    console.log("[OctoProbe] Direct VerificarEmail:", resp.status, JSON.stringify(text));
+    if (text) {
+      let data;
+      try { data = JSON.parse(text); } catch (_) { data = null; }
+      if (data?.type === "error") return {ok: false, status: "token_rejected", reason: data.description};
+    }
+  } catch (e) {
+    console.error("[OctoProbe] Direct VerificarEmail error:", e);
+  }
+  location.href = "/VistosOnline/Authentication.jsp";
+  return {ok: true, status: "navigated"};
+}
+
+// ---------------------------------------------------------------------------
+// Command dispatch table
+// ---------------------------------------------------------------------------
+
+const _CMD_HANDLERS = {
+  "cmd-get-state":          async ()    => ({ok: true, state: _detectPageState()}),
+  "cmd-accept-cookie":      async ()    => { await dismissCookieConsent(); return {ok: true}; },
+  "cmd-switch-lang":        async ()    => { await switchToEnglish(); return {ok: true}; },
+  "cmd-click-login-link":   async ()    => { await clickLoginLink(); return {ok: true}; },
+
+  "cmd-register-open-form": async ()    => _registerOpenForm(),
+  "cmd-register-fill":      async (msg) => {
+    setBadge("Register: filling form…", "#f0c040");
+    await fillRegisterForm(msg.person, msg.email);
+    return {ok: true};
+  },
+  "cmd-register-submit":    async ()    => _registerSubmit(),
+
+  "cmd-token-fill":         async (msg) => _tokenFill(msg.token),
+  "cmd-token-submit":       async ()    => _tokenSubmit(),
+
+  "cmd-login-fill":         async (msg) => _loginFillCredentials(msg),
+  "cmd-login-submit":       async ()    => _loginSubmit(),
+
+  "cmd-go-questionnaire":   async ()    => { await visaStepGoToQuestionnaire(); return {ok: true}; },
+  "cmd-fill-questionnaire": async ()    => { await visaStepQuestionnaire(); return {ok: true}; },
+  "cmd-fill-form":          async ()    => { await visaStepForm();    return {ok: true}; },
+  "cmd-fill-form-tabs":     async ()    => { await visaStepForm({submitAfter: false}); return {ok: true}; },
+  "cmd-submit-form":        async ()    => _submitVisaForm(),
+  "cmd-schedule":           async ()    => { await visaStepSchedule(); return {ok: true}; },
+
+  "cmd-keep-tick": async () => {
+    const maxScroll = Math.max(0, document.body.scrollHeight - window.innerHeight);
+    if (maxScroll > 0) {
+      const pos = Math.floor(Math.random() * maxScroll);
+      window.scrollTo({top: pos, behavior: "smooth"});
+    }
+    return {ok: true};
+  },
+
+  "cmd-run-proxy-check": async () => {
+    const q = await _checkProxyQuality();
+    return {ok: true, ...q};
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Message listener
+// ---------------------------------------------------------------------------
+
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg.type === "abort") {
+    _abortFlag = true;
+    sendResponse({ok: true});
+    return false;
+  }
+  if (msg.type === "run-proxy-check") {
+    sendResponse({ok: true});
+    _checkProxyQuality().then(q => {
+      chrome.runtime.sendMessage({type: "ws-send", data: {
+        type: "proxy-check", workflow: null, timestamp: new Date().toISOString(), ...q,
+      }});
+    });
+    return false;
+  }
+  const handler = _CMD_HANDLERS[msg.type];
+  if (handler) {
+    _abortFlag = false;
+    handler(msg).then(r => sendResponse(r)).catch(e => sendResponse({ok: false, error: e.message}));
+    return true;
+  }
+  return false;
+});
 
 // ---------------------------------------------------------------------------
 // Main entry point
@@ -2142,209 +1861,46 @@ async function visaStepSchedule() {
 
   injectBadge();
 
-  // Warmup workflow runs on any domain to build reCAPTCHA Enterprise trust signals.
-  const {"workflow-type": earlyWfType} = await storageGet("workflow-type");
-  if (earlyWfType === "warmup") {
-    await warmupStep();
-    return;
-  }
-
   if (location.hostname !== TARGET_HOST) return;
 
-  // Detect the WAF bot-challenge page (/ch/bd.js injected into an otherwise empty body).
-  // bd.js checks window.alert.toString() for native code — any patch we inject breaks it.
-  // Let the challenge run completely untouched; the browser will navigate once it passes.
+  // WAF bot-challenge — let bd.js run untouched; count consecutive hits to detect hard block.
   if (document.querySelector('script[src*="/ch/bd.js"]')) {
-    // Count consecutive challenge pages without a real page in between.
-    // Normal: 1 challenge → bd.js passes → real page (counter resets).
-    // IP-blocked: challenge loops ≥ 3 times without ever reaching a real page.
-    const {"challenge-count": prevCount = 0} = await storageGet("challenge-count");
-    const challengeCount = prevCount + 1;
-    await storageSet({"challenge-count": challengeCount});
-    console.log(`[OctoProbe] Bot challenge page #${challengeCount} in sequence`);
-
-    if (challengeCount >= 3) {
-      // Hard block — stop the workflow and tell the user to switch proxy/IP.
-      console.warn("[OctoProbe] IP appears blocked — challenge looped 3+ times without passing");
-      await storageSet({"workflow-type": null, "workflow-step": null,
-                        "login-pending": false, "challenge-count": 0});
+    const {"challenge-count": prev = 0} = await storageGet("challenge-count");
+    const count = prev + 1;
+    await storageSet({"challenge-count": count});
+    console.log(`[OctoProbe] Bot challenge page #${count} in sequence`);
+    if (count >= 2) {
+      console.warn("[OctoProbe] WAF challenge looped 2+ times — IP or profile flagged");
+      await storageSet({"challenge-count": 0});
       setBadge("IP BLOCKED — switch proxy", "#ff0000");
-      return;
+    } else {
+      setBadge(`Bot challenge — waiting… (${count}/2)`, "#888888");
     }
-
-    setBadge(`Bot challenge — waiting… (${challengeCount}/3)`, "#888888");
     return;
   }
 
-  // Reached a real page — reset the consecutive-challenge counter.
   await storageSet({"challenge-count": 0});
 
-  // Dismiss cookie consent banner before anything else — it blocks clicks when visible.
-  await dismissCookieConsent();
-
-  const {
-    "workflow-type": wfType,
-    "workflow-step": wfStep,
-    "register-person": person,
-    "register-email": emailAcct,
-    "username": storedUsername,
-    "password": storedPassword,
-    "login-pending": loginPending,
-    "register-post-submitted": regPostSubmitted,
-  } = await storageGet(["workflow-type","workflow-step","register-person","register-email","username","password","login-pending","register-post-submitted"]);
-
-  console.log(`[OctoProbe] workflow=${wfType} step=${wfStep} url=${location.href}`);
-
-  // Pick up any pending account stored before token verification submit.
-  // Fires on Authentication.jsp (or any page) after successful email verification navigates here.
+  // Persist any pending account set just before token submit (survives navigation).
   const {"pending-account": pendingAccount} = await storageGet("pending-account");
-  if (pendingAccount && location.hostname === TARGET_HOST) {
+  if (pendingAccount) {
     console.log("[OctoProbe] Found pending account — saving:", pendingAccount.username);
     const saveResult = await sendBgMessage({type: "save-account", account: pendingAccount}).catch(() => null);
     if (saveResult?.ok) {
       await new Promise(res => chrome.storage.local.remove("pending-account", res));
       chrome.runtime.sendMessage({type: "stop-email-poll"});
-      console.log("[OctoProbe] Account download triggered:", saveResult.filename);
-      const {"register-chain": regChain = "none"} = await storageGet("register-chain");
-      if (regChain === "visa") {
-        await storageSet({
-          "username":      pendingAccount.username,
-          "password":      pendingAccount.password,
-          "workflow-type": "visa",
-          "workflow-step": null,
-          "email-token":   null,
-        });
-        setBadge("Account saved — logging in…", "#00d4aa");
-        location.href = "/VistosOnline/";
-      } else {
-        await storageSet({"workflow-type": null, "workflow-step": null, "email-token": null});
-        setBadge("Account saved!", "#00d4aa");
-      }
+      console.log("[OctoProbe] Account saved:", saveResult.filename);
     } else {
       console.warn("[OctoProbe] save-account failed:", saveResult);
-      setBadge("Account save failed", "#ff6b6b");
-    }
-    return;
-  }
-
-  // Login success/retry detection — fires on pages reached after form submit navigation.
-  if (loginPending && wfType === "login") {
-    const isAuthPage  = /Authentication|authentication/i.test(location.pathname + location.search);
-    const isLoginPage = /\/login\b/i.test(location.pathname); // bd.js replayed the POST here
-
-    if (isLoginPage) {
-      // Check for secblock — IP/account hard-blocked by the server.
-      const bodyText = document.body?.innerText || "";
-      if (/secblock|exceeded.*limit|user blocked/i.test(bodyText)) {
-        console.warn("[OctoProbe] Login: secblock detected — IP or account is blocked");
-        await storageSet({"login-pending": false, "login-form-attempt": 0});
-        await _clearWorkflowFailed("IP/account BLOCKED — switch proxy");
-        return;
-      }
-      // bd.js passed the challenge and replayed the POST with the dummy token, which the
-      // server rejected. Challenge cookie is now set — navigate back to auth for phase 2.
-      console.log("[OctoProbe] Login: bd.js challenge passed (dummy token) — proceeding to phase 2");
-      setBadge("Login: re-solving captcha…", "#f0c040");
-      location.href = "/VistosOnline/Authentication.jsp";
-      return;
-    }
-
-    if (!isAuthPage) {
-      // We navigated somewhere other than auth or the login endpoint — success.
-      await storageSet({"workflow-type": null, "workflow-step": null, "login-pending": false, "login-form-attempt": 0});
-      setBadge("Logged in!", "#00d4aa");
-      console.log("[OctoProbe] Login successful — workflow complete");
-      return;
     }
   }
 
-  if (wfType === "register") {
-    const isTokenPage = location.search.includes("token=");
-    const isAuthPage  = /Authentication|authentication/i.test(location.pathname + location.search);
-    const isLoginPage = /\/login\b/i.test(location.pathname);
+  // Dismiss cookie consent before reporting state — it blocks clicks when visible.
+  await dismissCookieConsent();
 
-    if (isLoginPage) {
-      // bd.js replayed the Phase-0 register POST to /login — challenge cookie now set.
-      location.href = "/VistosOnline/Authentication.jsp";
-      return;
-    }
+  const state = _detectPageState();
+  console.log(`[OctoProbe] page-ready: state=${state} url=${location.href}`);
+  chrome.runtime.sendMessage({type: "page-ready", state, url: location.href}).catch(() => {});
 
-    if (regPostSubmitted) {
-      // Phase-1 real form POST completed — server navigated us somewhere unknown.
-      // Clear flag and poll for the verification email regardless of landing URL.
-      await storageSet({"register-post-submitted": false});
-      setBadge("Register: waiting for verification email…", "#f0c040");
-      const token = await waitForEmailToken(emailAcct?.jwt, 180000);
-      if (!token) {
-        await _clearWorkflowFailed("Register: no verification email received");
-        return;
-      }
-      location.href = `/VistosOnline/Authentication.jsp?token=${token}`;
-      return;
-    }
-
-    if (isTokenPage) {
-      await registerStepToken(emailAcct);
-    } else if (isAuthPage && wfStep === "auth") {
-      await registerStepAuth(person, emailAcct);
-    } else if (!isAuthPage && wfStep === "home") {
-      await registerStepHome();
-    } else {
-      // Unexpected state — show info and do nothing
-      setBadge(`Register: ${wfStep ?? "?"}`, "#888");
-    }
-
-  } else if (wfType === "login") {
-    const isAuthPage = /Authentication|authentication/i.test(location.pathname + location.search);
-    if (wfStep === "auth" && isAuthPage) {
-      await loginStepAuth({username: storedUsername, password: storedPassword});
-    } else if (wfStep === "home") {
-      await loginStepHome();
-    } else {
-      setBadge(`Login: ${wfStep ?? "?"}`, "#888");
-    }
-
-  } else if (wfType === "visa") {
-    // Route purely by current page state — no storage step dependency.
-    // _detectPageState() inspects URL + DOM, so it's always accurate after navigation.
-    const pageState = _detectPageState();
-    console.log(`[OctoProbe] Visa dispatch: state=${pageState} url=${location.href}`);
-
-    switch (pageState) {
-      case "not-logged-in":
-        // Reached the site but not authenticated — switch language then go to login.
-        await switchToEnglish();
-        await clickLoginLink();
-        break;
-      case "auth":
-        await visaStepAuth({username: storedUsername, password: storedPassword});
-        break;
-      case "logged-in":
-        // Authenticated home/dashboard — navigate to questionnaire.
-        await visaStepGoToQuestionnaire();
-        break;
-      case "questionnaire":
-        await visaStepQuestionnaire();
-        break;
-      case "form":
-        await visaStepForm();
-        break;
-      case "schedule":
-        await visaStepSchedule();
-        break;
-      case "session-lost":
-        // URL implies a workflow page but required DOM is missing — session expired.
-        // Return to home so _detectPageState can re-evaluate and log in if needed.
-        console.warn("[OctoProbe] Visa: session-lost — navigating home to recover");
-        location.href = "/VistosOnline/";
-        break;
-      default:
-        setBadge("Visa: unknown page state", "#888");
-        console.warn("[OctoProbe] Visa: unrecognised page — no action");
-    }
-
-  } else {
-    // Legacy / no workflow set — do nothing extra
-    setBadge(`Octo Probe v${chrome.runtime.getManifest().version}`, "#00d4aa");
-  }
+  setBadge(`Octo Probe v${chrome.runtime.getManifest().version}`, "#00d4aa");
 })();

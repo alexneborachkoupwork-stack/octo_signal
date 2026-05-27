@@ -10,4 +10,5 @@ doc/
 analyze_har.py
 detail_analysis.py
 check_*.py
-/data/__pycache__
+.claude/
+extension/config.json
