@@ -12,10 +12,12 @@ Manager WS Server (you)
    Extension (client)
 ```
 
-The extension auto-connects on startup using the URL in `extension/config.json`:
+The extension connects to the **Visa Booking Hub** when opened via `/worker-init?botId=…` (recommended), or standalone using `extension/config.json`:
 ```json
-{ "managerWsUrl": "ws://localhost:9000" }
+{ "managerWsUrl": "ws://localhost:3000/ext?botId=<uuid>" }
 ```
+
+Hub URL format: `ws://<host>:<port>/ext?botId=<bot-uuid>` (hub sends `{ "type": "ack", "botId" }` on connect; extension sends `{ "type": "hello", "version" }`).
 
 Reconnect is automatic (5 s back-off). All frames are **JSON text**.
 
