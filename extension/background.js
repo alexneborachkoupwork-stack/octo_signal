@@ -25,6 +25,70 @@ let _activeTabId = null;
 chrome.storage.local.get("active-tab-id").then(d => { if (d["active-tab-id"]) _activeTabId = d["active-tab-id"]; });
 
 // ---------------------------------------------------------------------------
+// Run logger — accumulates timestamped entries during a single command run
+// and saves to a .log file via chrome.downloads when the run ends.
+// One file per command: register_auto_YYYY-MM-DDTHH-MM-SS.log etc.
+// ---------------------------------------------------------------------------
+
+const _runLog = (() => {
+  // Capture originals NOW, before _patchBgConsole wraps them — prevents infinite recursion
+  // where _push → console.log → patched wrapper → _runLog.entry → _push → ...
+  const _print = console.log.bind(console);
+  let _lines = [];
+  let _label = null;
+
+  function _ts() { return new Date().toISOString(); }
+
+  function start(label) {
+    _label = label;
+    _lines = [];
+    _push(`=== ${label} started ===`);
+  }
+
+  function _push(msg) {
+    const line = `${_ts()}  ${msg}`;
+    _lines.push(line);
+    _print(`[RunLog] ${msg}`); // always use pre-patch original
+  }
+
+  function entry(msg) {
+    if (_label) _push(msg);
+  }
+
+  function finish(status) {
+    if (!_label) return;
+    _push(`=== finished: ${status} ===`);
+    const ts = _ts().replace(/[:.]/g, "-").slice(0, 19);
+    const filename = `${_label}_${ts}.log`;
+    const url = "data:text/plain;charset=utf-8," + encodeURIComponent(_lines.join("\n") + "\n");
+    chrome.downloads.download({ url, filename, saveAs: false }).catch(() => {});
+    _lines = [];
+    _label = null;
+  }
+
+  return { start, entry, finish };
+})();
+self._runLog = _runLog; // expose to communication.js (same SW scope, but const isn't on self)
+
+// Forward SW console output to the run logger.
+(function _patchBgConsole() {
+  let _inFwd = false; // recursion guard (belt-and-suspenders; _runLog uses pre-patch console)
+  const _fwd = (level, args) => {
+    if (_inFwd) return;
+    _inFwd = true;
+    try {
+      const text = args.map(a => (a instanceof Error ? a.stack : typeof a === "object" ? JSON.stringify(a) : String(a))).join(" ");
+      _runLog.entry(`[${level}] ${text}`);
+    } catch (_) {}
+    _inFwd = false;
+  };
+  for (const level of ["log", "warn", "error", "info"]) {
+    const orig = console[level].bind(console);
+    console[level] = function (...args) { orig(...args); _fwd(level.toUpperCase(), args); };
+  }
+})();
+
+// ---------------------------------------------------------------------------
 // Fake person generator (JS port of data/person.py)
 // ---------------------------------------------------------------------------
 
@@ -493,43 +557,79 @@ async function F1_openAuthPage() {
 
   if (state === "auth") return {ok: true, status: "ready"};
 
-  // not-logged-in: language switch may navigate (if not already English); click login always navigates.
-  // Fire lang-switch without awaiting so we can arm the listener before the navigation fires.
-  const langCmd = sendTabCmd("cmd-switch-lang").catch(() => {});
-  const langReady = waitForPageReady(6000); // short timeout — no nav if already English
-  await langCmd;
-  await langReady.catch(() => {}); // ignore timeout = page was already English
+  // Retry loop: lang switch + login link click.
+  // The lang switch can reload the page (if not already English), and the reload fires
+  // a page-ready at almost exactly the 6 s timeout boundary — a tight race where the
+  // lang-reload page-ready can bleed into authReady and resolve it with "not-logged-in".
+  // Using a 15 s timeout for langReady eliminates the race, and the retry loop catches
+  // any remaining edge cases.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) {
+      await new Promise(r => setTimeout(r, 1500 + attempt * 500));
+      try { ({state} = await sendTabCmd("cmd-get-state")); } catch (_) { state = "unknown"; }
+      if (state === "auth") return {ok: true, status: "ready"};
+      if (state !== "not-logged-in") {
+        const pr = waitForPageReady(30000);
+        const tabId = await _getActiveTab();
+        await chrome.tabs.update(tabId, {url: TARGET_URL});
+        ({state} = await pr);
+        if (state === "auth") return {ok: true, status: "ready"};
+      }
+    }
 
-  // Login-link click always navigates — arm listener first.
-  const authReady = waitForPageReady(20000);
-  await sendTabCmd("cmd-click-login-link").catch(() => {});
-  const {state: authState} = await authReady;
-  if (authState !== "auth") throw new Error(`F1: expected auth, got ${authState}`);
-  return {ok: true, status: "ready"};
+    // Language switch may reload the page — 15 s gives ample room past the reload time.
+    const langCmd = sendTabCmd("cmd-switch-lang").catch(() => {});
+    const langReady = waitForPageReady(15000);
+    await langCmd;
+    await langReady.catch(() => {}); // ignore timeout (already English) or navigation
+
+    // Confirm still on not-logged-in before arming the login listener.
+    try { ({state} = await sendTabCmd("cmd-get-state")); } catch (_) { state = "unknown"; }
+    if (state === "auth") return {ok: true, status: "ready"};
+
+    // Login-link click always navigates — arm listener first.
+    const authReady = waitForPageReady(20000);
+    await sendTabCmd("cmd-click-login-link").catch(() => {});
+    try {
+      const {state: authState} = await authReady;
+      if (authState === "auth") return {ok: true, status: "ready"};
+      state = authState;
+    } catch (_) {
+      state = "timeout";
+    }
+    _runLog.entry(`F1: attempt ${attempt + 1} got state=${state} — retrying`);
+  }
+  throw new Error(`F1: expected auth, got ${state}`);
 }
 
 async function F2_register(person, emailAcct) {
+  _runLog.entry(`F2: person=${person.name} ${person.surname} email=${emailAcct.email}`);
   await sendTabCmd("cmd-register-open-form");
+  _runLog.entry("F2: form opened");
   await sendTabCmd("cmd-register-fill", {person, email: emailAcct.email});
+  _runLog.entry("F2: form filled");
 
   // Arm BEFORE the submit loop — the server redirect to the token page can arrive
   // within milliseconds of the RGPD submit, before the loop exits and we could call
   // waitForPageReady.  If we armed it after, the page-ready signal would be lost.
   const tokenPageReady = waitForPageReady(180000);
 
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const result = await sendTabCmd("cmd-register-submit").catch(() => ({ok: true, status: "navigated"}));
-    if (result.status === "navigated" || result.status === "submitted") break;
-    if (result.status !== "captcha_fail") throw new Error(`F2 register-submit: ${result.status}`);
-    if (attempt >= 2) throw new Error("F2: captcha failed after 3 attempts");
-    await new Promise(r => setTimeout(r, 4000));
-  }
+  // 2-attempt retry is handled inside cmd-register-submit (_registerSubmit).
+  _runLog.entry("F2: captcha submit (up to 2 attempts internally)");
+  const result = await sendTabCmd("cmd-register-submit").catch(() => ({ok: true, status: "navigated"}));
+  _runLog.entry(`F2: submit result → ${result.status}`);
+  if (result.status === "ip_blocked") throw new Error("F2: IP blocked by captcha rate-limit");
+  if (result.status !== "navigated" && result.status !== "submitted")
+    throw new Error(`F2: register failed: ${result.status}`);
 
+  _runLog.entry("F2: waiting for token page redirect + email code");
   _startEmailPoll(emailAcct.jwt);
   await tokenPageReady; // wait for token page navigation
+  _runLog.entry("F2: token page reached — polling email");
 
   const codeToken = await _waitForEmailCodeToken(120000);
   if (!codeToken) throw new Error("F2: email code token timeout");
+  _runLog.entry(`F2: email code token received: ${codeToken}`);
 
   // Write pending-account BEFORE submit click — page navigates on success,
   // killing the content script; main() on the next page picks this up and saves the CSV.
@@ -552,6 +652,7 @@ async function F2_register(person, emailAcct) {
   const verifyReady = waitForPageReady(30000); // arm before submit navigates
   await sendTabCmd("cmd-token-submit").catch(() => {});
   const {state: finalState} = await verifyReady;
+  _runLog.entry(`F2: verification done → state=${finalState}`);
   return {ok: true, status: finalState === "auth" ? "verified" : finalState};
 }
 
@@ -586,10 +687,16 @@ async function F4_formFilling() {
   const {state: qState} = await pageReady;
   if (qState !== "questionnaire") throw new Error(`F4: expected questionnaire, got ${qState}`);
 
-  pageReady = waitForPageReady(60000);
-  await sendTabCmd("cmd-fill-questionnaire").catch(() => {});
-  const {state: fState} = await pageReady;
-  if (fState !== "form") throw new Error(`F4: expected form, got ${fState}`);
+  let fState;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    pageReady = waitForPageReady(90000);
+    await sendTabCmd("cmd-fill-questionnaire").catch(() => {});
+    ({state: fState} = await pageReady);
+    if (fState === "form") break;
+    if (fState !== "questionnaire") throw new Error(`F4: expected form, got ${fState}`);
+    // questionnaire page reloaded — retry
+  }
+  if (fState !== "form") throw new Error(`F4: questionnaire never reached form after retries`);
 
   pageReady = waitForPageReady(90000);
   await sendTabCmd("cmd-fill-form").catch(() => {});
@@ -615,42 +722,53 @@ function stopF6() {
 }
 
 async function F_warmup(config) {
+  const idleStep = config.idleStep ?? "login";
+  _runLog.start(`warmup_${idleStep}`);
+  _runLog.entry(`username=${config.username} idleStep=${idleStep}`);
   stopF6();
   await _resetWorkflow();
-  await chrome.storage.local.set({"warmup-idle-state": config.idleStep ?? "login"});
+  await chrome.storage.local.set({"warmup-idle-state": idleStep});
 
+  _runLog.entry("F_warmup: opening auth page");
   await F1_openAuthPage();
+  _runLog.entry("F_warmup: logging in");
   await F3_login({username: config.username, password: config.password});
-
-  const idleStep = config.idleStep ?? "login";
+  _runLog.entry("F_warmup: logged in");
 
   if (idleStep === "login") {
     F6_keepSession();
+    _runLog.finish("ok idleStep=login");
     return {ok: true, idleStep: "login"};
   }
 
+  _runLog.entry("F_warmup: navigating to questionnaire");
   let pageReady = waitForPageReady(30000);
   await sendTabCmd("cmd-go-questionnaire").catch(() => {});
   const {state: qState} = await pageReady;
   if (qState !== "questionnaire") throw new Error(`F_warmup: expected questionnaire, got ${qState}`);
+  _runLog.entry("F_warmup: filling questionnaire");
 
   pageReady = waitForPageReady(60000);
   await sendTabCmd("cmd-fill-questionnaire").catch(() => {});
   const {state: fState} = await pageReady;
   if (fState !== "form") throw new Error(`F_warmup: expected form, got ${fState}`);
+  _runLog.entry("F_warmup: on form page");
 
   if (idleStep === "form") {
     await sendTabCmd("cmd-fill-form-tabs").catch(() => {});
     F6_keepSession();
+    _runLog.finish("ok idleStep=form");
     return {ok: true, idleStep: "form"};
   }
 
   if (idleStep === "schedule") {
+    _runLog.entry("F_warmup: submitting form → schedule");
     pageReady = waitForPageReady(90000);
     await sendTabCmd("cmd-fill-form").catch(() => {});
     const {state: sState} = await pageReady;
     if (sState !== "schedule") throw new Error(`F_warmup: expected schedule, got ${sState}`);
     F6_keepSession();
+    _runLog.finish("ok idleStep=schedule");
     return {ok: true, idleStep: "schedule"};
   }
 
@@ -658,31 +776,45 @@ async function F_warmup(config) {
 }
 
 async function F_apply() {
+  _runLog.start("apply");
   stopF6();
   const {"warmup-idle-state": idleState = "login"} =
     await chrome.storage.local.get("warmup-idle-state");
+  _runLog.entry(`F_apply: idleState=${idleState}`);
 
   if (idleState === "login") {
+    _runLog.entry("F_apply: running F4 form filling");
     await F4_formFilling();
-    return F5_scheduling({});
+    _runLog.entry("F_apply: running F5 scheduling");
+    const r = await F5_scheduling({});
+    _runLog.finish(`ok status=${r.status ?? r.ok}`);
+    return r;
   }
 
   if (idleState === "form") {
+    _runLog.entry("F_apply: submitting form from idle");
     const pageReady = waitForPageReady(30000);
     await sendTabCmd("cmd-submit-form").catch(() => {});
     const {state: sState} = await pageReady;
     if (sState !== "schedule") throw new Error(`F_apply: expected schedule, got ${sState}`);
-    return F5_scheduling({});
+    _runLog.entry("F_apply: running F5 scheduling");
+    const r = await F5_scheduling({});
+    _runLog.finish(`ok status=${r.status ?? r.ok}`);
+    return r;
   }
 
   if (idleState === "schedule") {
-    return F5_scheduling({});
+    _runLog.entry("F_apply: running F5 scheduling from idle");
+    const r = await F5_scheduling({});
+    _runLog.finish(`ok status=${r.status ?? r.ok}`);
+    return r;
   }
 
   throw new Error(`F_apply: unknown idleState "${idleState}"`);
 }
 
 async function F_allInOne(config) {
+  _runLog.start("all_in_one");
   stopF6();
   await _resetWorkflow();
 
@@ -713,14 +845,20 @@ async function F_allInOne(config) {
     "email-code-token": null,
   });
 
+  _runLog.entry(`all_in_one: person=${person.name} ${person.surname} email=${emailAcct.email}`);
   await F1_openAuthPage();
+  await sendTabCmd("cmd-log-ip").catch(() => {});
   await F2_register(person, emailAcct);
+  _runLog.entry("all_in_one: registration done — logging in");
 
   await F1_openAuthPage();
   await F3_login({username: person.username, password: person.password});
+  _runLog.entry("all_in_one: logged in — running F4+F5");
 
   await F4_formFilling();
-  return F5_scheduling({});
+  const r = await F5_scheduling({});
+  _runLog.finish(`ok status=${r.status ?? r.ok}`);
+  return r;
 }
 
 // ---------------------------------------------------------------------------
@@ -755,6 +893,8 @@ function _runRegister(realPerson) {
     try {
       stopF6();
       await _resetWorkflow();
+      const label = realPerson ? "register_real" : "register_auto";
+      _runLog.start(label);
       let person;
       if (realPerson) {
         const acct = generatePerson();
@@ -769,10 +909,13 @@ function _runRegister(realPerson) {
           nationality: String(realPerson.nationality ?? "").trim(),
           traveldoc:   String(realPerson.traveldoc  ?? "").trim(),
         };
+        _runLog.entry(`person: ${person.name} ${person.surname} ${person.nationality} ${person.traveldoc}`);
       } else {
         person = generatePerson();
+        _runLog.entry(`person (auto): ${person.name} ${person.surname}`);
       }
       const emailAcct = await createTempEmail();
+      _runLog.entry(`email created: ${emailAcct.email}`);
       await chrome.storage.local.set({
         "register-person":  person,
         "register-email":   emailAcct,
@@ -780,10 +923,18 @@ function _runRegister(realPerson) {
         "email-code-token": null,
       });
       F1_openAuthPage()
+        .then(() => sendTabCmd("cmd-log-ip").catch(() => {}))
         .then(() => F2_register(person, emailAcct))
-        .then(r => self.Comm?.send({type: "register-done", ...r, email: emailAcct.email, username: person.username, password: person.password}))
-        .catch(e => self.Comm?.send({type: "error", reason: e.message}));
+        .then(r => {
+          _runLog.finish(`ok status=${r.status}`);
+          self.Comm?.send({type: "register-done", ...r, email: emailAcct.email, username: person.username, password: person.password});
+        })
+        .catch(e => {
+          _runLog.finish(`error: ${e.message}`);
+          self.Comm?.send({type: "error", reason: e.message});
+        });
     } catch(e) {
+      _runLog.finish(`error: ${String(e)}`);
       self.Comm?.send({type: "error", reason: String(e)});
     }
   })();
@@ -833,6 +984,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({ok: true});
     });
     return true;
+
+  } else if (msg.type === "log-entry") {
+    _runLog.entry(msg.msg);
+    sendResponse({ok: true});
 
   } else if (msg.type === "run-register") {
     _runRegister(msg.realPerson);
@@ -1148,6 +1303,34 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     })
     .then(() => sendResponse({ok: true}))
     .catch(e => sendResponse({ok: false, error: String(e)}));
+    return true;
+
+  } else if (msg.type === "cdp-click") {
+    // Dispatch a trusted mouse click via CDP Input.dispatchMouseEvent.
+    // isTrusted=true inside cross-origin iframes (e.g. reCAPTCHA anchor frame).
+    const tabId = sender.tab?.id;
+    if (!tabId) { sendResponse({ok: false, error: "no sender tab"}); return true; }
+    (async () => {
+      try {
+        await chrome.debugger.attach({tabId}, "1.3");
+        const {x, y} = msg;
+        const base = {x, y, modifiers: 0};
+        await chrome.debugger.sendCommand({tabId}, "Input.dispatchMouseEvent",
+          {...base, type: "mouseMoved", button: "none", clickCount: 0, buttons: 0});
+        await new Promise(r => setTimeout(r, 40 + Math.random() * 60));
+        await chrome.debugger.sendCommand({tabId}, "Input.dispatchMouseEvent",
+          {...base, type: "mousePressed", button: "left", clickCount: 1, buttons: 1});
+        await new Promise(r => setTimeout(r, 80 + Math.random() * 100));
+        await chrome.debugger.sendCommand({tabId}, "Input.dispatchMouseEvent",
+          {...base, type: "mouseReleased", button: "left", clickCount: 1, buttons: 0});
+        await chrome.debugger.detach({tabId});
+        sendResponse({ok: true});
+      } catch(e) {
+        console.warn("[OctoProbe BG] CDP click failed:", e.message);
+        try { await chrome.debugger.detach({tabId}); } catch(_) {}
+        sendResponse({ok: false, error: String(e)});
+      }
+    })();
     return true;
 
   } else if (msg.type === "get-recaptcha-sitekey") {

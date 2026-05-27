@@ -32,8 +32,8 @@
     #btn-save:hover { background: #00b890; }
     #btn-go       { background: #2a2a4a; color: #00d4aa; border: 1px solid #00d4aa; }
     #btn-go:hover { background: #1a1a3e; }
-    #btn-register { background: #2a1a4a; color: #d4a0ff; border: 1px solid #9060cc; }
-    #btn-register:hover { background: #1a0a3e; }
+    #btn-register, #btn-visa { background: #2a1a4a; color: #d4a0ff; border: 1px solid #9060cc; }
+    #btn-register:hover, #btn-visa:hover { background: #1a0a3e; }
     #status { margin-top: 10px; font-size: 11px; min-height: 14px; color: #00d4aa; }
     #status.error { color: #ff6b6b; }
     hr { border: none; border-top: 1px solid #222; margin: 10px 0; }
@@ -70,10 +70,6 @@
     <button id="btn-go">Login</button>
   </div>
 
-  <div class="row">
-    <button id="btn-register">Register (auto)</button>
-  </div>
-
   <p id="status"></p>
 
   <hr />
@@ -89,6 +85,10 @@
     <input type="checkbox" id="chk-parallel" />
     <span>Parallel mode (race all solvers)</span>
   </div>
+  <div class="chk-row">
+    <input type="checkbox" id="chk-good-proxy" />
+    <span>Good proxy (direct reCAPTCHA click)</span>
+  </div>
 
   <hr />
 
@@ -103,14 +103,14 @@
   <div id="visa-section">
     <label style="color:#9060cc;font-size:10px;text-transform:uppercase;letter-spacing:0.6px;display:block;margin-bottom:4px">Visa Appointment</label>
 
-    <label for="visa-arrival">Arrival Date (yyyy/mm/dd)</label>
-    <input id="visa-arrival" type="text" placeholder="2026/10/21" autocomplete="off" />
-
     <label for="visa-posto">Consular Post ID</label>
-    <input id="visa-posto" type="text" placeholder="5088" autocomplete="off" />
+    <input id="visa-posto" type="text" placeholder="5084" value="5084" autocomplete="off" />
 
     <div class="row" style="margin-top:10px">
-      <button id="btn-visa" style="background:#2a1a4a;color:#d4a0ff;border:1px solid #9060cc;flex:1">Apply for Visa</button>
+      <button id="btn-register">Test All in One</button>
+    </div>
+    <div class="row" style="margin-top:6px">
+      <button id="btn-visa">Apply for Visa</button>
     </div>
   </div>
 

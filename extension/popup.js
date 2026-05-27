@@ -7,13 +7,13 @@ const statusEl     = document.getElementById("status");
 const swEl         = document.getElementById("sw-status");
 const selSolver    = document.getElementById("sel-solver");
 const chkParallel  = document.getElementById("chk-parallel");
+const chkGoodProxy = document.getElementById("chk-good-proxy");
 
 // Email provider elements
 const btnEmailMailtm = document.getElementById("btn-email-mailtm");
 const btnEmailCf     = document.getElementById("btn-email-cf");
 
 // Visa section elements
-const visaArrivalEl = document.getElementById("visa-arrival");
 const visaPostoEl   = document.getElementById("visa-posto");
 const btnVisa       = document.getElementById("btn-visa");
 
@@ -33,16 +33,20 @@ function setStatus(msg, isError = false) {
 
 // Load saved credentials, captcha settings, real person data, and workflow state on open.
 chrome.storage.local.get(
-  ["username","password","captcha-solver","captcha-parallel",
+  ["username","password","captcha-solver","captcha-parallel","good-proxy",
    "workflow-type","workflow-step","real-person-input",
-   "visa-arrival-date","visa-consular-post",
+   "visa-consular-post",
    "email-provider"],
   (data) => {
     if (data.username) userEl.value = data.username;
     if (data.password) passEl.value = data.password;
 
-    if (data["visa-arrival-date"]) visaArrivalEl.value = data["visa-arrival-date"];
-    if (data["visa-consular-post"]) visaPostoEl.value  = data["visa-consular-post"];
+    // Restore stored value, or seed storage with the HTML default (5084) on first run.
+    if (data["visa-consular-post"]) {
+      visaPostoEl.value = data["visa-consular-post"];
+    } else {
+      chrome.storage.local.set({"visa-consular-post": visaPostoEl.value});
+    }
 
     const wfType = data["workflow-type"];
     const wfStep = data["workflow-step"];
@@ -52,8 +56,9 @@ chrome.storage.local.get(
       setStatus("Credentials loaded.");
     }
 
-    selSolver.value     = data["captcha-solver"]   ?? "capsolver";
-    chkParallel.checked = data["captcha-parallel"] ?? false;
+    selSolver.value      = data["captcha-solver"]   ?? "capsolver";
+    chkParallel.checked  = data["captcha-parallel"] ?? false;
+    chkGoodProxy.checked = data["good-proxy"]       ?? false;
 
     setEmailProvider(data["email-provider"] ?? "mailtm");
 
@@ -91,6 +96,10 @@ selSolver.addEventListener("change", () => {
 
 chkParallel.addEventListener("change", () => {
   chrome.storage.local.set({"captcha-parallel": chkParallel.checked});
+});
+
+chkGoodProxy.addEventListener("change", () => {
+  chrome.storage.local.set({"good-proxy": chkGoodProxy.checked});
 });
 
 function setEmailProvider(provider) {
@@ -136,10 +145,17 @@ goBtn.addEventListener("click", () => {
   window.close();
 });
 
-// Register (auto) — full pipeline: register → login → apply
+// Test All in One — full pipeline: register → login → apply
+// consulPost is required; all other visa fields fall back to auto-calculated values.
 regBtn.addEventListener("click", () => {
-  chrome.runtime.sendMessage({type: "comm-dispatch", payload: {type: "all-in-one"}});
-  window.close();
+  const postoId = visaPostoEl.value.trim();
+  if (!postoId) { setStatus("Consular Post ID is required.", true); return; }
+  chrome.storage.local.set({"visa-consular-post": postoId}, () => {
+    chrome.runtime.sendMessage({type: "comm-dispatch", payload: {
+      type: "all-in-one", consulPost: postoId,
+    }});
+    window.close();
+  });
 });
 
 // Register (real person) — dispatch through the shared command layer
@@ -174,24 +190,23 @@ btnRpClear.addEventListener("click", () => {
   setStatus("Real person data cleared.");
 });
 
-// Auto-save visa fields
-visaArrivalEl.addEventListener("input", () => {
-  chrome.storage.local.set({"visa-arrival-date": visaArrivalEl.value.trim()});
-});
+// Auto-save consular post to storage as user types.
 visaPostoEl.addEventListener("input", () => {
-  chrome.storage.local.set({"visa-consular-post": visaPostoEl.value.trim() || "5088"});
+  const v = visaPostoEl.value.trim();
+  if (v) chrome.storage.local.set({"visa-consular-post": v});
 });
 
 // Apply for Visa — dispatch through the shared command layer
 btnVisa.addEventListener("click", () => {
-  const arrivalDate = visaArrivalEl.value.trim();
-  const postoId     = visaPostoEl.value.trim() || "5088";
+  const postoId = visaPostoEl.value.trim();
 
   btnVisa.disabled    = true;
   btnVisa.textContent = "Starting…";
 
-  // Flush latest visa config to storage, then dispatch apply.
-  chrome.storage.local.set({"visa-arrival-date": arrivalDate, "visa-consular-post": postoId}, () => {
+  // Flush consular post to storage, then dispatch apply.
+  const su = {};
+  if (postoId) su["visa-consular-post"] = postoId;
+  chrome.storage.local.set(su, () => {
     chrome.runtime.sendMessage({type: "comm-dispatch", payload: {type: "apply"}});
     btnVisa.disabled    = false;
     btnVisa.textContent = "Apply for Visa";

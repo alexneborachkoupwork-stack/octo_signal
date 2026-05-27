@@ -1,10 +1,10 @@
 {
   "manifest_version": 3,
   "name": "Octo Probe",
-  "version": "3.0.0",
+  "version": "3.0.5",
   "description": "Runs login and registration workflows on the E-VISA site inside an Octo Browser profile.",
 
-  "permissions": ["storage", "activeTab", "scripting", "tabs", "downloads", "alarms"],
+  "permissions": ["storage", "activeTab", "scripting", "tabs", "downloads", "alarms", "debugger"],
   "host_permissions": ["<all_urls>"],
 
   "background": {

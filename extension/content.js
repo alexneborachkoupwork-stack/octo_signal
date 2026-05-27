@@ -178,36 +178,50 @@ async function humanMoveTo(el) {
   const cp2y   = sy + (ty-sy)*0.66 + (Math.random()-.5)*spread;
   let prevHover = document.elementFromPoint(sx, sy);
   for (let i = 0; i <= steps; i++) {
-    const t  = i / steps;
-    const cx = Math.round(_bezier(t, sx, cp1x, cp2x, tx));
-    const cy = Math.round(_bezier(t, sy, cp1y, cp2y, ty));
+    const t   = i / steps;
+    const cx  = Math.round(_bezier(t, sx, cp1x, cp2x, tx));
+    const cy  = Math.round(_bezier(t, sy, cp1y, cp2y, ty));
+    const scx = cx + (window.screenX ?? 0);
+    const scy = cy + (window.screenY ?? 0);
+    const mvX = cx - (window._mX ?? cx);
+    const mvY = cy - (window._mY ?? cy);
     const under = document.elementFromPoint(cx, cy) ?? document.body;
     if (under !== prevHover) {
       if (prevHover) {
-        prevHover.dispatchEvent(new MouseEvent("mouseout",   {bubbles: true,  cancelable: true,  clientX: cx, clientY: cy, relatedTarget: under}));
-        prevHover.dispatchEvent(new MouseEvent("mouseleave", {bubbles: false, cancelable: false, clientX: cx, clientY: cy, relatedTarget: under}));
+        prevHover.dispatchEvent(new MouseEvent("mouseout",   {bubbles: true,  cancelable: true,  clientX: cx, clientY: cy, screenX: scx, screenY: scy, relatedTarget: under}));
+        prevHover.dispatchEvent(new MouseEvent("mouseleave", {bubbles: false, cancelable: false, clientX: cx, clientY: cy, screenX: scx, screenY: scy, relatedTarget: under}));
       }
-      under.dispatchEvent(new MouseEvent("mouseover",  {bubbles: true,  cancelable: true,  clientX: cx, clientY: cy, relatedTarget: prevHover}));
-      under.dispatchEvent(new MouseEvent("mouseenter", {bubbles: false, cancelable: false, clientX: cx, clientY: cy, relatedTarget: prevHover}));
+      under.dispatchEvent(new MouseEvent("mouseover",  {bubbles: true,  cancelable: true,  clientX: cx, clientY: cy, screenX: scx, screenY: scy, relatedTarget: prevHover}));
+      under.dispatchEvent(new MouseEvent("mouseenter", {bubbles: false, cancelable: false, clientX: cx, clientY: cy, screenX: scx, screenY: scy, relatedTarget: prevHover}));
       prevHover = under;
     }
-    under.dispatchEvent(new MouseEvent("mousemove", {bubbles: true, cancelable: true, clientX: cx, clientY: cy}));
+    under.dispatchEvent(new PointerEvent("pointermove", {
+      bubbles: true, cancelable: true, clientX: cx, clientY: cy, screenX: scx, screenY: scy,
+      pointerId: 1, pointerType: "mouse", isPrimary: true, movementX: mvX, movementY: mvY,
+    }));
+    under.dispatchEvent(new MouseEvent("mousemove", {
+      bubbles: true, cancelable: true, clientX: cx, clientY: cy, screenX: scx, screenY: scy,
+      movementX: mvX, movementY: mvY,
+    }));
     window._mX = cx; window._mY = cy;
     await sleep(7 + Math.random() * 12);
   }
   await sleep(30 + Math.random() * 50);
+  return {x: Math.round(tx), y: Math.round(ty)};
 }
 
 async function humanClick(el) {
-  await humanMoveTo(el);
-  const rect = el.getBoundingClientRect();
-  const cx   = Math.round(rect.left + rect.width  * 0.5);
-  const cy   = Math.round(rect.top  + rect.height * 0.5);
-  const opts = {bubbles: true, clientX: cx, clientY: cy};
-  el.dispatchEvent(new MouseEvent("mousedown", opts));
+  const {x: cx, y: cy} = await humanMoveTo(el);
+  const scx   = cx + (window.screenX ?? 0);
+  const scy   = cy + (window.screenY ?? 0);
+  const mOpts = {bubbles: true, cancelable: true, clientX: cx, clientY: cy, screenX: scx, screenY: scy};
+  const pOpts = {...mOpts, pointerId: 1, pointerType: "mouse", isPrimary: true};
+  el.dispatchEvent(new PointerEvent("pointerdown", {...pOpts, pressure: 0.5, buttons: 1}));
+  el.dispatchEvent(new MouseEvent("mousedown",     {...mOpts, buttons: 1}));
   await sleep(30 + Math.random() * 60);
-  el.dispatchEvent(new MouseEvent("mouseup",   opts));
-  el.dispatchEvent(new MouseEvent("click",     opts));
+  el.dispatchEvent(new PointerEvent("pointerup",   {...pOpts, pressure: 0,   buttons: 0}));
+  el.dispatchEvent(new MouseEvent("mouseup",       {...mOpts, buttons: 0}));
+  el.dispatchEvent(new MouseEvent("click",         {...mOpts, buttons: 0}));
   const prev = document.activeElement;
   if (prev && prev !== el && prev !== document.body && prev !== document.documentElement) {
     prev.dispatchEvent(new FocusEvent("blur",     {bubbles: false, cancelable: false, relatedTarget: el}));
@@ -236,8 +250,9 @@ async function humanType(el, text) {
     el.dispatchEvent(new KeyboardEvent("keydown",  {key: ch, keyCode: cc, which: cc, charCode: 0,  bubbles: true, cancelable: true}));
     el.dispatchEvent(new KeyboardEvent("keypress", {key: ch, keyCode: cc, which: cc, charCode: cc, bubbles: true, cancelable: true}));
     const cur = el.value;
+    el.dispatchEvent(new InputEvent("beforeinput", {data: ch, inputType: "insertText", bubbles: true, cancelable: true}));
     if (setter) setter.call(el, cur + ch); else el.value = cur + ch;
-    el.dispatchEvent(new InputEvent("input",  {data: ch, inputType: "insertText", bubbles: true}));
+    el.dispatchEvent(new InputEvent("input",       {data: ch, inputType: "insertText", bubbles: true}));
     el.dispatchEvent(new KeyboardEvent("keyup",    {key: ch, keyCode: cc, which: cc, charCode: 0,  bubbles: true, cancelable: true}));
   }
   await sleep(80 + Math.random() * 100);
@@ -319,6 +334,25 @@ function storageSet(obj) {
 function sendBgMessage(msg) {
   return new Promise(resolve => chrome.runtime.sendMessage(msg, resolve));
 }
+
+function _logEntry(msg) {
+  sendBgMessage({type: "log-entry", msg}).catch(() => {});
+}
+
+// Forward all console output to the run logger so the saved .log file mirrors
+// what appears in DevTools. Runs once at content script load.
+(function _patchConsole() {
+  const _fwd = (level, args) => {
+    try {
+      const text = args.map(a => (a instanceof Error ? a.stack : typeof a === "object" ? JSON.stringify(a) : String(a))).join(" ");
+      _logEntry(`[${level}] ${text}`);
+    } catch (_) {}
+  };
+  for (const level of ["log", "warn", "error", "info"]) {
+    const orig = console[level].bind(console);
+    console[level] = function (...args) { orig(...args); _fwd(level.toUpperCase(), args); };
+  }
+})();
 
 // ---------------------------------------------------------------------------
 // Badge
@@ -502,8 +536,81 @@ async function fillRegisterForm(person, email) {
   await sleep(300 + Math.random() * 400);
 }
 
-function waitForRecaptcha() {
+async function waitForRecaptcha() {
+  // Direct click only when "good-proxy" flag is on — requires a high-rep residential proxy.
+  const {["good-proxy"]: goodProxy} = await chrome.storage.local.get("good-proxy");
+  const directToken = goodProxy ? await _waitForRecaptchaClick() : null;
+  if (directToken) {
+    _logEntry(`captcha: direct click passed — token obtained`);
+    console.log("[OctoProbe] reCAPTCHA passed via direct click.");
+    const solved = await new Promise(resolve => {
+      document.addEventListener("octo-recaptcha-pass", () => resolve(true), {once: true});
+      sendBgMessage({type: "inject-recaptcha-token", token: directToken})
+        .then(r => { if (!r?.ok) resolve(false); })
+        .catch(() => resolve(false));
+      setTimeout(() => resolve(false), 10000);
+    });
+    if (solved) return true;
+  }
+  // Fallback: API solver.
+  _logEntry(`captcha: ${goodProxy ? "direct click failed/challenge — " : ""}using API solver`);
   return _waitForRecaptchaApi();
+}
+
+// Direct click mode — uses CDP (isTrusted=true) to click the reCAPTCHA v2 checkbox.
+// Returns the token string if the click passed immediately, or null if a challenge
+// grid appeared (fall back to API solver) or if the iframe was not found.
+async function _waitForRecaptchaClick() {
+  const iframeEl = await waitFor(
+    () => {
+      const el = document.querySelector(
+        "iframe[src*='recaptcha/api2/anchor'], iframe[src*='recaptcha/enterprise/anchor']"
+      );
+      // Anchor iframe is 300×74. Exclude tiny/hidden iframes.
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return (r.width >= 50 && r.height >= 30) ? el : null;
+    },
+    10000
+  );
+  if (!iframeEl) {
+    console.warn("[OctoProbe] reCAPTCHA anchor iframe not found — skipping direct click");
+    return null;
+  }
+
+  iframeEl.scrollIntoView({block: "center", behavior: "smooth"});
+  await sleep(500 + Math.random() * 400);
+  await humanMoveTo(iframeEl);
+
+  const r = iframeEl.getBoundingClientRect();
+  // Checkbox center: ~28px from left edge, ~37px from top of the 300×74 anchor frame.
+  const checkboxX = Math.round(r.left + 28);
+  const checkboxY = Math.round(r.top  + 37);
+
+  _logEntry(`captcha: CDP click at (${checkboxX}, ${checkboxY})`);
+  const clickResult = await sendBgMessage({type: "cdp-click", x: checkboxX, y: checkboxY}).catch(() => null);
+  if (!clickResult?.ok) {
+    console.warn("[OctoProbe] CDP click failed:", clickResult?.error);
+    return null;
+  }
+
+  // Poll for token (pass) or challenge frame (image challenge → fall back to API solver).
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    await sleep(500);
+    const tokenEl = document.querySelector(
+      "textarea[name='g-recaptcha-response'], #g-recaptcha-response, #g-recaptcha-response-1"
+    );
+    if (tokenEl?.value?.length > 20) return tokenEl.value;
+    const challengeFrame = document.querySelector(
+      "iframe[src*='recaptcha/api2/bframe'], iframe[src*='recaptcha/enterprise/bframe']"
+    );
+    if (challengeFrame) {
+      _logEntry("captcha: challenge grid appeared — falling back to API solver");
+      return null;
+    }
+  }
+  return null; // 15 s timeout with no token
 }
 
 // Extract the reCAPTCHA site key from the current page.
@@ -538,10 +645,12 @@ async function _waitForRecaptchaApi() {
               ?? document.querySelector("[data-action]")?.dataset?.action
               ?? null;
   console.log("[OctoProbe] Sending to solver — siteKey:", siteKey, "action:", action);
+  _logEntry(`captcha: sending to solver siteKey=${siteKey} action=${action}`);
 
   const result = await sendBgMessage({type: "solve-recaptcha-api", pageUrl: location.href, siteKey, action}).catch(() => null);
   if (!result?.ok || !result.token) {
     console.error("[OctoProbe] API solve failed:", result?.error);
+    _logEntry(`captcha: solver failed — ${result?.error ?? "no result"}`);
     return false;
   }
 
@@ -551,9 +660,24 @@ async function _waitForRecaptchaApi() {
     const pad = _MIN_API_SOLVE_MS - elapsed;
     console.log(`[OctoProbe] Solver returned in ${elapsed}ms — padding ${pad}ms to reach ${_MIN_API_SOLVE_MS}ms minimum`);
     setBadge("API: solve too fast — padding…", "#9060cc");
-    await sleep(pad);
+    // Drift mouse instead of freezing — zero movement during solve is a bot signal.
+    const _driftEnd = Date.now() + pad;
+    while (Date.now() < _driftEnd) {
+      const jitter = 200 + Math.random() * 400;
+      await sleep(Math.min(jitter, _driftEnd - Date.now()));
+      if (Date.now() >= _driftEnd) break;
+      const nx = Math.max(0, Math.min(innerWidth,  (window._mX ?? innerWidth  * 0.5) + (Math.random() - 0.5) * 8));
+      const ny = Math.max(0, Math.min(innerHeight, (window._mY ?? innerHeight * 0.5) + (Math.random() - 0.5) * 8));
+      document.dispatchEvent(new MouseEvent("mousemove", {
+        bubbles: true, clientX: nx, clientY: ny,
+        screenX: nx + (window.screenX ?? 0), screenY: ny + (window.screenY ?? 0),
+      }));
+      window._mX = nx; window._mY = ny;
+    }
   }
-  console.log(`[OctoProbe] Token accepted after ${Date.now() - solveStart}ms total.`);
+  const totalMs = Date.now() - solveStart;
+  console.log(`[OctoProbe] Token accepted after ${totalMs}ms total.`);
+  _logEntry(`captcha: token accepted after ${totalMs}ms`);
 
   // Inject token — the injection dispatches octo-recaptcha-pass so we listen first.
   const solved = await new Promise(resolve => {
@@ -886,8 +1010,26 @@ function _detectPageState() {
 
 async function visaStepGoToQuestionnaire() {
   setBadge("Visa: opening questionnaire…", "#9060cc");
+
+  // If login redirected directly to the questionnaire page, the server has already
+  // initialised the AJAX session. Reloading would destroy that state and #questForm
+  // would never appear. Fire page-ready to satisfy F4's waitForPageReady and return.
+  if (/Questionario/i.test(location.pathname)) {
+    console.log("[OctoProbe] Already on questionnaire page — signalling page-ready.");
+    chrome.runtime.sendMessage({type: "page-ready", state: "questionnaire", url: location.href}).catch(() => {});
+    return;
+  }
+
   await switchToEnglish();
-  await sleep(400 + Math.random() * 400);
+
+  // Wait for the home page to be fully initialised (window.onload fired).
+  // The home page fires session-init scripts on window.onload (~4 s after load).
+  // Navigating before those scripts complete means the questionnaire AJAX has no
+  // server-side session to attach to, so #questForm is never injected.
+  if (document.readyState !== "complete") {
+    await waitFor(() => document.readyState === "complete" ? true : null, 15000, 200);
+  }
+  await sleep(1500 + Math.random() * 500); // dwell after window.onload scripts finish
 
   // Prefer clicking the nav link (most natural interaction for logged-in users).
   const navLink = document.querySelector("a[href*='Questionario']");
@@ -934,13 +1076,13 @@ async function visaStepQuestionnaire() {
 
   // Wait for #questForm (the questionnaire form) to be present.
   // The form is injected via AJAX after DOMContentLoaded — can take 15+ s.
-  const questForm = await waitFor(() => document.querySelector("#questForm"), 30000);
+  const questForm = await waitFor(() => document.querySelector("#questForm"), 60000);
   if (!questForm) {
     // Form never appeared — session may be invalid even though URL is /Questionario.
     // Navigate to auth so the dispatch loop re-runs login from scratch.
-    console.warn("[OctoProbe] Questionnaire form not found — redirecting to auth");
-    setBadge("Visa: session lost → re-auth…", "#9060cc");
-    location.href = "/VistosOnline/Authentication.jsp";
+    console.warn("[OctoProbe] Questionnaire form not found — reloading page to retry");
+    setBadge("Visa: questionnaire reload…", "#9060cc");
+    location.reload();
     return;
   }
 
@@ -1044,6 +1186,12 @@ async function _setField(name, value) {
   const el = document.querySelector(`[name="${name}"], #${name}`);
   if (!el) { console.warn(`[OctoProbe] Form field not found: ${name}`); return false; }
 
+  // Scroll element into view before mouse trajectory — humanMoveTo uses
+  // getBoundingClientRect() which returns 0×0 for off-screen/hidden elements,
+  // causing the cursor to fly to (0, 0) which is a strong bot signal.
+  el.scrollIntoView({behavior: "smooth", block: "nearest"});
+  await sleep(120 + Math.random() * 150);
+
   if (el.tagName === "SELECT") {
     await humanSelect(el, value);
   } else {
@@ -1098,72 +1246,97 @@ async function visaStepForm({submitAfter = true} = {}) {
   const {
     "real-person-input":   rp,
     "visa-arrival-date":   arrivalDate,
+    "visa-departure-date": departureDate,
     "visa-consular-post":  storedPostoId,
-  } = await storageGet(["real-person-input","visa-arrival-date","visa-consular-post"]);
+  } = await storageGet(["real-person-input","visa-arrival-date","visa-departure-date","visa-consular-post"]);
 
   const person = rp ?? {};
 
-  // Gender mapping.
-  const genderVal = (person.gender ?? "F").toUpperCase() === "M" ? "MALE" : "FEMALE";
-  const postoId   = storedPostoId ?? "5088";
+  // consulPost is required — no fallback. Abort early with a clear error.
+  if (!storedPostoId) {
+    await _clearWorkflowFailed("Visa: consulPost is required but not set in storage", E.VISA_FAILED);
+    return;
+  }
+  const postoId = storedPostoId;
 
-  // ── Passport dates from config.json ──────────────────────────────────────
   const _today = new Date();
   const _fmt   = d => `${d.getFullYear()}/${String(d.getMonth()+1).padStart(2,"0")}/${String(d.getDate()).padStart(2,"0")}`;
-  const _cfg = await fetch(chrome.runtime.getURL("config.json")).then(r => r.json()).catch(() => ({}));
-  let passportIssueDate  = _cfg.passportIssue;
-  let passportExpiryDate = _cfg.passportExpiry;
+  const _cfg   = await fetch(chrome.runtime.getURL("config.json")).then(r => r.json()).catch(() => ({}));
+
+  // ── Passport issue date ───────────────────────────────────────────────────
+  // Priority: person.passportIssue (inject) → config.json → fallback 1–3 years ago
+  let passportIssueDate = person.passportIssue ?? _cfg.passportIssue;
   if (!passportIssueDate) {
     const d = new Date(_today);
-    d.setFullYear(d.getFullYear() - (3 + Math.floor(Math.random() * 5)));
+    d.setFullYear(d.getFullYear() - (1 + Math.floor(Math.random() * 3))); // 1–3 years ago
     d.setMonth(Math.floor(Math.random() * 12));
     d.setDate(1 + Math.floor(Math.random() * 28));
     passportIssueDate = _fmt(d);
-  }
-  if (!passportExpiryDate) {
-    const d = new Date(passportIssueDate.replace(/\//g, "-"));
-    d.setFullYear(d.getFullYear() + 10);
-    passportExpiryDate = _fmt(d);
+    console.log(`[OctoProbe] passportIssue not provided — generated: ${passportIssueDate}`);
   }
 
-  // ── Arrival / departure dates ─────────────────────────────────────────────
-  // Field 27: arrival — use stored value or pick 3–6 weeks from today.
+  // ── Passport expiry date ──────────────────────────────────────────────────
+  // Priority: person.passportExpiry (inject) → config.json → fallback 5 years after issue
+  let passportExpiryDate = person.passportExpiry ?? _cfg.passportExpiry;
+  if (!passportExpiryDate) {
+    const d = new Date(passportIssueDate.replace(/\//g, "-"));
+    d.setFullYear(d.getFullYear() + 5); // 5 years after issue
+    passportExpiryDate = _fmt(d);
+    console.log(`[OctoProbe] passportExpiry not provided — generated: ${passportExpiryDate}`);
+  }
+
+  // ── Arrival date ──────────────────────────────────────────────────────────
+  // Priority: visa-arrival-date (inject) → fallback 1–3 months (30–90 days) from today
   let computedArrivalDate = arrivalDate;
   if (!computedArrivalDate) {
     const d = new Date(_today);
-    d.setDate(d.getDate() + (3 + Math.floor(Math.random() * 4)) * 7);
+    d.setDate(d.getDate() + 30 + Math.floor(Math.random() * 61)); // 30–90 days
     computedArrivalDate = _fmt(d);
+    console.log(`[OctoProbe] arrivalDate not provided — generated: ${computedArrivalDate}`);
   }
-  // Field 28: departure — arrival + 7 days.
-  const _depDate = new Date(computedArrivalDate.replace(/\//g, "-"));
-  _depDate.setDate(_depDate.getDate() + 7);
-  const computedDepartureDate = _fmt(_depDate);
 
-  // ── Consular post — top-level select above the tab strip ─────────────────
+  // ── Departure date ────────────────────────────────────────────────────────
+  // Priority: visa-departure-date (inject) → fallback 7–89 days after arrival
+  let computedDepartureDate = departureDate;
+  if (!computedDepartureDate) {
+    const d = new Date(computedArrivalDate.replace(/\//g, "-"));
+    d.setDate(d.getDate() + 7 + Math.floor(Math.random() * 83)); // 7–89 days after arrival
+    computedDepartureDate = _fmt(d);
+    console.log(`[OctoProbe] departureDate not provided — generated: ${computedDepartureDate}`);
+  }
+
+  // Persist both resolved dates to storage so visaStepSchedule can use the correct
+  // arrival bound when filtering available appointment slots (even when auto-generated).
+  await storageSet({
+    "visa-arrival-date":   computedArrivalDate,
+    "visa-departure-date": computedDepartureDate,
+  });
+
+  // ── Consular post (f0sf1) — inject; triggers AJAX for appointment slots ──
   setBadge("Visa: setting consular post…", "#9060cc");
   await sleep(400 + Math.random() * 300);
-  await _setField("cmbPostoConsular", postoId);
-  await sleep(400 + Math.random() * 300);
+  await _setField("f0sf1", postoId);
+  // Synthetic change events from isolated world have isTrusted=false — call
+  // ajaxFunction directly in MAIN world to guarantee the AJAX request fires.
+  await _callPageFn(`if(typeof ajaxFunction==="function") ajaxFunction("${postoId}");`);
+  await sleep(1200 + Math.random() * 600);   // wait for AJAX to settle
 
   // ── TAB 1: Personal data ──────────────────────────────────────────────────
   setBadge("Visa: Tab 1 — personal…", "#9060cc");
   await sleep(600 + Math.random() * 400);
 
   const tab1Fields = [
-    ["f1",    person.lastName  ?? ""],   // surname
-    ["f2",    "+"],                      // surname(s) at birth — same as current (field 2)
-    ["f3",    person.firstName ?? ""],   // first name
-    ["f4",    person.dob       ?? ""],   // date of birth
-    ["f6sf1", "CPV"],                    // country of birth
-    ["f6sf2", "+"],                      // place of birth — same value (field 5)
-    ["f7sf1", "CPV"],                    // current nationality
-    ["f8",    "CPV"],                    // original nationality
-    ["f9",    genderVal],                // gender
-    ["f10",   "1"],                      // marital status (single)
+    // prefill (readonly, skip): f1 surname, f3 first name, f4 dob, f9 gender
+    ["f2",    "+"],      // surname at birth — default:+
+    ["f6",    "+"],      // place of birth — default:+  (was f6sf2, corrected)
+    ["f6sf1", "CPV"],   // country of birth — default:CPV
+    ["f7sf1", "CPV"],   // current nationality — default:CPV
+    ["f8",    "CPV"],   // original nationality — default:CPV
+    ["f10",   "1"],     // marital status — default:single (1)
   ];
   for (const [name, val] of tab1Fields) {
     if (val) await _setField(name, val);
-    await sleep(150 + Math.random() * 200);
+    await sleep(400 + Math.random() * 400);
   }
 
   // ── TAB 2: Travel document ────────────────────────────────────────────────
@@ -1171,76 +1344,103 @@ async function visaStepForm({submitAfter = true} = {}) {
   setBadge("Visa: Tab 2 — travel doc…", "#9060cc");
 
   const tab2Fields = [
-    ["f13", "01"],                  // type of passport (ordinary)
-    ["f14", person.traveldoc ?? ""],// passport number
-    ["f15", "CPV"],                 // issued by
-    ["f16", passportIssueDate],     // date of issue — auto or stored (field 14)
-    ["f17", passportExpiryDate],    // valid until — issue + 10 yrs (field 15)
-    ["f5",  ""],                    // ID number (optional)
+    // prefill (readonly, skip): f13 passport type, f14 passport number
+    // Visual reading order: f16 → f17 → f15 (matches form layout)
+    ["f16", passportIssueDate],   // date of issue — inject (person > config > auto)
+    ["f17", passportExpiryDate],  // valid until — inject (person > config > auto)
+    ["f15", "CPV"],               // issued by — default:CPV
+    // f5 (ID number) — optional, no mark, skip
   ];
   for (const [name, val] of tab2Fields) {
     if (val) await _setField(name, val);
-    await sleep(150 + Math.random() * 200);
+    await sleep(400 + Math.random() * 400);
   }
 
   // ── TAB 3: Travel info ────────────────────────────────────────────────────
   await _switchToTab(2, 3);
   setBadge("Visa: Tab 3 — travel info…", "#9060cc");
+  // prefill (readonly, skip): f29 purpose of travel
+  // txtInfoMotEstada — optional, no mark, skip
+  // f25 duration — auto-calc hidden input, set by calcularDuracaoEValidar below
 
-  const tab3Fields = [
-    ["f29",       "10"],           // purpose: tourism
-    ["txtInfoMotEstada", "holiday"],
-    ["em_destino_1", "PRT"],       // destination state
-    ["f32",       "PRT"],          // transit route
-    ["f24",       "1"],            // single entry
-    ["f25",       "7"],            // duration of stay (days)
-    ["f30",       computedArrivalDate],    // arrival — stored or 3–6 wks from today (field 27)
-    ["f31",       computedDepartureDate], // departure — arrival + 7 days
-  ];
-  for (const [name, val] of tab3Fields) {
-    if (val) await _setField(name, val);
-    await sleep(150 + Math.random() * 200);
-  }
+  // Destination — default:PRT; call gerirDestino to keep destination slots consistent.
+  await _setField("em_destino_1", "PRT");
+  await _callPageFn(`if(typeof gerirDestino==="function") gerirDestino('PT','1');`);
+  await sleep(400 + Math.random() * 400);
+
+  // Transit route and number of entries — defaults.
+  await _setField("f32", "PRT");
+  await sleep(400 + Math.random() * 400);
+  await _setField("f24", "1");
+  await sleep(500 + Math.random() * 400);
+
+  // Arrival date — inject; MAIN world handlers unlock departure and may validate.
+  setBadge("Visa: Tab 3 — arrival date…", "#9060cc");
+  await _setField("f30", computedArrivalDate);
+  await _callPageFn(`(function(){
+    var el = document.querySelector('[name="f30"]');
+    if(typeof validarChegadaPartida==="function") validarChegadaPartida(el, 'PT');
+    if(typeof cleanPartida==="function") cleanPartida();
+    if(typeof gerirEstadoPartida==="function") gerirEstadoPartida();
+  })();`);
+  await sleep(500 + Math.random() * 400);
+
+  // Departure date — inject; calcularDuracaoEValidar updates f25 (duration hidden input).
+  setBadge("Visa: Tab 3 — departure date…", "#9060cc");
+  await _setField("f31", computedDepartureDate);
+  await _callPageFn(`(function(){
+    var el = document.querySelector('[name="f31"]');
+    if(typeof calcularDuracaoEValidar==="function") calcularDuracaoEValidar(el);
+  })();`);
+  await sleep(400 + Math.random() * 300);
 
   // ── TAB 4: Occupation / residence ────────────────────────────────────────
   await _switchToTab(3, 4);
   setBadge("Visa: Tab 4 — occupation…", "#9060cc");
 
   const tab4Fields = [
-    ["f19",  "05"],   // student
-    ["f20sf1", "SCHOOL"],
-    ["f20sf2", "CPV"],
-    ["f45",  "PRAIA"],
-    ["f46",  "0"],
-    ["cmbImpressoesDigitais", "N"],
-    ["f27",  "N"],    // no entry permit
-    ["f18sf1", ""],
-    ["f18sf2", ""],
-    ["f18sf3", ""],
+    ["f19",    "05"], // occupation — default:05
+    ["f20sf1",  "+"], // employer name — default:+
+    ["f20sf2",  "+"], // employer address/phone — default:+
+    ["f45",     "+"], // address — default:+
+    ["f46",     "0"], // phone — default:0
+    // f27 (entry permit) — no mark; form first option defaults to N, skip
+    // f18sf1/f18sf2/f18sf3 — conditional, no mark, skip
   ];
   for (const [name, val] of tab4Fields) {
     if (val) await _setField(name, val);
-    await sleep(150 + Math.random() * 200);
+    await sleep(400 + Math.random() * 400);
   }
+  // Fingerprints — default:N; call gerirImpressoes to keep dependent fields hidden.
+  await _setField("cmbImpressoesDigitais", "N");
+  await _callPageFn(`if(typeof gerirImpressoes==="function") gerirImpressoes(document.querySelector('[name="cmbImpressoesDigitais"]'));`);
+  await sleep(400 + Math.random() * 300);
 
   // ── TAB 5: Reference + costs ──────────────────────────────────────────────
   await _switchToTab(4, 5);
   setBadge("Visa: Tab 5 — reference…", "#9060cc");
 
-  const tab5Fields = [
-    ["cmbReferencia", "individual"],
-    ["f34",    "HOTEL LISBOA"],
-    ["f34sf2", "LISBOA, PORTUGAL"],
-    ["f34sf3", ""],
-    ["f34sf4", ""],
-    ["f34sf5", "1"],
-    ["cmbDespesasRequerente_1", "1"],
-    ["cmbDespesasPatrocinador_1", "1"],
-  ];
-  for (const [name, val] of tab5Fields) {
-    if (val) await _setField(name, val);
-    await sleep(150 + Math.random() * 200);
-  }
+  // Reference type — must call gerirReferencia in MAIN world to reveal the host
+  // fields section. Without this, f34/f34sf2 are inside a display:none container
+  // and humanMoveTo would target coords (0,0) — a strong bot signal.
+  await _setField("cmbReferencia", "individual");
+  await _callPageFn(`if(typeof gerirReferencia==="function") gerirReferencia(document.querySelector('[name="cmbReferencia"]'));`);
+  // Wait until host name field becomes visible before proceeding.
+  await waitFor(() => { const el = document.querySelector('[name="f34"]'); return el && isVisible(el) ? el : null; }, 4000, 200);
+  await sleep(400 + Math.random() * 300);
+
+  // Host details — defaults
+  await _setField("f34",    "+");   // host name
+  await sleep(400 + Math.random() * 400);
+  await _setField("f34sf2", "+");   // host address
+  await sleep(400 + Math.random() * 400);
+  await _setField("f34sf5", "1");   // host county
+  await sleep(400 + Math.random() * 400);
+
+  // Expenses — default:1
+  await _setField("cmbDespesasRequerente_1", "1");
+  await _callPageFn(`if(typeof gerirDespesasRequerente==="function") gerirDespesasRequerente(1);`);
+  await sleep(400 + Math.random() * 300);
 
   // ── TAB 6: Attachments — SKIP ─────────────────────────────────────────────
   // Tab 6 is skipped entirely per specification.
@@ -1256,8 +1456,8 @@ async function visaStepForm({submitAfter = true} = {}) {
 async function visaStepSchedule() {
   setBadge("Visa: schedule — waiting for page…", "#9060cc");
 
-  const {"visa-consular-post": postoId, "visa-arrival-date": arrivalDate} =
-    await storageGet(["visa-consular-post","visa-arrival-date"]);
+  const {"visa-consular-post": postoId} =
+    await storageGet(["visa-consular-post"]);
   const POSTO = postoId ?? "5088";
 
   // Wait for captcha div to appear.
@@ -1275,8 +1475,6 @@ async function visaStepSchedule() {
   const SCHEDULE_SITEKEY = "6LdOB9crAAAAADT4RFruc5sPmzLKIgvJVfL830d4";
   const solveStart = Date.now();
 
-  let captchaToken = null;
-
   const scheduleAction = document.querySelector("[data-sitekey][data-action]")?.dataset?.action
                       ?? document.querySelector("[data-action]")?.dataset?.action
                       ?? null;
@@ -1292,10 +1490,8 @@ async function visaStepSchedule() {
   }
   const elapsed = Date.now() - solveStart;
   if (elapsed < 8000) await sleep(8000 - elapsed);
-  captchaToken = result.token;
+  const captchaToken = result.token;
   await sendBgMessage({type: "inject-recaptcha-token", token: captchaToken}).catch(() => null);
-
-  if (!captchaToken) { await _clearWorkflowFailed("Visa: no captcha token obtained", E.VISA_FAILED); return; }
 
   // Fetch slots directly (bypasses window.data MAIN world issue).
   setBadge("Visa: fetching slots…", "#9060cc");
@@ -1334,22 +1530,12 @@ async function visaStepSchedule() {
 
   const today = new Date();
   today.setHours(0,0,0,0);
-  const maxDate = arrivalDate ? new Date(arrivalDate.replace(/\//g,"-")) : null;
-  if (maxDate) maxDate.setHours(0,0,0,0);
-
-  // Filter: after today, before arrival date (or within 90 days), and within a few weeks.
-  const cutoff = new Date(today);
-  cutoff.setDate(cutoff.getDate() + 90);
-
   const validDates = availableDates
     .filter(d => /^\d{4}\/\d{2}\/\d{2}$/.test(d))
     .filter(d => {
       const dt = new Date(d.replace(/\//g, "-"));
       dt.setHours(0,0,0,0);
-      if (dt <= today) return false;
-      if (maxDate && dt >= maxDate) return false;
-      if (dt > cutoff) return false;
-      return true;
+      return dt > today;
     })
     .sort();
 
@@ -1561,27 +1747,13 @@ async function _loginSubmit() {
     if (rgpdSubmit) await humanClick(rgpdSubmit);
     await sleep(1000 + Math.random() * 1000);
   }
-  setBadge("Login: waiting for response…", "#f0c040");
+  setBadge("Login: waiting for redirect…", "#f0c040");
   await sleep(5000);
   if (!/Authentication|authentication/i.test(location.pathname + location.search)) {
     return {ok: true, status: "navigated"};
   }
-  setBadge("Login: probing session…", "#f0c040");
-  let sessionOk = false;
-  try {
-    const probe = await fetch("/VistosOnline/Questionario", {
-      method: "GET", credentials: "include", redirect: "follow", cache: "no-store",
-    });
-    sessionOk = probe.ok && !/Authentication|authentication/i.test(probe.url);
-    console.log(`[OctoProbe] Login session probe: ${probe.url} — ${sessionOk ? "OK" : "FAIL"}`);
-  } catch(e) {
-    console.warn("[OctoProbe] Session probe error:", e);
-  }
-  if (sessionOk) {
-    setBadge("Logged in!", "#00d4aa");
-    location.href = "/VistosOnline/Questionario";
-    return {ok: true, status: "navigated"};
-  }
+  // Still on Authentication after 5 s — the login POST was rejected or never redirected.
+  // Do not navigate manually; the session is not established.
   await sendBgMessage({type: "reset-recaptcha"});
   setBadge("Login: rejected — will retry…", "#f0a030");
   return {ok: false, status: "rejected"};
@@ -1619,25 +1791,79 @@ async function _registerSubmit() {
     window._mX = Math.round(r.left + r.width * 0.5);
     window._mY = Math.round(r.top + r.height * 0.5);
   }
-  setBadge("Register: solving reCAPTCHA…", "#f0c040");
-  const solved = await waitForRecaptcha();
-  if (!solved) return {ok: false, status: "captcha_fail"};
 
-  await injectAlertCapture();
-  document.addEventListener("octo-alert", (e) => {
-    console.log(`[OctoProbe] Register alert: "${e.detail.msg}"`);
-  }, {once: true});
+  // Pre-captcha behavioral dwell — reCAPTCHA Enterprise scores the entire page session.
+  // A real user spends minutes reviewing the filled form before submitting.
+  setBadge("Register: reviewing form…", "#f0c040");
+  _logEntry("register: pre-captcha dwell starting");
+  const _dwellEnd = Date.now() + 25000 + Math.random() * 15000;
+  const _reviewFields = Array.from(document.querySelectorAll(
+    "#formReg input:not([type=hidden]), #formReg select"
+  )).filter(el => isVisible(el));
+  while (Date.now() < _dwellEnd) {
+    if (_reviewFields.length) {
+      const f = _reviewFields[Math.floor(Math.random() * _reviewFields.length)];
+      await humanMoveTo(f);
+    }
+    if (Math.random() < 0.3) {
+      const scrollTarget = Math.random() * (document.body.scrollHeight * 0.6);
+      window.scrollTo({top: scrollTarget, behavior: "smooth"});
+    }
+    await sleep(2500 + Math.random() * 3000);
+  }
+  _logEntry("register: pre-captcha dwell done");
 
   const formSubmitBtn = document.querySelector(
     "#formReg button[type='submit'], #formReg input[type='submit'], #formReg button[type='button']"
   );
   if (!formSubmitBtn) return {ok: false, status: "submit_not_found"};
 
-  setBadge("Register: opening privacy popup…", "#f0c040");
-  await humanClick(formSubmitBtn);
+  await injectAlertCapture();
 
-  const MAX_RGPD = 2;
-  for (let rgpdAttempt = 1; rgpdAttempt <= MAX_RGPD; rgpdAttempt++) {
+  // 2-attempt loop — server issues a softer scoring threshold on the second attempt.
+  // Both attempts: close any open RGPD popup → fresh captcha solve → click formSubmitBtn.
+  let _registerAlert = null;
+  for (let rgpdAttempt = 1; rgpdAttempt <= 2; rgpdAttempt++) {
+    _registerAlert = null;
+    document.addEventListener("octo-alert", (e) => {
+      _registerAlert = e.detail.msg;
+      _logEntry(`register: server alert → "${e.detail.msg}"`);
+      console.log(`[OctoProbe] Register alert: "${e.detail.msg}"`);
+    }, {once: true});
+
+    if (rgpdAttempt > 1) {
+      // Dismiss the still-open RGPD popup BEFORE re-solving — the modal covers the form
+      // and the captcha widget.  A real user closes the error dialog, reviews the form,
+      // then tries again.
+      const popupClose = document.querySelector(
+        "#registroMsg .close, #registroMsg [data-dismiss='modal'], #registroMsg button[aria-label='Close']"
+      );
+      if (popupClose && isVisible(popupClose)) {
+        await humanClick(popupClose);
+      } else {
+        document.dispatchEvent(new KeyboardEvent("keydown", {key: "Escape", keyCode: 27, bubbles: true, cancelable: true}));
+      }
+      await waitFor(() => {
+        const el = document.querySelector("#registroMsg");
+        return (!el || !isVisible(el)) ? true : null;
+      }, 5000);
+      // Scroll the recaptcha area back into view (form is visible again after dismiss).
+      if (rcEl) rcEl.scrollIntoView({behavior: "smooth", block: "center"});
+      await sleep(1000 + Math.random() * 800);
+    }
+
+    setBadge("Register: solving reCAPTCHA…", "#f0c040");
+    _logEntry(`register: starting captcha solve (attempt ${rgpdAttempt})`);
+    const solved = await waitForRecaptcha();
+    if (!solved) {
+      _logEntry(`register: captcha solve failed (attempt ${rgpdAttempt})`);
+      return {ok: false, status: "captcha_fail"};
+    }
+    _logEntry(`register: captcha solved — submitting (attempt ${rgpdAttempt})`);
+
+    setBadge("Register: opening privacy popup…", "#f0c040");
+    await humanClick(formSubmitBtn);
+
     const rgpdPopup = await waitFor(() => {
       const el = document.querySelector("#registroMsg");
       return el && isVisible(el) ? el : null;
@@ -1645,15 +1871,16 @@ async function _registerSubmit() {
 
     if (!rgpdPopup) {
       setBadge("Register: waiting for response…", "#f0c040");
+      _logEntry("register: RGPD popup absent — form accepted");
       return {ok: true, status: "submitted"};
     }
 
-    setBadge(`Register: accepting privacy (${rgpdAttempt}/${MAX_RGPD})…`, "#f0c040");
+    setBadge("Register: accepting privacy…", "#f0c040");
     await sleep(600 + Math.random() * 500);
     const rgpdSubmit = document.querySelector("#registroSubmit");
     if (!rgpdSubmit) return {ok: false, status: "rgpd_not_found"};
 
-    setBadge(`Register: submitting (${rgpdAttempt}/${MAX_RGPD})…`, "#f0c040");
+    setBadge("Register: submitting…", "#f0c040");
     await humanClick(rgpdSubmit);
 
     const outcome = await new Promise(resolve => {
@@ -1667,24 +1894,22 @@ async function _registerSubmit() {
       }, {once: true});
     });
 
+    _logEntry(`register: RGPD outcome=${outcome} attempt=${rgpdAttempt} alert="${_registerAlert ?? "none"}"`);
+
     if (outcome === "navigated") return {ok: true, status: "navigated"};
-    if (rgpdAttempt >= MAX_RGPD) return {ok: false, status: "captcha_fail"};
 
-    const closeBtn = document.querySelector("#closepopupRegistro");
-    if (closeBtn && isVisible(closeBtn)) await humanClick(closeBtn);
-    await sleep(1500 + Math.random() * 1500);
+    const _al = (_registerAlert ?? "").toLowerCase();
+    // "1 more attempts" = first rejection, quota still available → let attempt 2 run.
+    // True block = "blocked"+"incremental" WITHOUT a remaining-attempt hint.
+    if (_al.includes("blocked") && _al.includes("incremental") && !_al.includes("1 more attempt")) {
+      console.warn("[OctoProbe] Register: IP block detected");
+      return {ok: false, status: "ip_blocked"};
+    }
 
-    await sendBgMessage({type: "reset-recaptcha"});
-    setBadge(`Register: re-solving captcha (${rgpdAttempt + 1}/${MAX_RGPD})…`, "#f0c040");
-    await sleep(4000 + Math.random() * 3000);
-
-    const reSolved = await waitForRecaptcha();
-    if (!reSolved) return {ok: false, status: "captcha_fail"};
-    await injectAlertCapture();
-    await sleep(800 + Math.random() * 1200);
-
-    setBadge(`Register: re-opening popup (${rgpdAttempt + 1}/${MAX_RGPD})…`, "#f0c040");
-    await humanClick(formSubmitBtn);
+    if (rgpdAttempt < 2) {
+      _logEntry("register: first attempt rejected — waiting before retry");
+      await sleep(3000 + Math.random() * 2000);
+    }
   }
   return {ok: false, status: "captcha_fail"};
 }
@@ -1783,6 +2008,17 @@ async function _tokenSubmit() {
 const _CMD_HANDLERS = {
   "cmd-get-state":          async ()    => ({ok: true, state: _detectPageState()}),
   "cmd-accept-cookie":      async ()    => { await dismissCookieConsent(); return {ok: true}; },
+  "cmd-log-ip": async () => {
+    try {
+      const res = await fetch("https://api.ipify.org?format=json");
+      const {ip} = await res.json();
+      console.log("[OctoProbe] Proxy IP:", ip);
+      return {ok: true, ip};
+    } catch (e) {
+      console.warn("[OctoProbe] IP fetch failed:", e.message);
+      return {ok: true, ip: "unknown"};
+    }
+  },
   "cmd-switch-lang":        async ()    => { await switchToEnglish(); return {ok: true}; },
   "cmd-click-login-link":   async ()    => { await clickLoginLink(); return {ok: true}; },
 

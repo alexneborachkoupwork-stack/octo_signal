@@ -1,17 +1,11 @@
 // Injected at document_start in MAIN world — runs before any page JS.
-// Suppresses navigator.webdriver and removes CDP/automation artifacts
-// that BotDetectorLib (bd.js) checks at weight 1.0.
-// Do NOT patch window.alert or Function.prototype.toString — bd.js checks these for native code.
+// Removes CDP/automation artifacts that BotDetectorLib (bd.js) checks at weight 1.0.
+// navigator.webdriver is NOT patched here — Octo Browser sets it natively at the
+// browser level without a detectable JS override; patching it in JS would add a
+// detectable own-property (hasOwnProperty true) and a non-native getter toString.
+// Do NOT patch window.alert or Function.prototype.toString — bd.js checks native code.
 
 (function () {
-  // Suppress webdriver flag (BotDetectorLib "webdriver" signal, weight 1.0).
-  try {
-    Object.defineProperty(navigator, 'webdriver', {
-      get: () => undefined,
-      configurable: true,
-    });
-  } catch (_) {}
-
   // Remove known CDP / Puppeteer / automation bindings (weight 1.0 each).
   var _artifacts = [
     '__puppeteer', '__puppeteer_evaluation_script__',
@@ -33,3 +27,59 @@
       .forEach(function (k) { try { delete window[k]; } catch (_) {} });
   } catch (_) {}
 })();
+
+// ── WebGL renderer normalisation ─────────────────────────────────────────────
+// Some WebGL contexts created by reCAPTCHA's fingerprinting code fall back to
+// SwiftShader even when hardware GL is available — "Google SwiftShader" is an
+// unambiguous bot signal.  We probe a fresh canvas here (before any page JS)
+// to read the real Intel hardware renderer, then patch getParameter on all
+// WebGL context prototypes so every canvas — including reCAPTCHA's — reports
+// the same hardware string.  getExtension is patched to always return the
+// WEBGL_debug_renderer_info object so the renderer constants are reachable
+// even on contexts that normally hide it.
+(function () {
+  var _VENDOR   = 0x9245;  // UNMASKED_VENDOR_WEBGL
+  var _RENDERER = 0x9246;  // UNMASKED_RENDERER_WEBGL
+
+  // Read the real hardware renderer before any page script can interfere.
+  // Falls back to a plausible Intel string if the probe fails.
+  var _vendor   = 'Intel Inc.';
+  var _renderer = 'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+  try {
+    var _c  = document.createElement('canvas');
+    var _gl = _c.getContext('webgl') || _c.getContext('experimental-webgl');
+    if (_gl) {
+      var _ext = _gl.getExtension('WEBGL_debug_renderer_info');
+      if (_ext) {
+        var _v = _gl.getParameter(_ext.UNMASKED_VENDOR_WEBGL);
+        var _r = _gl.getParameter(_ext.UNMASKED_RENDERER_WEBGL);
+        // Only use if hardware — if even this canvas is SwiftShader keep fallback.
+        if (_v && _r && _r.indexOf('SwiftShader') === -1) {
+          _vendor   = _v;
+          _renderer = _r;
+        }
+      }
+    }
+    _gl = null; _c = null;
+  } catch (_) {}
+
+  function _patchCtx(Ctx) {
+    if (!Ctx) return;
+    var _gExt  = Ctx.prototype.getExtension;
+    var _gParm = Ctx.prototype.getParameter;
+    Ctx.prototype.getExtension = function getExtension(name) {
+      if (name === 'WEBGL_debug_renderer_info')
+        return _gExt.call(this, name) || {UNMASKED_VENDOR_WEBGL: _VENDOR, UNMASKED_RENDERER_WEBGL: _RENDERER};
+      return _gExt.call(this, name);
+    };
+    Ctx.prototype.getParameter = function getParameter(pname) {
+      if (pname === _VENDOR)   return _vendor;
+      if (pname === _RENDERER) return _renderer;
+      return _gParm.call(this, pname);
+    };
+  }
+
+  try { _patchCtx(window.WebGLRenderingContext);  } catch (_) {}
+  try { _patchCtx(window.WebGL2RenderingContext); } catch (_) {}
+})();
+

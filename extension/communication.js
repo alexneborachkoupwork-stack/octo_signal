@@ -58,6 +58,7 @@ self.Comm = (() => {
       const su = {};
       if (msg.captchaSolver  != null) su["captcha-solver"]   = msg.captchaSolver;
       if (msg.captchaParallel!= null) su["captcha-parallel"] = msg.captchaParallel;
+      if (msg.goodProxy      != null) su["good-proxy"]       = msg.goodProxy;
       if (msg.emailProvider  != null) su["email-provider"]   = msg.emailProvider;
       if (msg.cfDomain       != null) su["cf-mail-domain"]   = msg.cfDomain;
       if (msg.cfWorkerUrl    != null) su["cf-worker-url"]    = msg.cfWorkerUrl;
@@ -65,8 +66,7 @@ self.Comm = (() => {
       if (Object.keys(su).length) await chrome.storage.local.set(su);
       let realPerson = null;
       if (msg.realPerson) {
-        const {passportIssue: _pi, passportExpiry: _pe, ...rest} = msg.realPerson;
-        realPerson = {...rest, surnameAtBirth: "+", placeOfBirth: "+"};
+        realPerson = {...msg.realPerson, surnameAtBirth: "+", placeOfBirth: "+"};
       }
       _runRegister(realPerson);
       return;
@@ -78,24 +78,25 @@ self.Comm = (() => {
       if (msg.password       != null) su["password"]           = msg.password;
       if (msg.captchaSolver  != null) su["captcha-solver"]     = msg.captchaSolver;
       if (msg.captchaParallel!= null) su["captcha-parallel"]   = msg.captchaParallel;
-      if (msg.arrivalDate    != null) su["visa-arrival-date"]  = msg.arrivalDate;
-      if (msg.consulPost     != null) su["visa-consular-post"] = msg.consulPost;
+      if (msg.goodProxy      != null) su["good-proxy"]         = msg.goodProxy;
+      if (msg.arrivalDate    != null) su["visa-arrival-date"]   = msg.arrivalDate;
+      if (msg.departureDate  != null) su["visa-departure-date"] = msg.departureDate;
+      if (msg.consulPost     != null) su["visa-consular-post"]  = msg.consulPost;
       if (msg.realPerson     != null) {
-        const {passportIssue: _pi, passportExpiry: _pe, ...rest} = msg.realPerson;
-        su["real-person-input"] = {...rest, surnameAtBirth: "+", placeOfBirth: "+"};
+        su["real-person-input"] = {...msg.realPerson, surnameAtBirth: "+", placeOfBirth: "+"};
       }
       if (Object.keys(su).length) await chrome.storage.local.set(su);
       const _creds = await chrome.storage.local.get(["username","password"]);
       F_warmup({username: _creds.username ?? "", password: _creds.password ?? "", idleStep: msg.idleStep ?? "login"})
         .then(r  => send({type: "warmup-ready", ...r}))
-        .catch(e => send({type: "error", reason: e.message}));
+        .catch(e => { self._runLog?.finish(`error: ${e.message}`); send({type: "error", reason: e.message}); });
       return;
     }
 
     if (type === "apply") {
       F_apply()
         .then(r  => send({type: "apply-done", ...r}))
-        .catch(e => send({type: "error", reason: e.message}));
+        .catch(e => { self._runLog?.finish(`error: ${e.message}`); send({type: "error", reason: e.message}); });
       return;
     }
 
@@ -103,25 +104,25 @@ self.Comm = (() => {
       const su = {};
       if (msg.captchaSolver  != null) su["captcha-solver"]     = msg.captchaSolver;
       if (msg.captchaParallel!= null) su["captcha-parallel"]   = msg.captchaParallel;
+      if (msg.goodProxy      != null) su["good-proxy"]         = msg.goodProxy;
       if (msg.emailProvider  != null) su["email-provider"]     = msg.emailProvider;
       if (msg.cfDomain       != null) su["cf-mail-domain"]     = msg.cfDomain;
       if (msg.cfWorkerUrl    != null) su["cf-worker-url"]      = msg.cfWorkerUrl;
       if (msg.cfWorkerSecret != null) su["cf-worker-secret"]   = msg.cfWorkerSecret;
-      if (msg.arrivalDate    != null) su["visa-arrival-date"]  = msg.arrivalDate;
-      if (msg.consulPost     != null) su["visa-consular-post"] = msg.consulPost;
+      if (msg.arrivalDate    != null) su["visa-arrival-date"]   = msg.arrivalDate;
+      if (msg.departureDate  != null) su["visa-departure-date"] = msg.departureDate;
+      if (msg.consulPost     != null) su["visa-consular-post"]  = msg.consulPost;
       if (msg.realPerson     != null) {
-        const {passportIssue: _pi, passportExpiry: _pe, ...rest} = msg.realPerson;
-        su["real-person-input"] = {...rest, surnameAtBirth: "+", placeOfBirth: "+"};
+        su["real-person-input"] = {...msg.realPerson, surnameAtBirth: "+", placeOfBirth: "+"};
       }
       if (Object.keys(su).length) await chrome.storage.local.set(su);
       let realPerson = null;
       if (msg.realPerson) {
-        const {passportIssue: _pi, passportExpiry: _pe, ...rest} = msg.realPerson;
-        realPerson = {...rest, surnameAtBirth: "+", placeOfBirth: "+"};
+        realPerson = {...msg.realPerson, surnameAtBirth: "+", placeOfBirth: "+"};
       }
       F_allInOne({realPerson, arrivalDate: msg.arrivalDate, consulPost: msg.consulPost})
         .then(r  => send({type: "all-in-one-done", ...r}))
-        .catch(e => send({type: "error", reason: e.message}));
+        .catch(e => { self._runLog?.finish(`error: ${e.message}`); send({type: "error", reason: e.message}); });
       return;
     }
   }

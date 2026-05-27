@@ -1,0 +1,107 @@
+{
+  "_comment": "Updated from Visa Request Form.html. Changes vs second_form_mapping_2.json noted inline.",
+
+  "applicant_email":                ["f0",                        ""],
+  "consular_post_id":               ["f0sf1",                     ""],
+
+  "surname":                        ["f1",                        ""],
+  "surname_at_birth":               ["f2",                        ""],
+  "first_name":                     ["f3",                        ""],
+  "date_of_birth":                  ["f4",                        ""],
+  "place_of_birth":                 ["f6",                        ""],
+  "country_of_birth":               ["f6sf1",                     ""],
+  "current_nationality":            ["f7sf1",                     ""],
+  "original_nationality":           ["f8",                        ""],
+  "gender":                         ["f9",                        ""],
+  "marital_status":                 ["f10",                       ""],
+
+  "id_number":                      ["f5",                        ""],
+
+  "type_of_passport":               ["f13",                       ""],
+  "passport_number":                ["f14",                       ""],
+  "date_of_issue":                  ["f16",                       ""],
+  "valid_until":                    ["f17",                       ""],
+  "issued_by":                      ["f15",                       ""],
+
+  "applicant_address":              ["f45",                       ""],
+  "applicant_phone_number":         ["f46",                       ""],
+
+  "return_authorization":           ["f18sf1",                    ""],
+  "residence_title":                ["f18sf2",                    ""],
+  "residence_validity_end":         ["f18sf3",                    ""],
+
+  "current_ocupation":              ["f19",                       ""],
+  "employer_name":                  ["f20sf1",                    ""],
+  "employer_address_phone":         ["f20sf2",                    ""],
+
+  "purpose_of_travel_1":            ["f29",                       ""],
+  "purpose_of_travel_2":            ["f29sf2",                    ""],
+  "purpose_of_travel_3":            ["f29sf3",                    ""],
+  "additional_info_on_purpose_of_stay": ["txtInfoMotEstada",      ""],
+
+  "state_of_destination_1":         ["em_destino_1",              ""],
+  "state_of_destination_2":         ["em_destino_2",              ""],
+  "state_of_destination_3":         ["em_destino_3",              ""],
+
+  "transit_route":                  ["f32",                       ""],
+
+  "number_of_entries_requested":    ["f24",                       ""],
+  "duration_of_stay":               ["f25",                       ""],
+  "intended_date_of_arrival":       ["f30",                       ""],
+  "intended_date_of_departure":     ["f31",                       ""],
+
+  "fingerprints_collected":         ["cmbImpressoesDigitais",     ""],
+  "fingerprints_collected_date":    ["dataImpressoesDigitais",    ""],
+  "visa_sticker_number":            ["numVinImpressoesDigitais",  ""],
+
+  "entry_permit":                   ["f27",                       ""],
+  "permit_valid_until":             ["f27sf2",                    ""],
+  "permit_issuing_entity":          ["f27sf3",                    ""],
+
+  "reference_in_national_territory": ["cmbReferencia",            ""],
+  "host_name":                      ["f34",                       ""],
+  "host_address":                   ["f34sf2",                    ""],
+  "host_phone_fax":                 ["f34sf3",                    ""],
+  "host_email":                     ["f34sf4",                    ""],
+  "host_county":                    ["f34sf5",                    ""],
+
+  "travel_expenses_type_1":         ["cmbDespesasRequerente_1",   ""],
+  "travel_expenses_type_2":         ["cmbDespesasRequerente_2",   ""],
+  "travel_expenses_type_3":         ["cmbDespesasRequerente_3",   ""],
+  "travel_expenses_type_4":         ["cmbDespesasRequerente_4",   ""],
+  "sponsor_1":                      ["cmbDespesasPatrocinador_1", ""],
+  "sponsor_2":                      ["cmbDespesasPatrocinador_2", ""],
+  "sponsor_3":                      ["cmbDespesasPatrocinador_3", ""],
+  "sponsor_4":                      ["cmbDespesasPatrocinador_4", ""],
+
+  "parent_surname":                 ["txtApelidoPaternal",        ""],
+  "parent_name":                    ["txtNomePaternal",           ""],
+  "parent_address":                 ["txtEnderecoPaternal",       ""],
+  "parent_phone_number":            ["txtTelefonePaternal",       ""],
+  "parent_email":                   ["txtEmailPaternal",          ""],
+  "parent_nationality":             ["cmbNacionalidadePaternal",  ""],
+
+  "benefactor_surname":             ["f43",                       ""],
+  "benefactor_name":                ["f43sf2",                    ""],
+  "benefactor_birth_date":          ["f43sf3",                    ""],
+  "benefactor_nationality":         ["f43sf4",                    ""],
+  "benefactor_passport_number":     ["f43sf5",                    ""],
+  "relation_with_benefactor":       ["f43sf6",                    ""],
+
+  "visa_type":                      ["tipo_visto",                "C"],
+  "visa_type_desc":                 ["tipo_visto_desc",           "SHORT STAY VISA (SCHENGEN)"],
+  "days_of_stay":                   ["class_visto",               "SCH"],
+  "visit_purpose":                  ["cod_estada",                "10"],
+  "visa_doc":                       ["id_visto_doc",              "36"],
+  "passport_type":                  ["tipo_passaporte",           ""],
+  "nationality":                    ["nacionalidade",             ""],
+  "country_of_residence":           ["pais_residencia",           ""],
+  "scheduling_date":                ["f_date_c",                  ""],
+  "scheduling_period":              ["cmbPeriodo",                ""],
+
+  "foto":                           ["foto",                      "photo.jpg"],
+  "file1":                          ["file1",                     "attachment.pdf"],
+  "file2":                          ["file2",                     "attachment.pdf"],
+  "file3":                          ["file3",                     "attachment.pdf"],
+  "file4":                          ["file4",                     "attachment.pdf"]
+}
