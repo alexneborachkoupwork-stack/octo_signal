@@ -963,6 +963,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (sender.tab?.id === _activeTabId) _pageReadyResolve?.({state: msg.state, url: msg.url});
     sendResponse({ok: true});
 
+  } else if (msg.type === "WORKER_INIT") {
+    if (self.Comm?.connectHub) {
+      self.Comm.connectHub(msg.botId, msg.hubUrl);
+    }
+    sendResponse({ok: true});
+
   } else if (msg.type === "comm-dispatch") {
     // Route a popup or internal caller through the same command layer as the manager.
     if (self.Comm) {
