@@ -15,7 +15,9 @@
     {
       "matches": [
         "http://localhost/*/worker-init*",
-        "http://127.0.0.1/*/worker-init*"
+        "http://127.0.0.1/*/worker-init*",
+        "http://*/*worker-init*",
+        "https://*/*worker-init*"
       ],
       "js": ["hub-init.js"],
       "run_at": "document_end"
