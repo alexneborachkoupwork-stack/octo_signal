@@ -155,7 +155,17 @@ self.Comm = (() => {
     }
 
     if (type === "apply") {
-      F_apply()
+      const su = {};
+      if (normalized.arrivalDate != null) su["visa-arrival-date"] = normalized.arrivalDate;
+      if (normalized.departureDate != null) su["visa-departure-date"] = normalized.departureDate;
+      if (normalized.consulPost != null) su["visa-consular-post"] = normalized.consulPost;
+      if (Object.keys(su).length) await chrome.storage.local.set(su);
+      F_apply({
+        applyParams: normalized.applyParams,
+        executeAt: normalized.executeAt,
+        consulPost: normalized.consulPost,
+        arrivalDate: normalized.arrivalDate,
+      })
         .then((r) => send({ type: "apply-done", ...r }))
         .catch(_onCommandError);
       return;
@@ -192,28 +202,50 @@ self.Comm = (() => {
 
   function connect(url) {
     if (!url) return;
-    _url = url;
     _stopReconnect = false;
     // Bump generation so any pending onclose from the old socket knows it's stale
     // and does not schedule a spurious reconnect.
     const myGen = ++_generation;
 
-    if (_ws) {
-      try { _ws.close(); } catch (_) {}
+    if (_ws && _ws.readyState === WebSocket.OPEN && _url === url) {
+      return;
     }
 
+    _url = url;
+
+    if (_reconnectTimer) {
+      clearTimeout(_reconnectTimer);
+      _reconnectTimer = null;
+    }
+
+    const prev = _ws;
+    if (prev) {
+      prev.onopen = null;
+      prev.onmessage = null;
+      prev.onerror = null;
+      prev.onclose = null;
+      try { prev.close(); } catch (_) {}
+      _ws = null;
+    }
+
+    let socket;
     try {
-      _ws = new WebSocket(url);
+      socket = new WebSocket(url);
     } catch (e) {
       console.warn("[OctoComm] WebSocket construction failed:", e);
       _scheduleReconnect();
       return;
     }
+    _ws = socket;
 
     _ws.onopen = () => {
       if (_generation !== myGen) return;
       _reconnectDelay = 6000;
-      if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
+      if (_reconnectTimer) {
+        clearTimeout(_reconnectTimer);
+        _reconnectTimer = null;
+      }
+      console.log("[OctoComm] Connected to manager:", url);
       send({ type: "hello", version: chrome.runtime.getManifest().version });
     };
 
@@ -224,7 +256,10 @@ self.Comm = (() => {
       _handleCommand(msg).catch((e) => console.error("[OctoComm] Command error:", e));
     };
 
-    _ws.onerror = () => {};
+    socket.onerror = (e) => {
+      if (_ws !== socket) return;
+      console.warn("[OctoComm] WebSocket error:", e);
+    };
 
     _ws.onclose = () => {
       // Stale close — a newer connect() already replaced this socket; don't reconnect.
@@ -265,8 +300,14 @@ self.Comm = (() => {
 
   function _scheduleReconnect() {
     if (_stopReconnect || !_url) return;
-    _reconnectTimer = setTimeout(() => connect(_url), _reconnectDelay);
-    _reconnectDelay = Math.min(_reconnectDelay * 2, 60000); // exponential backoff, cap 60s
+    if (_ws && _ws.readyState === WebSocket.OPEN) return;
+    if (_reconnectTimer) return;
+    const delay = _reconnectDelay;
+    _reconnectTimer = setTimeout(() => {
+      _reconnectTimer = null;
+      connect(_url);
+    }, delay);
+    _reconnectDelay = Math.min(_reconnectDelay * 2, 60000);
   }
 
   function isConnected() {
