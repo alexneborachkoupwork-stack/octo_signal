@@ -134,14 +134,20 @@ class Session extends EventEmitter {
   /**
    * Called by SessionManager when an inbound message arrives from the extension.
    */
+  // Types that carry no workflow signal — logged at DEBUG only.
+  static _KEEPALIVE = new Set(['ping','pong','hello','status','solver-balance','solver-balances']);
+
   onMessage(msg) {
     // Ignore messages that arrive after the session has already settled — prevents
     // double-fail / double-stop from stale sockets or delayed extension messages.
     if (this.state === STATES.DONE || this.state === STATES.FAILED) return;
 
-    log.info(this.sessionId, '← ext', msg.type, msg.ok != null ? `ok=${msg.ok}` : '');
-
     const type = msg.type;
+    if (Session._KEEPALIVE.has(type)) {
+      log.debug(this.sessionId, '← ext', type);
+    } else {
+      log.info(this.sessionId, '← ext', type, msg.ok != null ? `ok=${msg.ok}` : '');
+    }
 
     // Workflow completion
     if (type.endsWith('-done')) {
@@ -161,9 +167,9 @@ class Session extends EventEmitter {
         this.result = msg;
         log.info(this.sessionId, `Workflow done  type=${type}  status=${msg.status ?? 'ok'}`);
         this._setState(STATES.DONE);
-        this._onResult({ ok: true, sessionId: this.sessionId, ...msg });
         this.stop().catch(() => {});
-        this.emit('done', this.result);
+        this.emit('done', this.result);         // removes from sessions map (synchronous)
+        this._onResult({ ok: true, sessionId: this.sessionId, ...msg }); // stats correct
       }
       return;
     }
@@ -193,10 +199,6 @@ class Session extends EventEmitter {
       return;
     }
 
-    // Informational / keepalive messages — log and ignore
-    if (['hello','pong','status','solver-balance','solver-balances'].includes(type)) {
-      log.debug(this.sessionId, '← info', JSON.stringify(msg).slice(0, 120));
-    }
   }
 
   /**
@@ -308,9 +310,9 @@ class Session extends EventEmitter {
   async _fail(reason) {
     log.error(this.sessionId, `FAILED: ${reason}`);
     this._setState(STATES.FAILED);
-    this._onResult({ ok: false, sessionId: this.sessionId, reason });
+    this.emit('failed', reason);                  // removes from sessions map (synchronous)
+    this._onResult({ ok: false, sessionId: this.sessionId, reason }); // stats correct
     await this.stop().catch(() => {});
-    this.emit('failed', reason);
   }
 }
 

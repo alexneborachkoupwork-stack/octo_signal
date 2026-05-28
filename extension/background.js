@@ -77,7 +77,26 @@ const _runLog = (() => {
       const sid = d.botId ? `_${d.botId.slice(0, 8)}` : "";
       const filename = `${label}${sid}_${ts}.log`;
       const url = "data:text/plain;charset=utf-8," + encodeURIComponent(content);
-      await chrome.downloads.download({ url, filename, saveAs: false });
+      const downloadId = await chrome.downloads.download({ url, filename, saveAs: false });
+      // Wait for the file to be fully written before resolving.
+      // chrome.downloads.download() resolves when Chrome *accepts* the request, not when
+      // the file is on disk.  For Octo profiles each profile is its own Chrome process —
+      // the process exits when the manager calls stopProfile(), cancelling any download
+      // that hasn't finished writing yet.  Waiting for onChanged state=complete ensures
+      // the file is on disk before we send the done/error WS message that triggers teardown.
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, 5000); // safety cap — never hang
+        function onChanged(delta) {
+          if (delta.id !== downloadId) return;
+          const s = delta.state?.current;
+          if (s === "complete" || s === "interrupted") {
+            clearTimeout(timer);
+            chrome.downloads.onChanged.removeListener(onChanged);
+            resolve();
+          }
+        }
+        chrome.downloads.onChanged.addListener(onChanged);
+      });
     } catch (_) {}
   }
 
@@ -581,7 +600,10 @@ function waitForPageReady(tabId, timeoutMs = 30000) {
     if (prev?.timer) clearTimeout(prev.timer);
     const timer = setTimeout(() => {
       _pageReadyResolvers.delete(tabId);
-      reject(new Error("page-ready timeout"));
+      const err = new Error("page-ready timeout");
+      err.proxyStatus = "proxy_slow";
+      err.nextAction  = "rotate_proxy";
+      reject(err);
     }, timeoutMs);
     _pageReadyResolvers.set(tabId, {
       resolve: (data) => { clearTimeout(timer); _pageReadyResolvers.delete(tabId); resolve(data); },
