@@ -7,16 +7,27 @@ self.Comm = (() => {
   let _url = null;
   let _reconnectTimer = null;
   let _stopReconnect = false;
+  let _reconnectDelay = 6000;
+  let _botId = null; // set by connectHub(), included in every outbound message
 
   function send(data) {
     if (_ws && _ws.readyState === WebSocket.OPEN) {
-      try { _ws.send(JSON.stringify(data)); } catch (_) {}
+      try {
+        // Automatically attach sessionId (= botId) to every outbound message
+        const msg = _botId ? { sessionId: _botId, ...data } : data;
+        _ws.send(JSON.stringify(msg));
+      } catch (_) {}
     }
   }
 
   function _onCommandError(e) {
     self._runLog?.finish(`error: ${e.message}`);
-    send({ type: "error", reason: e.message });
+    send({
+      type:        "error",
+      reason:      e.message,
+      proxyStatus: e.proxyStatus ?? null,
+      nextAction:  e.nextAction  ?? null,
+    });
   }
 
   /** Map legacy hub CMD_* envelopes to octo_signal flat commands. */
@@ -45,8 +56,6 @@ self.Comm = (() => {
         consulPost: payload.consulPost,
         realPerson: payload.realPerson,
         captchaSolver: payload.captchaSolver,
-        captchaParallel: payload.captchaParallel,
-        goodProxy: payload.goodProxy,
       };
     }
     if (type === "CMD_APPLY" || type === "CMD_BOOKING") {
@@ -117,8 +126,6 @@ self.Comm = (() => {
     if (type === "register") {
       const su = {};
       if (normalized.captchaSolver != null) su["captcha-solver"] = normalized.captchaSolver;
-      if (normalized.captchaParallel != null) su["captcha-parallel"] = normalized.captchaParallel;
-      if (normalized.goodProxy != null) su["good-proxy"] = normalized.goodProxy;
       if (normalized.emailProvider != null) su["email-provider"] = normalized.emailProvider;
       if (normalized.cfDomain != null) su["cf-mail-domain"] = normalized.cfDomain;
       if (normalized.cfWorkerUrl != null) su["cf-worker-url"] = normalized.cfWorkerUrl;
@@ -133,8 +140,6 @@ self.Comm = (() => {
       if (normalized.username != null) su["username"] = normalized.username;
       if (normalized.password != null) su["password"] = normalized.password;
       if (normalized.captchaSolver != null) su["captcha-solver"] = normalized.captchaSolver;
-      if (normalized.captchaParallel != null) su["captcha-parallel"] = normalized.captchaParallel;
-      if (normalized.goodProxy != null) su["good-proxy"] = normalized.goodProxy;
       if (normalized.arrivalDate != null) su["visa-arrival-date"] = normalized.arrivalDate;
       if (normalized.departureDate != null) su["visa-departure-date"] = normalized.departureDate;
       if (normalized.consulPost != null) su["visa-consular-post"] = normalized.consulPost;
@@ -173,8 +178,6 @@ self.Comm = (() => {
     if (type === "all-in-one") {
       const su = {};
       if (normalized.captchaSolver != null) su["captcha-solver"] = normalized.captchaSolver;
-      if (normalized.captchaParallel != null) su["captcha-parallel"] = normalized.captchaParallel;
-      if (normalized.goodProxy != null) su["good-proxy"] = normalized.goodProxy;
       if (normalized.emailProvider != null) su["email-provider"] = normalized.emailProvider;
       if (normalized.cfDomain != null) su["cf-mail-domain"] = normalized.cfDomain;
       if (normalized.cfWorkerUrl != null) su["cf-worker-url"] = normalized.cfWorkerUrl;
@@ -191,7 +194,7 @@ self.Comm = (() => {
         arrivalDate: normalized.arrivalDate,
         consulPost: normalized.consulPost,
       })
-        .then((r) => send({ type: "all-in-one-done", ...r }))
+        .then((r) => send({ type: "all-in-one-done", ...r, proxyStatus: "ok" }))
         .catch(_onCommandError);
       return;
     }
@@ -234,9 +237,13 @@ self.Comm = (() => {
 
     socket.onopen = () => {
       if (_ws !== socket) return;
+      _reconnectDelay = 6000;
+      if (_reconnectTimer) {
+        clearTimeout(_reconnectTimer);
+        _reconnectTimer = null;
+      }
       console.log("[OctoComm] Connected to manager:", url);
-      const version = chrome.runtime.getManifest().version;
-      send({ type: "hello", version });
+      send({ type: "hello", version: chrome.runtime.getManifest().version });
     };
 
     socket.onmessage = (ev) => {
@@ -262,6 +269,7 @@ self.Comm = (() => {
   /** Hub worker-init: ws://host/ext?botId=… */
   function connectHub(botId, hubWsBase) {
     if (!botId || !hubWsBase) return;
+    _botId = botId; // used as sessionId in all outbound messages
     const base = String(hubWsBase).replace(/\?.*$/, "").replace(/\/$/, "");
     const url = `${base}?botId=${encodeURIComponent(botId)}`;
     chrome.storage.local.set({ botId, hubUrl: base, hubWsUrl: base });
@@ -284,17 +292,28 @@ self.Comm = (() => {
     if (_stopReconnect || !_url) return;
     if (_ws && _ws.readyState === WebSocket.OPEN) return;
     if (_reconnectTimer) return;
+    const delay = _reconnectDelay;
     _reconnectTimer = setTimeout(() => {
       _reconnectTimer = null;
       connect(_url);
-    }, 5000);
+    }, delay);
+    _reconnectDelay = Math.min(_reconnectDelay * 2, 60000);
   }
 
   function isConnected() {
     return !!_ws && _ws.readyState === WebSocket.OPEN;
   }
 
-  return { connect, connectHub, disconnect, send, isConnected, dispatch: _handleCommand };
+  // Reconnect if the WS is not open — called by the ws-ping alarm to recover from
+  // SW suspension (SW sleep drops the WS silently without firing onclose).
+  function reconnectIfNeeded() {
+    if (_stopReconnect || !_url) return;
+    if (!_ws || _ws.readyState === WebSocket.CLOSED || _ws.readyState === WebSocket.CLOSING) {
+      connect(_url);
+    }
+  }
+
+  return { connect, connectHub, disconnect, send, isConnected, reconnectIfNeeded, dispatch: _handleCommand };
 })();
 
 // Prefer hub session from worker-init; fall back to config.json for standalone popup testing.
