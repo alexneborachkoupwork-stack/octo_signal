@@ -20,6 +20,12 @@ const TARGET_URL  = "https://pedidodevistos.mne.gov.pt/VistosOnline/";
 const TARGET_HOST = new URL(TARGET_URL).hostname;
 const MAILTM    = "https://api.mail.tm";
 
+// Session-unique key for MAIN-world property names and custom event names.
+// Regenerated on every SW start — avoids detectable static "_octo*" fingerprint.
+const _SK       = Math.random().toString(36).slice(2, 10);
+const _EVT_ALERT = 'a' + _SK;
+const _EVT_RCP   = 'r' + _SK;
+
 // In-memory active tab ID; persisted to storage for SW restart survival.
 let _activeTabId = null;
 chrome.storage.local.get("active-tab-id").then(d => { if (d["active-tab-id"]) _activeTabId = d["active-tab-id"]; });
@@ -58,10 +64,14 @@ const _runLog = (() => {
   function finish(status) {
     if (!_label) return;
     _push(`=== finished: ${status} ===`);
-    const ts = _ts().replace(/[:.]/g, "-").slice(0, 19);
-    const filename = `${_label}_${ts}.log`;
-    const url = "data:text/plain;charset=utf-8," + encodeURIComponent(_lines.join("\n") + "\n");
-    chrome.downloads.download({ url, filename, saveAs: false }).catch(() => {});
+    const ts  = _ts().replace(/[:.]/g, "-").slice(0, 19);
+    // Include sessionId (botId) in log filename for traceability across layers
+    chrome.storage.local.get("botId").then(d => {
+      const sid = d.botId ? `_${d.botId.slice(0, 8)}` : "";
+      const filename = `${_label}${sid}_${ts}.log`;
+      const url = "data:text/plain;charset=utf-8," + encodeURIComponent(_lines.join("\n") + "\n");
+      chrome.downloads.download({ url, filename, saveAs: false }).catch(() => {});
+    }).catch(() => {});
     _lines = [];
     _label = null;
   }
@@ -92,10 +102,56 @@ self._runLog = _runLog; // expose to communication.js (same SW scope, but const 
 // Fake person generator (JS port of data/person.py)
 // ---------------------------------------------------------------------------
 
-const _FIRST = ["Ana","Maria","João","Carlos","Pedro","Sofia","Luísa","Miguel","Rita","Filipe",
-                 "Sara","Rui","Inês","Tiago","Beatriz","André","Catarina","Nuno","Mariana","Diogo"];
-const _LAST  = ["Silva","Santos","Oliveira","Costa","Ferreira","Pereira","Rodrigues","Alves",
-                 "Martins","Carvalho","Gomes","Lopes","Sousa","Marques","Mendes","Correia"];
+// CPV (Cape Verde) given names — authentic to Cape Verdean culture.
+const _FIRST_M = ["João","Carlos","Hélder","António","Manuel","Sérgio","Leandro","Dário","Orlando",
+                   "Arlindo","Paulo","Filipe","Osvaldo","Wilfredo","Adílson","Valdemar","Hailton",
+                   "Pedro","Rui","Nuno","Décio","Sandro","Edílson","Lúcio","Gilberto"];
+const _FIRST_F = ["Maria","Ana","Edna","Rosa","Lúcia","Eunice","Arminda","Sandra","Graça","Noemia",
+                   "Filomena","Carla","Nair","Isadora","Vera","Conceição","Milena","Suzete","Lisete",
+                   "Ercília","Anilsa","Dulce","Odete","Yara","Valdira"];
+
+// CPV surnames — most common Cape Verdean family names.
+// Double-surname form (maternal + paternal) is used ~50 % of the time.
+const _LAST  = ["Semedo","Tavares","Correia","Lima","Varela","Monteiro","Évora","Fernandes",
+                 "Rodrigues","Furtado","Mendes","Barros","Cruz","Veiga","Delgado","Pires",
+                 "Andrade","Soares","Cardoso","Lopes","Brito","Gonçalves","Neves","Spencer",
+                 "Borges","Moreno","Duarte","Fontes","Mascarenhas","Santos"];
+
+// Linking particles used in compound given names: "Maria da Graça", "João de Deus".
+const _PARTICLES = ["da","de","do","dos","das"];
+
+// Generate a compound CPV given name matching the gender.
+// Distribution: ~40 % single · ~35 % two-part · ~25 % particle compound.
+function _genGivenName(gender) {
+  const pool = gender === "M" ? _FIRST_M : _FIRST_F;
+  const a = _pick(pool);
+  const r = _rand(10);
+  if (r < 4) {
+    // Two-part: "João Carlos", "Ana Paula"
+    let b = _pick(pool);
+    if (b === a) b = _pick(pool);
+    return a + " " + b;
+  }
+  if (r < 7) {
+    // Particle compound: "Maria da Graça", "António de Jesus"
+    const p = _pick(_PARTICLES);
+    let b = _pick(pool);
+    if (b === a) b = _pick(pool);
+    return a + " " + p + " " + b;
+  }
+  return a;
+}
+
+// Generate a CPV surname: single or double (maternal + paternal).
+function _genSurname() {
+  const a = _pick(_LAST);
+  if (_rand(2)) {
+    let b = _pick(_LAST);
+    if (b === a) b = _pick(_LAST);
+    return a + " " + b;
+  }
+  return a;
+}
 const _NAT   = ["CPV"];
 
 function _pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
@@ -170,9 +226,12 @@ function _parseDOB(raw) {
 }
 
 function generatePerson() {
-  const first = _pick(_FIRST);
-  const last  = _pick(_LAST);
-  const uname = (first.slice(0,3) + last.slice(0,3) + (1000000 + _rand(99000000))).toLowerCase()
+  const gender  = _rand(2) ? "M" : "F";
+  const first   = _genGivenName(gender);
+  const last    = _genSurname();
+  // Username uses only the bare root of each (first word, no particles).
+  const _strip = s => s.split(" ").find(w => !_PARTICLES.includes(w.toLowerCase())) ?? s.split(" ")[0];
+  const uname = (_strip(first).slice(0,3) + _strip(last).slice(0,3) + (1000000 + _rand(99000000))).toLowerCase()
                 .normalize("NFD").replace(/[̀-ͯ]/g,"");
   const traveldoc = "PA" + Array.from({length:6}, () => _rand(10)).join("");
   return {
@@ -181,7 +240,7 @@ function generatePerson() {
     username:    uname,
     password:    _genPassword(),
     birth_date:  _genBirthdate(),
-    gender:      _rand(2) ? "M" : "F",
+    gender,
     nationality: _pick(_NAT),
     traveldoc,
   };
@@ -196,47 +255,139 @@ function generatePerson() {
 
 async function _mtDomain() {
   const r = await fetch(`${MAILTM}/domains`);
+
+  if (!r.ok) {
+    throw new Error(`Failed to fetch domains: ${r.status}`);
+  }
+
   const d = await r.json();
-  return d["hydra:member"][0]["domain"];
+
+  const domains = (d["hydra:member"] || [])
+    .filter(x => x.isActive)
+    .map(x => x.domain);
+
+  if (!domains.length) {
+    throw new Error("No active mail.tm domains available");
+  }
+
+  // random domain
+  return domains[Math.floor(Math.random() * domains.length)];
 }
 
-async function _createMailTM() {
-  const domain = await _mtDomain();
-  const local  = Math.random().toString(36).slice(2, 12);
-  const email  = `${local}@${domain}`;
-  const pwd    = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+function _randomstring(len = 10) {
+  let s = '';
+  while (s.length < len) s += Math.random().toString(36).slice(2);
+  return s.slice(0, len);
+}
 
-  await fetch(`${MAILTM}/accounts`, {
-    method: "POST",
-    headers: {"Content-Type":"application/json"},
-    body: JSON.stringify({address: email, password: pwd}),
-  });
+async function _createMailTM(retries = 5) {
+  let lastErr;
 
-  const tr = await fetch(`${MAILTM}/token`, {
-    method: "POST",
-    headers: {"Content-Type":"application/json"},
-    body: JSON.stringify({address: email, password: pwd}),
-  });
-  const {token: jwt} = await tr.json();
-  return {email, password: pwd, jwt};
+  for (let i = 0; i < retries; i++) {
+    try {
+      const domain = await _mtDomain();
+      const local = _randomstring(10 + Math.floor(Math.random() * 5));
+      const email = `${local}@${domain}`;
+
+      const pwd = 
+        _randomstring(16) +
+        _randomstring(16);
+      
+      // create account
+      const ar = await fetch(`${MAILTM}/accounts`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          address: email,
+          password: pwd,
+        }),
+      });
+
+      if (!ar.ok) {
+        const txt = await ar.text();
+        throw new Error(
+          `Account creation failed (${ar.status}): ${txt}`
+        );
+      }
+
+      // login / get token
+      const tr= await fetch(`${MAILTM}/token`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          address: email,
+          password: pwd,
+        }),
+      });
+
+      if (!tr.ok) {
+        const txt = await tr.text();
+        throw new Error(
+          `Token request failed (${tr.status}): ${txt}`
+        );
+      }
+
+      const td = await tr.json();
+
+      if (!td.token) {
+        throw new Error("mail.tm did not return JWT");
+      }
+
+      return {
+        email,
+        password: pwd,
+        jwt: td.token,
+        domain,
+      };
+    } catch (err) {
+      lastErr = err;
+      console.error(`mail.tm retry ${i + 1} failed:`, err);
+    }
+  }
+  throw lastErr;
 }
 
 async function _pollMailTM(jwt) {
   const r = await fetch(`${MAILTM}/messages`, {
     headers: {"Authorization": `Bearer ${jwt}`},
   });
+
   if (r.status === 401) {
     const err = new Error("mail.tm JWT expired (401)");
     err.authExpired = true;
     throw err;
   }
+
+  if (!r.ok) {
+    throw new Error(`Failed to fetch messages: ${r.status}`);
+  }
+
   const d = await r.json();
   const items = d["hydra:member"] ?? [];
+
   if (!items.length) return null;
 
-  const mr = await fetch(`${MAILTM}/messages/${items[0].id}`, {
+  // newest first
+  items.sort(
+    (a, b) =>
+      new Date(b.createdAt) - new Date(a.createdAt)
+  );
+
+  const msgId = items[0].id;
+  const mr = await fetch(`${MAILTM}/messages/${msgId}`, {
     headers: {"Authorization": `Bearer ${jwt}`},
   });
+
+  if (!mr.ok) {
+    throw new Error(
+      `Failed to fetch message body: ${mr.status}`
+    );
+  }
+
   return mr.json();
 }
 
@@ -400,17 +551,86 @@ function _raceSolvers(pageUrl, siteKey, action) {
   });
 }
 
+// reCAPTCHA token injection script — runs in MAIN world via executeScript.
+// Self-contained (no closure refs); data passed via args = [token, evtRcp].
+// Used by both inject-recaptcha-token and solve-and-inject-recaptcha handlers.
+function _recaptchaInjectFunc(token, evtRcp) {
+  for (const sel of ["#g-recaptcha-response-1","#g-recaptcha-response"]) {
+    const ta = document.querySelector(sel);
+    if (!ta) continue;
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,"value")?.set;
+    if (setter) setter.call(ta, token); else ta.value = token;
+    ta.dispatchEvent(new Event("input",  {bubbles:true}));
+    ta.dispatchEvent(new Event("change", {bubbles:true}));
+  }
+  try {
+    function _native(fn, name) {
+      fn.toString = function() { return 'function ' + name + '() { [native code] }'; };
+      try { Object.defineProperty(fn, 'name', {value: name, configurable: true}); } catch(_) {}
+      return fn;
+    }
+    const _tok = token;
+    if (window.grecaptcha?.enterprise?.getResponse) window.grecaptcha.enterprise.getResponse = _native(function getResponse() { return _tok; }, 'getResponse');
+    if (window.grecaptcha?.getResponse)             window.grecaptcha.getResponse             = _native(function getResponse() { return _tok; }, 'getResponse');
+    if (window.grecaptcha?.enterprise?.execute)     window.grecaptcha.enterprise.execute      = _native(function execute() { return Promise.resolve(_tok); }, 'execute');
+    if (window.grecaptcha?.execute)                 window.grecaptcha.execute                 = _native(function execute() { return Promise.resolve(_tok); }, 'execute');
+  } catch(_) {}
+  try {
+    const _tok = token;
+    const seen = new WeakSet();
+    function _findAndCallCb(obj, depth) {
+      if (!obj || depth > 8 || typeof obj !== "object" || seen.has(obj)) return;
+      seen.add(obj);
+      if (typeof obj.callback === "function") { try { obj.callback(_tok); } catch(_) {} }
+      for (const v of Object.values(obj)) _findAndCallCb(v, depth + 1);
+    }
+    for (const client of Object.values(window.___grecaptcha_cfg?.clients ?? {})) _findAndCallCb(client, 0);
+  } catch(_) {}
+  try {
+    const _anchor = document.querySelector("iframe[src*='recaptcha/api2/anchor'], iframe[src*='recaptcha/enterprise/anchor']");
+    if (_anchor?.contentWindow) {
+      for (const _m of [JSON.stringify({token}), JSON.stringify({type:"verify",token}), JSON.stringify({source:"recaptcha",type:"solution",token})]) {
+        try { _anchor.contentWindow.postMessage(_m, "*"); } catch(_) {}
+      }
+    }
+  } catch(_) {}
+  document.dispatchEvent(new CustomEvent(evtRcp, {detail:{token}}));
+}
+
+// Unified solver dispatch — used by both solve-recaptcha-api and solve-and-inject-recaptcha.
+async function _doSolveRecaptcha(pageUrl, siteKey, action) {
+  // Always race all solvers in parallel — first successful token wins.
+  // This eliminates the sequential primary→fallback delay: if the primary solver
+  // returns error 1001 (unsolvable) or is slow, another solver's result is used
+  // immediately. Balance is checked asynchronously for reporting only.
+  const {"captcha-solver": solver = "capsolver"} =
+    await chrome.storage.local.get("captcha-solver");
+  const primary = (solver in _SOLVER_URLS) ? solver : "capsolver";
+  const pickedKey = primary === "anti-captcha" ? _pick(_ANTICAPTCHA_KEYS)
+    : primary === "2captcha"   ? _pick(_TWOCAPTCHA_KEYS)
+    : primary === "capmonster" ? _pick(_CAPMONSTER_KEYS)
+    : _CAPSOLVER_KEY;
+
+  // Non-blocking balance report for the configured primary.
+  _fetchBalance(_SOLVER_URLS[primary], pickedKey)
+    .then(bal => { if (bal !== null) self.Comm?.send({type:"solver-balance", solver:primary, balance:bal, ts:new Date().toISOString()}); })
+    .catch(() => {});
+
+  // Race every solver simultaneously; first valid token resolves.
+  return _raceSolvers(pageUrl, siteKey, action);
+}
+
 // ---------------------------------------------------------------------------
 // Tab helper + page-ready signaling
 // ---------------------------------------------------------------------------
 
-// Tear down any in-flight workflow completely before starting a new one.
+// Tear down shared workflow state before starting a new session.
+// Each session is responsible for closing its OWN tab in a finally{} block.
+// The stray-tab sweep was removed — it killed concurrent sessions' tabs.
 async function _resetWorkflow() {
   stopF6();
   clearInterval(_pollInterval);
   _pollInterval = null;
-
-  const savedTabId = _activeTabId;
   _activeTabId = null;
 
   await chrome.storage.local.remove([
@@ -419,19 +639,12 @@ async function _resetWorkflow() {
     "email-token", "email-code-token", "emailPoll",
     "login-pending", "pending-account",
     "active-tab-id", "register-retried",
-    "warmup-idle-state",
+    "warmup-idle-state", "warmup-tab-id",
   ]);
-
-  if (savedTabId) await chrome.tabs.remove(savedTabId).catch(() => {});
-
-  // Sweep: close any stray target tabs.
-  const allTabs = await chrome.tabs.query({});
-  const stragglers = allTabs.filter(t => {
-    try { return new URL(t.url ?? "").hostname === TARGET_HOST; } catch (_) { return false; }
-  });
-  if (stragglers.length > 0) await chrome.tabs.remove(stragglers.map(t => t.id)).catch(() => {});
 }
 
+// Kept for SW-restart survival: if the worker restarts mid-session, _activeTabId is
+// reloaded from storage and the single-tab popup flow still works.
 async function _getActiveTab() {
   if (_activeTabId != null) {
     try { await chrome.tabs.get(_activeTabId); return _activeTabId; } catch (_) {}
@@ -446,22 +659,40 @@ async function _getActiveTab() {
   return _activeTabId;
 }
 
-let _pageReadyResolve = null, _pageReadyReject = null, _pageReadyTimer = null;
+// Creates a dedicated background tab for one concurrent session.
+// visibilityState is patched by antidetect.js to always return "visible",
+// and CDP mouse events (reCAPTCHA click) work on background tabs.
+async function _createSessionTab() {
+  const tab = await chrome.tabs.create({url: TARGET_URL, active: false});
+  const tabId = tab.id;
+  _activeTabId = tabId; // keep for abort/proxy-check only
+  await chrome.storage.local.set({"active-tab-id": tabId});
+  return tabId;
+}
 
-function waitForPageReady(timeoutMs = 30000) {
+// Per-tab page-ready resolvers — replaces the three scalar globals that only allowed
+// one concurrent waitForPageReady at a time.
+const _pageReadyResolvers = new Map(); // tabId → {resolve, reject, timer}
+
+function waitForPageReady(tabId, timeoutMs = 30000) {
   return new Promise((resolve, reject) => {
-    if (_pageReadyTimer) clearTimeout(_pageReadyTimer);
-    _pageReadyTimer = setTimeout(() => {
-      _pageReadyResolve = _pageReadyReject = null;
+    const prev = _pageReadyResolvers.get(tabId);
+    if (prev?.timer) clearTimeout(prev.timer);
+    const timer = setTimeout(() => {
+      _pageReadyResolvers.delete(tabId);
       reject(new Error("page-ready timeout"));
     }, timeoutMs);
-    _pageReadyResolve = (data) => { clearTimeout(_pageReadyTimer); _pageReadyResolve = _pageReadyReject = null; resolve(data); };
-    _pageReadyReject  = (err)  => { clearTimeout(_pageReadyTimer); _pageReadyResolve = _pageReadyReject = null; reject(err); };
+    _pageReadyResolvers.set(tabId, {
+      resolve: (data) => { clearTimeout(timer); _pageReadyResolvers.delete(tabId); resolve(data); },
+      reject:  (err)  => { clearTimeout(timer); _pageReadyResolvers.delete(tabId); reject(err);  },
+      timer,
+    });
   });
 }
 
-async function sendTabCmd(type, params = {}) {
-  const tabId = await _getActiveTab();
+// tabId is now an explicit first parameter — no global lookup.
+// This makes concurrent sessions safe: each session carries its own tabId.
+async function sendTabCmd(tabId, type, params = {}) {
   return chrome.tabs.sendMessage(tabId, {type, ...params});
 }
 
@@ -503,8 +734,10 @@ async function _doPollTick() {
     if (codeToken) storageUpdate["email-code-token"] = codeToken;
     await chrome.storage.local.set(storageUpdate);
 
-    // Notify content script — prefer codeToken (UUID) over linkToken (hex).
-    if (_activeTabId) chrome.tabs.sendMessage(_activeTabId, {type: "email-token", token: codeToken ?? linkToken}).catch(() => {});
+    // Notify the session's content script — prefer codeToken (UUID) over linkToken (hex).
+    // emailPoll.tabId was stored when _startEmailPoll() was called — routes to the correct session.
+    const _pollTabId = emailPoll.tabId ?? _activeTabId;
+    if (_pollTabId) chrome.tabs.sendMessage(_pollTabId, {type: "email-token", token: codeToken ?? linkToken}).catch(() => {});
   } catch (e) {
     if (e.authExpired) {
       clearInterval(_pollInterval);
@@ -521,8 +754,8 @@ async function _doPollTick() {
 // Email poll helpers (used by F2)
 // ---------------------------------------------------------------------------
 
-function _startEmailPoll(jwt) {
-  chrome.storage.local.set({emailPoll: {jwt}});
+function _startEmailPoll(jwt, tabId) {
+  chrome.storage.local.set({emailPoll: {jwt, tabId}});
   if (!_pollInterval) _pollInterval = setInterval(_doPollTick, 6000);
 }
 
@@ -541,16 +774,40 @@ async function _waitForEmailCodeToken(maxMs = 120000) {
 // F1–F6 orchestration functions
 // ---------------------------------------------------------------------------
 
-async function F1_openAuthPage() {
+// Minimal pre-session warmup — visits 2 real sites before the target.
+// Builds a browsing history entry so reCAPTCHA Enterprise sees a non-fresh session.
+// Sites are Google-affiliated (high trust) and topic-relevant (visa search).
+const _WARMUP_URLS = [
+  "https://www.google.com/search?q=apply+for+visa+portugal+schengen",
+  "https://en.wikipedia.org/wiki/Visa_policy_of_Portugal",
+];
+
+async function F0_warmupBrowse(tabId) {
+  for (const url of _WARMUP_URLS) {
+    await chrome.tabs.update(tabId, {url});
+    // Poll until the tab finishes loading (page-ready won't fire for non-target pages)
+    await new Promise(resolve => {
+      const check = setInterval(async () => {
+        const tab = await chrome.tabs.get(tabId).catch(() => null);
+        if (!tab || tab.status === "complete") { clearInterval(check); resolve(); }
+      }, 400);
+      setTimeout(() => { clearInterval(check); resolve(); }, 12000);
+    });
+    // Dwell — let the page accumulate behavioral signals
+    await new Promise(r => setTimeout(r, 7000 + Math.random() * 4000));
+  }
+  _runLog.entry("F0: warmup browse done");
+}
+
+async function F1_openAuthPage(tabId) {
   let state;
-  try { ({state} = await sendTabCmd("cmd-get-state")); } catch (_) { state = "unknown"; }
+  try { ({state} = await sendTabCmd(tabId, "cmd-get-state")); } catch (_) { state = "unknown"; }
 
   if (state === "auth") return {ok: true, status: "ready"};
 
   if (state !== "not-logged-in") {
     // Set up listener BEFORE navigation so page-ready can't arrive before we're listening.
-    const pageReady = waitForPageReady(30000);
-    const tabId = await _getActiveTab();
+    const pageReady = waitForPageReady(tabId, 30000);
     await chrome.tabs.update(tabId, {url: TARGET_URL});
     ({state} = await pageReady);
   }
@@ -566,11 +823,10 @@ async function F1_openAuthPage() {
   for (let attempt = 0; attempt < 3; attempt++) {
     if (attempt > 0) {
       await new Promise(r => setTimeout(r, 1500 + attempt * 500));
-      try { ({state} = await sendTabCmd("cmd-get-state")); } catch (_) { state = "unknown"; }
+      try { ({state} = await sendTabCmd(tabId, "cmd-get-state")); } catch (_) { state = "unknown"; }
       if (state === "auth") return {ok: true, status: "ready"};
       if (state !== "not-logged-in") {
-        const pr = waitForPageReady(30000);
-        const tabId = await _getActiveTab();
+        const pr = waitForPageReady(tabId, 30000);
         await chrome.tabs.update(tabId, {url: TARGET_URL});
         ({state} = await pr);
         if (state === "auth") return {ok: true, status: "ready"};
@@ -578,18 +834,18 @@ async function F1_openAuthPage() {
     }
 
     // Language switch may reload the page — 15 s gives ample room past the reload time.
-    const langCmd = sendTabCmd("cmd-switch-lang").catch(() => {});
-    const langReady = waitForPageReady(15000);
+    const langCmd = sendTabCmd(tabId, "cmd-switch-lang").catch(() => {});
+    const langReady = waitForPageReady(tabId, 15000);
     await langCmd;
     await langReady.catch(() => {}); // ignore timeout (already English) or navigation
 
     // Confirm still on not-logged-in before arming the login listener.
-    try { ({state} = await sendTabCmd("cmd-get-state")); } catch (_) { state = "unknown"; }
+    try { ({state} = await sendTabCmd(tabId, "cmd-get-state")); } catch (_) { state = "unknown"; }
     if (state === "auth") return {ok: true, status: "ready"};
 
     // Login-link click always navigates — arm listener first.
-    const authReady = waitForPageReady(20000);
-    await sendTabCmd("cmd-click-login-link").catch(() => {});
+    const authReady = waitForPageReady(tabId, 20000);
+    await sendTabCmd(tabId, "cmd-click-login-link").catch(() => {});
     try {
       const {state: authState} = await authReady;
       if (authState === "auth") return {ok: true, status: "ready"};
@@ -602,29 +858,38 @@ async function F1_openAuthPage() {
   throw new Error(`F1: expected auth, got ${state}`);
 }
 
-async function F2_register(person, emailAcct) {
+async function F2_register(tabId, person, emailAcct) {
   _runLog.entry(`F2: person=${person.name} ${person.surname} email=${emailAcct.email}`);
-  await sendTabCmd("cmd-register-open-form");
+  await sendTabCmd(tabId, "cmd-register-open-form");
   _runLog.entry("F2: form opened");
-  const fillResult = await sendTabCmd("cmd-register-fill", {person, email: emailAcct.email});
+  const fillResult = await sendTabCmd(tabId, "cmd-register-fill", {person, email: emailAcct.email});
   if (fillResult?.status === "form_incomplete") throw new Error("F2: form_incomplete — AJAX fields not loaded");
   _runLog.entry("F2: form filled");
 
   // Arm BEFORE the submit loop — the server redirect to the token page can arrive
   // within milliseconds of the RGPD submit, before the loop exits and we could call
   // waitForPageReady.  If we armed it after, the page-ready signal would be lost.
-  const tokenPageReady = waitForPageReady(360000);
+  const tokenPageReady = waitForPageReady(tabId, 360000);
 
   // 2-attempt retry is handled inside cmd-register-submit (_registerSubmit).
   _runLog.entry("F2: captcha submit (up to 2 attempts internally)");
-  const result = await sendTabCmd("cmd-register-submit").catch(() => ({ok: true, status: "navigated"}));
+  const result = await sendTabCmd(tabId, "cmd-register-submit").catch(() => ({ok: true, status: "navigated"}));
   _runLog.entry(`F2: submit result → ${result.status}`);
-  if (result.status === "ip_blocked") throw new Error("F2: IP blocked by captcha rate-limit");
-  if (result.status !== "navigated" && result.status !== "submitted")
-    throw new Error(`F2: register failed: ${result.status}`);
+  if (result.status === "ip_blocked") {
+    const e = new Error("F2: IP blocked by captcha rate-limit");
+    e.proxyStatus = "blocked"; e.nextAction = "rotate_proxy"; throw e;
+  }
+  if (result.status === "captcha_fail") {
+    const e = new Error("F2: register failed: captcha_fail");
+    e.proxyStatus = "burned"; e.nextAction = "rotate_proxy"; throw e;
+  }
+  if (result.status !== "navigated" && result.status !== "submitted") {
+    const e = new Error(`F2: register failed: ${result.status}`);
+    e.proxyStatus = "unknown"; throw e;
+  }
 
   _runLog.entry("F2: waiting for token page redirect + email code");
-  _startEmailPoll(emailAcct.jwt);
+  _startEmailPoll(emailAcct.jwt, tabId);
   await tokenPageReady; // wait for token page navigation
   _runLog.entry("F2: token page reached — polling email");
 
@@ -634,6 +899,7 @@ async function F2_register(person, emailAcct) {
 
   // Write pending-account BEFORE submit click — page navigates on success,
   // killing the content script; main() on the next page picks this up and saves the CSV.
+  const {botId: _sessionId} = await chrome.storage.local.get("botId");
   await chrome.storage.local.set({
     "pending-account": {
       username:      person.username,
@@ -646,30 +912,68 @@ async function F2_register(person, emailAcct) {
       nationality:   person.nationality ?? "CPV",
       traveldoc:     person.traveldoc,
       registered_at: new Date().toISOString(),
+      sessionId:     _sessionId ?? null,
     }
   });
 
-  await sendTabCmd("cmd-token-fill", {token: codeToken});
-  const verifyReady = waitForPageReady(30000); // arm before submit navigates
-  await sendTabCmd("cmd-token-submit").catch(() => {});
+  await sendTabCmd(tabId, "cmd-token-fill", {token: codeToken});
+  _runLog.entry("F2: submitting email verification token");
+  const verifyReady = waitForPageReady(tabId, 30000); // arm before submit navigates
+  // port-closed error = page navigated = success; {ok:false} = error alert = failure
+  const tokenResult = await sendTabCmd(tabId, "cmd-token-submit")
+    .catch(() => ({ok: true, status: "navigated"}));
   const {state: finalState} = await verifyReady;
-  _runLog.entry(`F2: verification done → state=${finalState}`);
+  _runLog.entry(`F2: verification done → result=${tokenResult.ok ? "success" : `failed(${tokenResult.status})`} state=${finalState}`);
+
+  if (!tokenResult.ok) {
+    await chrome.storage.local.remove("pending-account");
+    throw new Error(`F2: email verification failed: ${tokenResult.status}${tokenResult.alert ? ` — ${tokenResult.alert}` : ""}`);
+  }
+
+  // Belt-and-suspenders: save directly from background in case the content.js
+  // save-account round-trip failed (navigation timing, WS disconnect, etc).
+  // Deduplication by username prevents double entries when content.js also saved.
+  try {
+    const {accounts: _accs} = await chrome.storage.local.get("accounts");
+    const _list = Array.isArray(_accs) ? _accs : [];
+    if (!_list.some(a => a.username === person.username)) {
+      _list.push({
+        username:      person.username,
+        password:      person.password,
+        name:          person.name,
+        surname:       person.surname,
+        email:         emailAcct.email,
+        birth_date:    person.birth_date,
+        gender:        person.gender,
+        nationality:   person.nationality ?? "CPV",
+        traveldoc:     person.traveldoc,
+        registered_at: new Date().toISOString(),
+      });
+      await chrome.storage.local.set({accounts: _list});
+      _runLog.entry(`F2: credentials saved to accounts list (username=${person.username})`);
+    } else {
+      _runLog.entry(`F2: credentials already in accounts list (username=${person.username})`);
+    }
+  } catch(e) {
+    _runLog.entry(`F2: accounts save error: ${e.message}`);
+  }
+
   return {ok: true, status: finalState === "auth" ? "verified" : finalState};
 }
 
-async function F3_login(creds) {
+async function F3_login(tabId, creds) {
   let state;
-  try { ({state} = await sendTabCmd("cmd-get-state")); } catch (_) { state = "unknown"; }
+  try { ({state} = await sendTabCmd(tabId, "cmd-get-state")); } catch (_) { state = "unknown"; }
   if (state === "logged-in") return {ok: true, status: "already-logged-in"};
 
-  await sendTabCmd("cmd-login-fill", creds);
+  await sendTabCmd(tabId, "cmd-login-fill", creds);
 
   for (let attempt = 0; attempt < 3; attempt++) {
     // Port-closed error = tab navigated mid-command; wait briefly for new page-ready.
     // Normal "navigated" return = _loginSubmit already waited 5s + session probe,
     // new page is fully loaded — no additional wait needed.
-    const result = await sendTabCmd("cmd-login-submit").catch(async () => {
-      await waitForPageReady(15000).catch(() => {});
+    const result = await sendTabCmd(tabId, "cmd-login-submit").catch(async () => {
+      await waitForPageReady(tabId, 15000).catch(() => {});
       return {ok: true, status: "navigated"};
     });
     if (result.status === "logged-in" || result.status === "navigated") {
@@ -681,17 +985,17 @@ async function F3_login(creds) {
   return {ok: false, status: "login_failed"};
 }
 
-async function F4_formFilling() {
+async function F4_formFilling(tabId) {
   // Arm each listener BEFORE the command that triggers navigation.
-  let pageReady = waitForPageReady(30000);
-  await sendTabCmd("cmd-go-questionnaire").catch(() => {});
+  let pageReady = waitForPageReady(tabId, 30000);
+  await sendTabCmd(tabId, "cmd-go-questionnaire").catch(() => {});
   const {state: qState} = await pageReady;
   if (qState !== "questionnaire") throw new Error(`F4: expected questionnaire, got ${qState}`);
 
   let fState;
   for (let attempt = 0; attempt < 2; attempt++) {
-    pageReady = waitForPageReady(90000);
-    await sendTabCmd("cmd-fill-questionnaire").catch(() => {});
+    pageReady = waitForPageReady(tabId, 150000);
+    await sendTabCmd(tabId, "cmd-fill-questionnaire").catch(() => {});
     ({state: fState} = await pageReady);
     if (fState === "form") break;
     if (fState === "auth") break;  // server-side session expiry — handle below
@@ -705,35 +1009,36 @@ async function F4_formFilling() {
     const {"register-person": creds} = await chrome.storage.local.get("register-person");
     if (!creds?.username || !creds?.password)
       throw new Error("F4: session expired, no stored credentials for re-login");
-    await F3_login({username: creds.username, password: creds.password});
-    pageReady = waitForPageReady(30000);
-    await sendTabCmd("cmd-go-questionnaire").catch(() => {});
+    const _reloginRes = await F3_login(tabId, {username: creds.username, password: creds.password});
+    if (!_reloginRes.ok) throw new Error(`F4: re-login failed — status=${_reloginRes.status}`);
+    pageReady = waitForPageReady(tabId, 30000);
+    await sendTabCmd(tabId, "cmd-go-questionnaire").catch(() => {});
     const {state: qState2} = await pageReady;
     if (qState2 !== "questionnaire") throw new Error(`F4: after re-login, expected questionnaire, got ${qState2}`);
-    pageReady = waitForPageReady(90000);
-    await sendTabCmd("cmd-fill-questionnaire").catch(() => {});
+    pageReady = waitForPageReady(tabId, 150000);
+    await sendTabCmd(tabId, "cmd-fill-questionnaire").catch(() => {});
     ({state: fState} = await pageReady);
   }
 
   if (fState !== "form") throw new Error(`F4: questionnaire never reached form after retries`);
 
-  pageReady = waitForPageReady(90000);
-  await sendTabCmd("cmd-fill-form").catch(() => {});
+  pageReady = waitForPageReady(tabId, 150000);
+  await sendTabCmd(tabId, "cmd-fill-form").catch(() => {});
   const {state: sState} = await pageReady;
   if (sState !== "schedule") throw new Error(`F4: expected schedule, got ${sState}`);
 
   return {ok: true, status: "form-ready"};
 }
 
-async function F5_scheduling(config) {
-  return sendTabCmd("cmd-schedule", config).catch(e => ({ok: false, error: e.message}));
+async function F5_scheduling(tabId, config) {
+  return sendTabCmd(tabId, "cmd-schedule", config).catch(e => ({ok: false, error: e.message}));
 }
 
 let _f6Interval = null;
 
-function F6_keepSession() {
+function F6_keepSession(tabId) {
   if (_f6Interval) clearInterval(_f6Interval);
-  _f6Interval = setInterval(() => sendTabCmd("cmd-keep-tick").catch(() => {}), 30000);
+  _f6Interval = setInterval(() => sendTabCmd(tabId, "cmd-keep-tick").catch(() => {}), 30000);
 }
 
 function stopF6() {
@@ -746,85 +1051,96 @@ async function F_warmup(config) {
   _runLog.entry(`username=${config.username} idleStep=${idleStep}`);
   stopF6();
   await _resetWorkflow();
-  await chrome.storage.local.set({"warmup-idle-state": idleStep});
+  const tabId = await _createSessionTab();
+  await chrome.storage.local.set({"warmup-idle-state": idleStep, "warmup-tab-id": tabId});
 
-  _runLog.entry("F_warmup: opening auth page");
-  await F1_openAuthPage();
-  _runLog.entry("F_warmup: logging in");
-  await F3_login({username: config.username, password: config.password});
-  _runLog.entry("F_warmup: logged in");
+  try {
+    _runLog.entry("F_warmup: opening auth page");
+    await F1_openAuthPage(tabId);
+    _runLog.entry("F_warmup: logging in");
+    const _warmupLoginRes = await F3_login(tabId, {username: config.username, password: config.password});
+    if (!_warmupLoginRes.ok) {
+      _runLog.finish(`error: F_warmup: login failed — status=${_warmupLoginRes.status}`);
+      return {ok: false, status: _warmupLoginRes.status};
+    }
+    _runLog.entry("F_warmup: logged in");
 
-  if (idleStep === "login") {
-    F6_keepSession();
-    _runLog.finish("ok idleStep=login");
-    return {ok: true, idleStep: "login"};
+    if (idleStep === "login") {
+      F6_keepSession(tabId);
+      _runLog.finish("ok idleStep=login");
+      return {ok: true, idleStep: "login"};
+    }
+
+    _runLog.entry("F_warmup: navigating to questionnaire");
+    let pageReady = waitForPageReady(tabId, 30000);
+    await sendTabCmd(tabId, "cmd-go-questionnaire").catch(() => {});
+    const {state: qState} = await pageReady;
+    if (qState !== "questionnaire") throw new Error(`F_warmup: expected questionnaire, got ${qState}`);
+    _runLog.entry("F_warmup: filling questionnaire");
+
+    pageReady = waitForPageReady(tabId, 60000);
+    await sendTabCmd(tabId, "cmd-fill-questionnaire").catch(() => {});
+    const {state: fState} = await pageReady;
+    if (fState !== "form") throw new Error(`F_warmup: expected form, got ${fState}`);
+    _runLog.entry("F_warmup: on form page");
+
+    if (idleStep === "form") {
+      await sendTabCmd(tabId, "cmd-fill-form-tabs").catch(() => {});
+      F6_keepSession(tabId);
+      _runLog.finish("ok idleStep=form");
+      return {ok: true, idleStep: "form"};
+    }
+
+    if (idleStep === "schedule") {
+      _runLog.entry("F_warmup: submitting form → schedule");
+      pageReady = waitForPageReady(tabId, 90000);
+      await sendTabCmd(tabId, "cmd-fill-form").catch(() => {});
+      const {state: sState} = await pageReady;
+      if (sState !== "schedule") throw new Error(`F_warmup: expected schedule, got ${sState}`);
+      F6_keepSession(tabId);
+      _runLog.finish("ok idleStep=schedule");
+      return {ok: true, idleStep: "schedule"};
+    }
+
+    throw new Error(`F_warmup: unknown idleStep "${idleStep}"`);
+  } catch(e) {
+    chrome.tabs.remove(tabId).catch(() => {});
+    throw e;
   }
-
-  _runLog.entry("F_warmup: navigating to questionnaire");
-  let pageReady = waitForPageReady(30000);
-  await sendTabCmd("cmd-go-questionnaire").catch(() => {});
-  const {state: qState} = await pageReady;
-  if (qState !== "questionnaire") throw new Error(`F_warmup: expected questionnaire, got ${qState}`);
-  _runLog.entry("F_warmup: filling questionnaire");
-
-  pageReady = waitForPageReady(60000);
-  await sendTabCmd("cmd-fill-questionnaire").catch(() => {});
-  const {state: fState} = await pageReady;
-  if (fState !== "form") throw new Error(`F_warmup: expected form, got ${fState}`);
-  _runLog.entry("F_warmup: on form page");
-
-  if (idleStep === "form") {
-    await sendTabCmd("cmd-fill-form-tabs").catch(() => {});
-    F6_keepSession();
-    _runLog.finish("ok idleStep=form");
-    return {ok: true, idleStep: "form"};
-  }
-
-  if (idleStep === "schedule") {
-    _runLog.entry("F_warmup: submitting form → schedule");
-    pageReady = waitForPageReady(90000);
-    await sendTabCmd("cmd-fill-form").catch(() => {});
-    const {state: sState} = await pageReady;
-    if (sState !== "schedule") throw new Error(`F_warmup: expected schedule, got ${sState}`);
-    F6_keepSession();
-    _runLog.finish("ok idleStep=schedule");
-    return {ok: true, idleStep: "schedule"};
-  }
-
-  throw new Error(`F_warmup: unknown idleStep "${idleStep}"`);
 }
 
 async function F_apply() {
   _runLog.start("apply");
   stopF6();
-  const {"warmup-idle-state": idleState = "login"} =
-    await chrome.storage.local.get("warmup-idle-state");
+  const {"warmup-idle-state": idleState = "login", "warmup-tab-id": tabId} =
+    await chrome.storage.local.get(["warmup-idle-state", "warmup-tab-id"]);
+  const _tabId = tabId ?? await _getActiveTab();
   _runLog.entry(`F_apply: idleState=${idleState}`);
 
   if (idleState === "login") {
     _runLog.entry("F_apply: running F4 form filling");
-    await F4_formFilling();
+    await F4_formFilling(_tabId);
     _runLog.entry("F_apply: running F5 scheduling");
-    const r = await F5_scheduling({});
+    const r = await F5_scheduling(_tabId, {});
     _runLog.finish(`ok status=${r.status ?? r.ok}`);
     return r;
   }
 
   if (idleState === "form") {
     _runLog.entry("F_apply: submitting form from idle");
-    const pageReady = waitForPageReady(30000);
-    await sendTabCmd("cmd-submit-form").catch(() => {});
+    const pageReady = waitForPageReady(_tabId, 30000);
+    await sendTabCmd(_tabId, "cmd-submit-form").catch(() => {});
     const {state: sState} = await pageReady;
     if (sState !== "schedule") throw new Error(`F_apply: expected schedule, got ${sState}`);
     _runLog.entry("F_apply: running F5 scheduling");
-    const r = await F5_scheduling({});
+    const r = await F5_scheduling(_tabId, {});
     _runLog.finish(`ok status=${r.status ?? r.ok}`);
     return r;
   }
 
   if (idleState === "schedule") {
     _runLog.entry("F_apply: running F5 scheduling from idle");
-    const r = await F5_scheduling({});
+    const r = await F5_scheduling(_tabId, {});
     _runLog.finish(`ok status=${r.status ?? r.ok}`);
     return r;
   }
@@ -837,6 +1153,7 @@ async function F_allInOne(config) {
   stopF6();
   await _resetWorkflow();
 
+  // Build person data once — shared across both phases.
   let person;
   if (config.realPerson) {
     const acct = generatePerson();
@@ -855,7 +1172,6 @@ async function F_allInOne(config) {
   } else {
     person = generatePerson();
   }
-
   const emailAcct = await createTempEmail();
   await chrome.storage.local.set({
     "register-person":  person,
@@ -864,20 +1180,45 @@ async function F_allInOne(config) {
     "email-code-token": null,
   });
 
+  // ── Phase 1: Registration (dedicated tab, warmup → register) ────────────
   _runLog.entry(`all_in_one: person=${person.name} ${person.surname} email=${emailAcct.email}`);
-  await F1_openAuthPage();
-  await sendTabCmd("cmd-log-ip").catch(() => {});
-  await F2_register(person, emailAcct);
-  _runLog.entry("all_in_one: registration done — logging in");
+  const regTabId = await _createSessionTab();
+  try {
+    await F0_warmupBrowse(regTabId);
+    await F1_openAuthPage(regTabId);
+    await sendTabCmd(regTabId, "cmd-log-ip").catch(() => {});
+    await F2_register(regTabId, person, emailAcct);
+    _runLog.entry("all_in_one: registration done");
+  } finally {
+    // Always close registration tab — its session context is spent.
+    chrome.tabs.remove(regTabId).catch(() => {});
+  }
 
-  await F1_openAuthPage();
-  await F3_login({username: person.username, password: person.password});
-  _runLog.entry("all_in_one: logged in — running F4+F5");
+  // ── Phase 2: Login + F4 + F5 (fresh tab, fresh warmup → fresh session) ──
+  // Brief gap lets the server-side account settle before login attempt.
+  _runLog.entry("all_in_one: opening fresh session for login");
+  await new Promise(r => setTimeout(r, 3000 + Math.random() * 3000));
 
-  await F4_formFilling();
-  const r = await F5_scheduling({});
-  _runLog.finish(`ok status=${r.status ?? r.ok}`);
-  return r;
+  const loginTabId = await _createSessionTab();
+  try {
+    await F0_warmupBrowse(loginTabId);
+    await F1_openAuthPage(loginTabId);
+    const _loginRes = await F3_login(loginTabId, {username: person.username, password: person.password});
+    if (!_loginRes.ok) {
+      const e = new Error(`F3: login failed — status=${_loginRes.status}`);
+      e.proxyStatus = "login_rejected";
+      e.nextAction  = "rotate_proxy";
+      throw e;
+    }
+    _runLog.entry("all_in_one: logged in — running F4+F5");
+
+    await F4_formFilling(loginTabId);
+    const r = await F5_scheduling(loginTabId, {});
+    _runLog.finish(`ok status=${r.status ?? r.ok}`);
+    return r;
+  } finally {
+    chrome.tabs.remove(loginTabId).catch(() => {});
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -909,11 +1250,13 @@ function _runCheckSolverBalances() {
 
 function _runRegister(realPerson) {
   (async () => {
+    let tabId;
     try {
       stopF6();
       await _resetWorkflow();
       const label = realPerson ? "register_real" : "register_auto";
       _runLog.start(label);
+      tabId = await _createSessionTab();
       let person;
       if (realPerson) {
         const acct = generatePerson();
@@ -941,20 +1284,16 @@ function _runRegister(realPerson) {
         "email-token":      null,
         "email-code-token": null,
       });
-      F1_openAuthPage()
-        .then(() => sendTabCmd("cmd-log-ip").catch(() => {}))
-        .then(() => F2_register(person, emailAcct))
-        .then(r => {
-          _runLog.finish(`ok status=${r.status}`);
-          self.Comm?.send({type: "register-done", ...r, email: emailAcct.email, username: person.username, password: person.password});
-        })
-        .catch(e => {
-          _runLog.finish(`error: ${e.message}`);
-          self.Comm?.send({type: "error", reason: e.message});
-        });
+      await F1_openAuthPage(tabId);
+      await sendTabCmd(tabId, "cmd-log-ip").catch(() => {});
+      const r = await F2_register(tabId, person, emailAcct);
+      _runLog.finish(`ok status=${r.status}`);
+      self.Comm?.send({type: "register-done", ...r, email: emailAcct.email, username: person.username, password: person.password});
     } catch(e) {
-      _runLog.finish(`error: ${String(e)}`);
-      self.Comm?.send({type: "error", reason: String(e)});
+      _runLog.finish(`error: ${e.message ?? String(e)}`);
+      self.Comm?.send({type: "error", reason: e.message ?? String(e)});
+    } finally {
+      if (tabId) chrome.tabs.remove(tabId).catch(() => {});
     }
   })();
 }
@@ -971,160 +1310,195 @@ chrome.runtime.onInstalled.addListener(() => {
 // WS keepalive alarm — prevents service worker suspension while WS is open.
 chrome.alarms.create("ws-ping", {periodInMinutes: 0.4});
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "ws-ping" && self.Comm?.isConnected()) {
-    self.Comm.send({type: "ping"});
+  if (alarm.name === "ws-ping") {
+    if (self.Comm?.isConnected()) {
+      self.Comm.send({type: "ping"});
+    } else {
+      // SW may have been suspended — WS dropped silently without onclose firing.
+      self.Comm?.reconnectIfNeeded();
+    }
   }
 });
 
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+// Attach the extension debugger to a tab, run fn(), then detach — always in a finally
+// so the debugger is released even when fn() throws.
+async function _withDebugger(tabId, fn) {
+  await chrome.debugger.attach({tabId}, "1.3");
+  try {
+    return await fn();
+  } finally {
+    await chrome.debugger.detach({tabId}).catch(() => {});
+  }
+}
 
-  if (msg.type === "page-ready") {
-    if (sender.tab?.id === _activeTabId) _pageReadyResolve?.({state: msg.state, url: msg.url});
-    sendResponse({ok: true});
+const _MSG_HANDLERS = {
 
-  } else if (msg.type === "WORKER_INIT") {
-    if (self.Comm?.connectHub) {
-      self.Comm.connectHub(msg.botId, msg.hubUrl);
-    }
-    sendResponse({ok: true});
+  "page-ready": (msg, sender, respond) => {
+    const _prr = _pageReadyResolvers.get(sender.tab?.id);
+    if (_prr) _prr.resolve({state: msg.state, url: msg.url});
+    respond({ok: true});
+  },
 
-  } else if (msg.type === "comm-dispatch") {
-    // Route a popup or internal caller through the same command layer as the manager.
-    if (self.Comm) {
-      self.Comm.dispatch(msg.payload).catch(e => console.error("[OctoProbe BG] comm-dispatch error:", e));
-    }
-    sendResponse({ok: true});
+  "WORKER_INIT": (msg, _sender, respond) => {
+    if (self.Comm?.connectHub) self.Comm.connectHub(msg.botId, msg.hubUrl);
+    respond({ok: true});
+  },
 
-  } else if (msg.type === "ping") {
-    sendResponse({type: "pong", version: chrome.runtime.getManifest().version});
+  "comm-dispatch": (msg, _sender, respond) => {
+    if (self.Comm) self.Comm.dispatch(msg.payload).catch(e => console.error("[OctoProbe BG] comm-dispatch error:", e));
+    respond({ok: true});
+  },
 
-  } else if (msg.type === "get-creds") {
+  "get-session-keys": (_msg, _sender, respond) => {
+    respond({sk: _SK, evtAlert: _EVT_ALERT, evtRcp: _EVT_RCP});
+  },
+
+  "ping": (_msg, _sender, respond) => {
+    respond({type: "pong", version: chrome.runtime.getManifest().version});
+  },
+
+  "get-creds": (_msg, _sender, respond) => {
     chrome.storage.local.get(["username","password"], (d) => {
-      sendResponse({username: d.username||"", password: d.password||""});
+      respond({username: d.username||"", password: d.password||""});
     });
     return true;
+  },
 
-  } else if (msg.type === "save-creds") {
+  "save-creds": (msg, _sender, respond) => {
     chrome.storage.local.set({username: msg.username, password: msg.password}, () => {
-      sendResponse({ok: true});
+      respond({ok: true});
     });
     return true;
+  },
 
-  } else if (msg.type === "log-entry") {
+  "log-entry": (msg, _sender, respond) => {
     _runLog.entry(msg.msg);
-    sendResponse({ok: true});
+    respond({ok: true});
+  },
 
-  } else if (msg.type === "run-register") {
+  "run-register": (msg, _sender, respond) => {
     _runRegister(msg.realPerson);
-    sendResponse({ok: true});
+    respond({ok: true});
+  },
 
-  } else if (msg.type === "run-F6") {
-    F6_keepSession();
-    sendResponse({ok: true});
-    return true;
+  "run-F6": (_msg, _sender, respond) => {
+    if (_activeTabId) F6_keepSession(_activeTabId);
+    respond({ok: !!_activeTabId});
+  },
 
-  } else if (msg.type === "start-email-poll") {
-    _startEmailPoll(msg.jwt);
-    sendResponse({ok: true});
+  "start-email-poll": (msg, sender, respond) => {
+    _startEmailPoll(msg.jwt, sender.tab?.id);
+    respond({ok: true});
+  },
 
-  } else if (msg.type === "stop-email-poll") {
+  "stop-email-poll": (_msg, _sender, respond) => {
     clearInterval(_pollInterval);
     _pollInterval = null;
     chrome.storage.local.remove("emailPoll");
-    sendResponse({ok: true});
+    respond({ok: true});
+  },
 
-  } else if (msg.type === "sleep") {
-    setTimeout(() => sendResponse({ok: true}), msg.ms);
+  "sleep": (msg, _sender, respond) => {
+    setTimeout(() => respond({ok: true}), msg.ms);
     return true;
+  },
 
-  } else if (msg.type === "dispatch-proxy-check") {
+  "dispatch-proxy-check": (_msg, _sender, respond) => {
     _runCheckProxy();
-    sendResponse({ok: !!_activeTabId});
+    respond({ok: !!_activeTabId});
+  },
 
-  } else if (msg.type === "dispatch-abort") {
+  "dispatch-abort": (_msg, _sender, respond) => {
     _runDispatchAbort();
-    sendResponse({ok: true});
+    respond({ok: true});
+  },
 
-  } else if (msg.type === "save-account") {
-    // Persist account to chrome.storage.local and download a CSV file.
+  "save-account": (msg, _sender, respond) => {
     const account = msg.account;
     const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const filename = `account_${ts}.csv`;
-
-    // Append to running accounts list in storage
-    chrome.storage.local.get("accounts", ({accounts}) => {
-      const list = Array.isArray(accounts) ? accounts : [];
-      list.push(account);
-      chrome.storage.local.set({accounts: list});
-    });
-
-    // Build CSV and trigger download
-    const headers = Object.keys(account);
-    const values  = headers.map(k => `"${String(account[k]).replace(/"/g, '""')}"`);
-    const csv     = headers.join(",") + "\n" + values.join(",") + "\n";
-    const dataUrl = "data:text/csv;charset=utf-8," + encodeURIComponent(csv);
-    chrome.downloads.download({url: dataUrl, filename, saveAs: false}, (id) => {
-      console.log(`[OctoProbe BG] Account saved → ${filename} (download id ${id})`);
-      sendResponse({ok: true, filename});
-    });
+    // Include sessionId prefix for traceability when multiple sessions run concurrently
+    const _sid = msg.sessionId ?? account.sessionId ?? null;
+    const filename = _sid ? `account_${_sid.slice(0, 8)}_${ts}.csv` : `account_${ts}.csv`;
+    (async () => {
+      try {
+        const {accounts} = await chrome.storage.local.get("accounts");
+        const list = Array.isArray(accounts) ? accounts : [];
+        if (!list.some(a => a.username === account.username)) {
+          list.push(account);
+          await chrome.storage.local.set({accounts: list});
+        }
+        const headers = Object.keys(account);
+        const values  = headers.map(k => `"${String(account[k]).replace(/"/g, '""')}"`);
+        const csv     = headers.join(",") + "\n" + values.join(",") + "\n";
+        const dataUrl = "data:text/csv;charset=utf-8," + encodeURIComponent(csv);
+        chrome.downloads.download({url: dataUrl, filename, saveAs: false}, (id) => {
+          console.log(`[OctoProbe BG] Account saved → ${filename} (download id ${id})`);
+        });
+        respond({ok: true, filename});
+      } catch(e) {
+        console.error("[OctoProbe BG] save-account error:", e);
+        respond({ok: false, error: String(e)});
+      }
+    })();
     return true;
+  },
 
-  } else if (msg.type === "close-tab") {
+  "close-tab": (_msg, sender, respond) => {
     const tabId = sender.tab?.id;
     if (tabId) chrome.tabs.remove(tabId);
-    sendResponse({ok: true});
+    respond({ok: true});
+  },
 
-  } else if (msg.type === "clear-workflow") {
+  "clear-workflow": (_msg, _sender, respond) => {
     chrome.storage.local.remove([
       "workflow-type","workflow-step","register-person","register-email","email-token","email-code-token","emailPoll","warmup-idle-state"
     ]);
-    sendResponse({ok: true});
+    respond({ok: true});
+  },
 
-  } else if (msg.type === "inject-alert-capture") {
-    // Inject alert override into the page's MAIN world via scripting API.
-    // This bypasses the site's CSP (inline <script> injection is blocked by CSP,
-    // but chrome.scripting.executeScript with world:"MAIN" is not).
-    //
-    // confirmToo=true adds confirm()/prompt() overrides — only safe at form-submit
-    // time, NOT during login (reCAPTCHA Enterprise checks native-function toString()).
+  "inject-alert-capture": (msg, sender, respond) => {
     const tabId = sender.tab?.id;
-    if (!tabId) { sendResponse({ok: false, error: "no sender tab"}); return true; }
+    if (!tabId) { respond({ok: false, error: "no sender tab"}); return; }
     chrome.scripting.executeScript({
       target: {tabId},
       world: "MAIN",
-      args: [!!msg.confirmToo],
-      func: (confirmToo) => {
-        if (!window._octoAlertHooked) {
-          window._octoAlertHooked = true;
-          window.alert = function(m) {
-            window._octoLastAlert = String(m);
-            document.dispatchEvent(new CustomEvent("octo-alert", {detail: {msg: String(m)}}));
-          };
-          console.log("[OctoProbe BG] window.alert suppressed via scripting API");
+      args: [!!msg.confirmToo, _SK, _EVT_ALERT],
+      func: (confirmToo, sk, evtAlert) => {
+        function _native(fn, name) {
+          fn.toString = function() { return 'function ' + name + '() { [native code] }'; };
+          try { Object.defineProperty(fn, 'name', {value: name, configurable: true}); } catch(_) {}
+          return fn;
         }
-        // confirm/prompt: only override when explicitly requested (form-submit step).
-        // Overriding these during login lets reCAPTCHA Enterprise detect tampered
-        // native APIs via toString(), which lowers the session score.
-        if (confirmToo && !window._octoConfirmHooked) {
-          window._octoConfirmHooked = true;
-          window.confirm = function(m) {
-            window._octoLastConfirm = String(m);
-            document.dispatchEvent(new CustomEvent("octo-confirm", {detail: {msg: String(m)}}));
+        const _hookedKey = '_' + sk + 'h';
+        const _alertKey  = '_' + sk + 'a';
+        const _cHookedKey = '_' + sk + 'ch';
+        const _cKey = '_' + sk + 'c';
+        if (!window[_hookedKey]) {
+          window[_hookedKey] = true;
+          window.alert = _native(function alert(m) {
+            window[_alertKey] = String(m);
+            document.dispatchEvent(new CustomEvent(evtAlert, {detail: {msg: String(m)}}));
+          }, 'alert');
+        }
+        if (confirmToo && !window[_cHookedKey]) {
+          window[_cHookedKey] = true;
+          window.confirm = _native(function confirm(m) {
+            window[_cKey] = String(m);
+            document.dispatchEvent(new CustomEvent(evtAlert, {detail: {msg: String(m)}}));
             return true;
-          };
-          window.prompt = function(_m, def) { return def ?? ""; };
-          console.log("[OctoProbe BG] window.confirm/prompt suppressed via scripting API");
+          }, 'confirm');
+          window.prompt = _native(function prompt(_m, def) { return def ?? ''; }, 'prompt');
         }
       },
     })
-    .then(() => sendResponse({ok: true}))
-    .catch(e => sendResponse({ok: false, error: String(e)}));
+    .then(() => respond({ok: true}))
+    .catch(e => respond({ok: false, error: String(e)}));
     return true;
+  },
 
-  } else if (msg.type === "reset-recaptcha") {
-    // Reset the reCAPTCHA widget before a retry attempt — clears any stale token.
+  "reset-recaptcha": (_msg, sender, respond) => {
     const tabId = sender.tab?.id;
-    if (!tabId) { sendResponse({ok: false, error: "no sender tab"}); return true; }
+    if (!tabId) { respond({ok: false, error: "no sender tab"}); return; }
     chrome.scripting.executeScript({
       target: {tabId}, world: "MAIN",
       func: () => {
@@ -1138,25 +1512,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const ta = document.querySelector(sel);
           if (ta) ta.value = "";
         }
-        console.log("[OctoProbe BG] reCAPTCHA widget reset for retry");
       },
     })
-    .then(() => sendResponse({ok: true}))
-    .catch(e => sendResponse({ok: false, error: String(e)}));
+    .then(() => respond({ok: true}))
+    .catch(e => respond({ok: false, error: String(e)}));
     return true;
+  },
 
-  } else if (msg.type === "fill-token") {
-    // Fill the token input in MAIN world — guaranteed to bypass any page-level block.
+  "fill-token": (msg, sender, respond) => {
     const tabId = sender.tab?.id;
     const {token} = msg;
-    if (!tabId) { sendResponse({ok: false, error: "no sender tab"}); return true; }
+    if (!tabId) { respond({ok: false, error: "no sender tab"}); return; }
     chrome.scripting.executeScript({
-      target: {tabId},
-      world: "MAIN",
-      args: [token],
+      target: {tabId}, world: "MAIN", args: [token],
       func: async (token) => {
         const sels = [
-          "input[name='tokenInput']",   // primary — confirmed from 2.activation.html
+          "input[name='tokenInput']",
           "input[id='tokenInput']",
           "input[id*='oken']",
           "#mainContent input[type='text']",
@@ -1168,13 +1539,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           if (found && found.offsetParent !== null) { el = found; break; }
         }
         if (!el) return {ok: false, error: "input not found"};
-
         el.focus();
         const sleep = ms => new Promise(r => setTimeout(r, ms));
         const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
-
+        function _gr() { let u,v; do{u=Math.random();}while(!u); do{v=Math.random();}while(!v); return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v); }
         for (const ch of token) {
-          const delay = 60 + Math.random() * 120 + (Math.random() < 0.07 ? 280 + Math.random() * 400 : 0);
+          const delay = Math.max(25, Math.round(Math.exp(Math.log(95) + 0.45 * _gr())));
           await sleep(delay);
           el.dispatchEvent(new KeyboardEvent("keydown",  {key: ch, bubbles: true, cancelable: true}));
           el.dispatchEvent(new KeyboardEvent("keypress", {key: ch, bubbles: true, cancelable: true}));
@@ -1183,194 +1553,93 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           el.dispatchEvent(new InputEvent("input", {data: ch, inputType: "insertText", bubbles: true}));
           el.dispatchEvent(new KeyboardEvent("keyup", {key: ch, bubbles: true}));
         }
-
         await sleep(80 + Math.random() * 100);
         el.dispatchEvent(new Event("change", {bubbles: true}));
-        console.log("[OctoProbe BG] type-token result:", el.value);
         return {ok: true, value: el.value};
       },
     })
-    .then(([r]) => sendResponse(r?.result ?? {ok: false}))
-    .catch(e => sendResponse({ok: false, error: String(e)}));
+    .then(([r]) => respond(r?.result ?? {ok: false}))
+    .catch(e => respond({ok: false, error: String(e)}));
     return true;
+  },
 
-  } else if (msg.type === "solve-recaptcha-api") {
+  "solve-recaptcha-api": (msg, _sender, respond) => {
     const {pageUrl, siteKey, action = null} = msg;
+    _doSolveRecaptcha(pageUrl, siteKey, action)
+      .then(token => respond({ok: true, token}))
+      .catch(e   => respond({ok: false, error: String(e)}));
+    return true;
+  },
+
+  // Combines solve + inject into one round-trip. Background solves, pads to minSolveMs,
+  // injects the token via executeScript (which fires the _evtRcp event in MAIN world),
+  // then responds. Content.js drifts the mouse concurrently while awaiting this response.
+  "solve-and-inject-recaptcha": (msg, sender, respond) => {
+    const tabId = sender.tab?.id;
+    if (!tabId) { respond({ok: false, error: "no sender tab"}); return; }
+    const {pageUrl, siteKey, action = null, minSolveMs = 12000} = msg;
     (async () => {
       try {
-        const {
-          "captcha-solver":   solver   = "capsolver",
-          "captcha-parallel": parallel = false,
-        } = await chrome.storage.local.get(["captcha-solver","captcha-parallel"]);
-
-        let token;
-        if (parallel) {
-          token = await _raceSolvers(pageUrl, siteKey, action);
-        } else {
-          const primary = (solver in _SOLVER_URLS) ? solver : "capsolver";
-          // Pick key once — same key used for balance check and solve call.
-          const pickedKey = primary === "anti-captcha" ? _pick(_ANTICAPTCHA_KEYS)
-            : primary === "2captcha"   ? _pick(_TWOCAPTCHA_KEYS)
-            : primary === "capmonster" ? _pick(_CAPMONSTER_KEYS)
-            : _CAPSOLVER_KEY;
-
-          // Check primary solver balance; skip to fallbacks only on confirmed zero.
-          // null means the balance API was unreachable — proceed with primary anyway.
-          const bal = await _fetchBalance(_SOLVER_URLS[primary], pickedKey);
-          if (bal !== null) self.Comm?.send({type: "solver-balance", solver: primary, balance: bal, ts: new Date().toISOString()});
-          if (bal !== null && bal < 0.01) console.warn(`[OctoProbe BG] ${primary} balance $${bal.toFixed(4)} — skipping to fallbacks`);
-
-          let usePrimary = bal === null || bal >= 0.01;
-          if (usePrimary) {
-            try {
-              token = primary === "capsolver"
-                ? await _solveCapSolver(pageUrl, siteKey, action)
-                : await _solveACFormat(_SOLVER_URLS[primary], pickedKey, pageUrl, siteKey, action);
-            } catch (primaryErr) {
-              console.warn(`[OctoProbe BG] Primary solver "${primary}" failed: ${primaryErr.message} — trying fallback`);
-              usePrimary = false;
-            }
-          }
-
-          if (!usePrimary) {
-            // Race all remaining solvers as fallback.
-            const fallbackEntries = Object.entries(_SOLVER_URLS).filter(([k]) => k !== primary);
-            token = await new Promise((resolve, reject) => {
-              let remaining = fallbackEntries.length;
-              let settled = false;
-              for (const [k] of fallbackEntries) {
-                const fn = k === "capsolver"
-                  ? () => _solveCapSolver(pageUrl, siteKey, action)
-                  : () => _solveACFormat(_SOLVER_URLS[k],
-                      k === "anti-captcha" ? _pick(_ANTICAPTCHA_KEYS)
-                        : k === "2captcha" ? _pick(_TWOCAPTCHA_KEYS)
-                        : _pick(_CAPMONSTER_KEYS),
-                      pageUrl, siteKey, action);
-                fn().then(t => {
-                  if (!settled && t) { settled = true; resolve(t); }
-                }).catch(() => {
-                  if (--remaining === 0 && !settled) reject(new Error("All solvers failed"));
-                });
-              }
-            });
-          }
-        }
-        sendResponse({ok: true, token});
+        const solveStart = Date.now();
+        const token = await _doSolveRecaptcha(pageUrl, siteKey, action);
+        const elapsed = Date.now() - solveStart;
+        if (elapsed < minSolveMs) await new Promise(r => setTimeout(r, minSolveMs - elapsed));
+        const totalMs = Date.now() - solveStart;
+        console.log(`[OctoProbe BG] Token obtained after ${totalMs}ms — injecting`);
+        await chrome.scripting.executeScript({
+          target: {tabId}, world: "MAIN", args: [token, _EVT_RCP],
+          func: _recaptchaInjectFunc,
+        });
+        respond({ok: true, totalMs});
       } catch(e) {
-        sendResponse({ok: false, error: String(e)});
+        respond({ok: false, error: String(e)});
       }
     })();
     return true;
+  },
 
-  } else if (msg.type === "inject-recaptcha-token") {
+  "inject-recaptcha-token": (msg, sender, respond) => {
     const tabId = sender.tab?.id;
     const {token} = msg;
-    if (!tabId) { sendResponse({ok: false, error: "no sender tab"}); return true; }
+    if (!tabId) { respond({ok: false, error: "no sender tab"}); return; }
     chrome.scripting.executeScript({
-      target: {tabId}, world: "MAIN", args: [token],
-      func: (token) => {
-        // 1. Write the solved token into both reCAPTCHA hidden textareas
-        for (const sel of ["#g-recaptcha-response-1","#g-recaptcha-response"]) {
-          const ta = document.querySelector(sel);
-          if (!ta) continue;
-          const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,"value")?.set;
-          if (setter) setter.call(ta, token); else ta.value = token;
-          ta.dispatchEvent(new Event("input",  {bubbles:true}));
-          ta.dispatchEvent(new Event("change", {bubbles:true}));
-        }
-        // 2. Patch grecaptcha getResponse() AND execute() to return our token.
-        //    getResponse() covers sites that read the response after widget callback fires.
-        //    execute() covers sites whose doLogin() calls execute() for a fresh token —
-        //    we return the pre-solved token immediately so no new challenge fires.
-        try {
-          const _tok = token;
-          if (window.grecaptcha?.enterprise?.getResponse) {
-            window.grecaptcha.enterprise.getResponse = function() { return _tok; };
-          }
-          if (window.grecaptcha?.getResponse) {
-            window.grecaptcha.getResponse = function() { return _tok; };
-          }
-          if (window.grecaptcha?.enterprise?.execute) {
-            window.grecaptcha.enterprise.execute = function() { return Promise.resolve(_tok); };
-          }
-          if (window.grecaptcha?.execute) {
-            window.grecaptcha.execute = function() { return Promise.resolve(_tok); };
-          }
-          console.log("[OctoProbe] grecaptcha getResponse + execute patched to return injected token");
-        } catch(_) {}
-        // 3. Walk ___grecaptcha_cfg.clients and call the widget success callback.
-        //    This sets the widget's internal "solved" state and may enable the submit
-        //    button — required for sites where doLogin() checks widget state before
-        //    reading the token rather than calling getResponse() directly.
-        try {
-          const _tok = token;
-          const seen = new WeakSet();
-          function _findAndCallCb(obj, depth) {
-            if (!obj || depth > 8 || typeof obj !== "object" || seen.has(obj)) return false;
-            seen.add(obj);
-            if (typeof obj.callback === "function") {
-              try { obj.callback(_tok); } catch(_) {}
-              console.log("[OctoProbe] findCb: fired widget success callback");
-              return true;
-            }
-            for (const v of Object.values(obj)) {
-              if (_findAndCallCb(v, depth + 1)) return true;
-            }
-            return false;
-          }
-          for (const client of Object.values(window.___grecaptcha_cfg?.clients ?? {})) {
-            if (_findAndCallCb(client, 0)) break;
-          }
-        } catch(_) {}
-        // 4. Notify content script (CustomEvent crosses MAIN→isolated boundary via DOM)
-        document.dispatchEvent(new CustomEvent("octo-recaptcha-pass", {detail:{token}}));
-      },
+      target: {tabId}, world: "MAIN", args: [token, _EVT_RCP],
+      func: _recaptchaInjectFunc,
     })
-    .then(() => sendResponse({ok: true}))
-    .catch(e => sendResponse({ok: false, error: String(e)}));
+    .then(() => respond({ok: true}))
+    .catch(e => respond({ok: false, error: String(e)}));
     return true;
+  },
 
-  } else if (msg.type === "cdp-click") {
-    // Dispatch a trusted mouse click via CDP Input.dispatchMouseEvent.
-    // isTrusted=true inside cross-origin iframes (e.g. reCAPTCHA anchor frame).
+  "cdp-click": (msg, sender, respond) => {
     const tabId = sender.tab?.id;
-    if (!tabId) { sendResponse({ok: false, error: "no sender tab"}); return true; }
-    (async () => {
-      try {
-        await chrome.debugger.attach({tabId}, "1.3");
-        const {x, y} = msg;
-        const base = {x, y, modifiers: 0};
-        await chrome.debugger.sendCommand({tabId}, "Input.dispatchMouseEvent",
-          {...base, type: "mouseMoved", button: "none", clickCount: 0, buttons: 0});
-        await new Promise(r => setTimeout(r, 40 + Math.random() * 60));
-        await chrome.debugger.sendCommand({tabId}, "Input.dispatchMouseEvent",
-          {...base, type: "mousePressed", button: "left", clickCount: 1, buttons: 1});
-        await new Promise(r => setTimeout(r, 80 + Math.random() * 100));
-        await chrome.debugger.sendCommand({tabId}, "Input.dispatchMouseEvent",
-          {...base, type: "mouseReleased", button: "left", clickCount: 1, buttons: 0});
-        await chrome.debugger.detach({tabId});
-        sendResponse({ok: true});
-      } catch(e) {
-        console.warn("[OctoProbe BG] CDP click failed:", e.message);
-        try { await chrome.debugger.detach({tabId}); } catch(_) {}
-        sendResponse({ok: false, error: String(e)});
-      }
-    })();
+    if (!tabId) { respond({ok: false, error: "no sender tab"}); return; }
+    _withDebugger(tabId, async () => {
+      const {x, y} = msg;
+      const base = {x, y, modifiers: 0};
+      await chrome.debugger.sendCommand({tabId}, "Input.dispatchMouseEvent",
+        {...base, type: "mouseMoved", button: "none", clickCount: 0, buttons: 0});
+      await new Promise(r => setTimeout(r, 40 + Math.random() * 60));
+      await chrome.debugger.sendCommand({tabId}, "Input.dispatchMouseEvent",
+        {...base, type: "mousePressed", button: "left", clickCount: 1, buttons: 1});
+      await new Promise(r => setTimeout(r, 80 + Math.random() * 100));
+      await chrome.debugger.sendCommand({tabId}, "Input.dispatchMouseEvent",
+        {...base, type: "mouseReleased", button: "left", clickCount: 1, buttons: 0});
+    }).then(() => respond({ok: true}))
+      .catch(e => { console.warn("[OctoProbe BG] CDP click failed:", e.message); respond({ok: false, error: String(e)}); });
     return true;
+  },
 
-  } else if (msg.type === "get-recaptcha-sitekey") {
+  "get-recaptcha-sitekey": (_msg, sender, respond) => {
     const tabId = sender.tab?.id;
-    if (!tabId) { sendResponse({ok: false, siteKey: null}); return true; }
+    if (!tabId) { respond({ok: false, siteKey: null}); return; }
     chrome.scripting.executeScript({
       target: {tabId}, world: "MAIN",
       func: () => {
-        // 1. data-sitekey attribute
         const el = document.querySelector("[data-sitekey]");
         if (el?.dataset?.sitekey) return el.dataset.sitekey;
-        // 2. reCAPTCHA iframe src (?k= param)
         const fr = document.querySelector("iframe[src*='recaptcha']");
         if (fr) { const m = fr.src.match(/[?&]k=([A-Za-z0-9_-]+)/); if (m) return m[1]; }
-        // 3. Walk ___grecaptcha_cfg for a sitekey-shaped string
         try {
           const seen = new WeakSet();
           function findKey(obj, depth) {
@@ -1391,80 +1660,38 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return null;
       },
     })
-    .then(([r]) => sendResponse({ok: true, siteKey: r?.result ?? null}))
-    .catch(() => sendResponse({ok: false, siteKey: null}));
+    .then(([r]) => respond({ok: true, siteKey: r?.result ?? null}))
+    .catch(() => respond({ok: false, siteKey: null}));
     return true;
+  },
 
-  } else if (msg.type === "exec-page-script") {
-    // Execute arbitrary code in the MAIN world of the sender's tab.
+  "exec-page-script": (msg, sender, respond) => {
     const tabId = sender.tab?.id;
-    if (!tabId) { sendResponse({ok: false, error: "no sender tab"}); return true; }
+    if (!tabId) { respond({ok: false, error: "no sender tab"}); return; }
     const code = msg.code ?? "";
     chrome.scripting.executeScript({
-      target: {tabId},
-      world: "MAIN",
-      args: [code],
+      target: {tabId}, world: "MAIN", args: [code],
       func: (c) => { try { return (new Function(c))(); } catch(e) { return {error: String(e)}; } },
     })
-    .then(([r]) => sendResponse({ok: true, result: r?.result ?? null}))
-    .catch(e => sendResponse({ok: false, error: String(e)}));
+    .then(([r]) => respond({ok: true, result: r?.result ?? null}))
+    .catch(e => respond({ok: false, error: String(e)}));
     return true;
+  },
 
-  } else if (msg.type === "ws-send") {
-    // Relay a message from content.js to the manager via WebSocket.
+  "ws-send": (msg, _sender, respond) => {
     if (self.Comm) self.Comm.send(msg.data);
-    sendResponse({ok: true});
+    respond({ok: true});
+  },
 
-  } else if (msg.type === "check-solver-balances") {
+  "check-solver-balances": (_msg, _sender, respond) => {
     _runCheckSolverBalances();
-    sendResponse({ok: true});
+    respond({ok: true});
+  },
 
-  } else if (msg.type === "inject-recaptcha-watcher") {
-    // Inject reCAPTCHA solve watcher into MAIN world via scripting API (bypasses CSP).
-    // Resets any previous watcher and starts a fresh polling loop.
-    const tabId = sender.tab?.id;
-    if (!tabId) { sendResponse({ok: false, error: "no sender tab"}); return true; }
-    chrome.scripting.executeScript({
-      target: {tabId},
-      world: "MAIN",
-      func: () => {
-        // Reset watcher state so a new solve is required
-        window._octoRcpToken   = null;
-        window._octoRcpWatcher = true;
+};
 
-        // Reset the reCAPTCHA widget to clear the previous (possibly expired) response.
-        // Without this, getResponse() returns the old token and check() fires instantly.
-        try {
-          if (typeof grecaptcha !== "undefined") {
-            if (typeof grecaptcha.enterprise?.reset === "function") grecaptcha.enterprise.reset();
-            else if (typeof grecaptcha.reset === "function") grecaptcha.reset();
-          }
-        } catch (_) {}
-        // Also clear the hidden textarea directly — fallback for when reset() silently fails.
-        const _ta = document.querySelector("#g-recaptcha-response-1,#g-recaptcha-response");
-        if (_ta) _ta.value = "";
-
-        function check() {
-          if (!window._octoRcpWatcher) return;
-          try {
-            const r = typeof grecaptcha !== "undefined" &&
-              (grecaptcha.enterprise?.getResponse?.() || grecaptcha.getResponse?.());
-            if (r && r.length > 0) {
-              window._octoRcpToken = r;
-              document.dispatchEvent(new CustomEvent("octo-recaptcha-pass", {detail: {token: r}}));
-              return;
-            }
-          } catch (_) {}
-          setTimeout(check, 800);
-        }
-        check();
-        console.log("[OctoProbe BG] reCAPTCHA watcher injected (widget reset)");
-      },
-    })
-    .then(() => sendResponse({ok: true}))
-    .catch(e => sendResponse({ok: false, error: String(e)}));
-    return true;
-  }
-
-  return true;
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  const h = _MSG_HANDLERS[msg.type];
+  if (h) return h(msg, sender, sendResponse) ?? false;
+  return false;
 });

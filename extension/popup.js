@@ -6,8 +6,6 @@ const regBtn       = document.getElementById("btn-register");
 const statusEl     = document.getElementById("status");
 const swEl         = document.getElementById("sw-status");
 const selSolver    = document.getElementById("sel-solver");
-const chkParallel  = document.getElementById("chk-parallel");
-const chkGoodProxy = document.getElementById("chk-good-proxy");
 
 // Email provider elements
 const btnEmailMailtm = document.getElementById("btn-email-mailtm");
@@ -33,7 +31,7 @@ function setStatus(msg, isError = false) {
 
 // Load saved credentials, captcha settings, real person data, and workflow state on open.
 chrome.storage.local.get(
-  ["username","password","captcha-solver","captcha-parallel","good-proxy",
+  ["username","password","captcha-solver",
    "workflow-type","workflow-step","real-person-input",
    "visa-consular-post",
    "email-provider"],
@@ -56,9 +54,7 @@ chrome.storage.local.get(
       setStatus("Credentials loaded.");
     }
 
-    selSolver.value      = data["captcha-solver"]   ?? "capsolver";
-    chkParallel.checked  = data["captcha-parallel"] ?? false;
-    chkGoodProxy.checked = data["good-proxy"]       ?? false;
+    selSolver.value = data["captcha-solver"] ?? "capsolver";
 
     setEmailProvider(data["email-provider"] ?? "mailtm");
 
@@ -94,13 +90,6 @@ selSolver.addEventListener("change", () => {
   chrome.storage.local.set({"captcha-solver": selSolver.value});
 });
 
-chkParallel.addEventListener("change", () => {
-  chrome.storage.local.set({"captcha-parallel": chkParallel.checked});
-});
-
-chkGoodProxy.addEventListener("change", () => {
-  chrome.storage.local.set({"good-proxy": chkGoodProxy.checked});
-});
 
 function setEmailProvider(provider) {
   const isCf = provider === "cloudflare";

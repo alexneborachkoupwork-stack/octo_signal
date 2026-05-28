@@ -63,23 +63,54 @@
     _gl = null; _c = null;
   } catch (_) {}
 
+  function _native(fn, name) {
+    fn.toString = function() { return 'function ' + name + '() { [native code] }'; };
+    try { Object.defineProperty(fn, 'name', {value: name, configurable: true}); } catch(_) {}
+    return fn;
+  }
+
   function _patchCtx(Ctx) {
     if (!Ctx) return;
     var _gExt  = Ctx.prototype.getExtension;
     var _gParm = Ctx.prototype.getParameter;
-    Ctx.prototype.getExtension = function getExtension(name) {
+    Ctx.prototype.getExtension = _native(function getExtension(name) {
       if (name === 'WEBGL_debug_renderer_info')
         return _gExt.call(this, name) || {UNMASKED_VENDOR_WEBGL: _VENDOR, UNMASKED_RENDERER_WEBGL: _RENDERER};
       return _gExt.call(this, name);
-    };
-    Ctx.prototype.getParameter = function getParameter(pname) {
+    }, 'getExtension');
+    Ctx.prototype.getParameter = _native(function getParameter(pname) {
       if (pname === _VENDOR)   return _vendor;
       if (pname === _RENDERER) return _renderer;
       return _gParm.call(this, pname);
-    };
+    }, 'getParameter');
   }
 
   try { _patchCtx(window.WebGLRenderingContext);  } catch (_) {}
   try { _patchCtx(window.WebGL2RenderingContext); } catch (_) {}
+})();
+
+// ── Page Visibility API ───────────────────────────────────────────────────────
+// reCAPTCHA Enterprise monitors document.visibilityState and document.hidden as
+// behavioral signals. Background tabs, minimised windows, or OS-level window
+// occlusion return "hidden"/true — indistinguishable from a bot running off-screen.
+// Patching Document.prototype (not the document instance) keeps
+// Object.getOwnPropertyDescriptor(document, 'visibilityState') === undefined,
+// matching a real unpatched browser.
+(function () {
+  function _native(fn, name) {
+    fn.toString = function () { return 'function get ' + name + '() { [native code] }'; };
+    try { Object.defineProperty(fn, 'name', {value: name, configurable: true}); } catch (_) {}
+    return fn;
+  }
+  try {
+    Object.defineProperty(Document.prototype, 'visibilityState', {
+      get: _native(function visibilityState() { return 'visible'; }, 'visibilityState'),
+      configurable: true,
+    });
+    Object.defineProperty(Document.prototype, 'hidden', {
+      get: _native(function hidden() { return false; }, 'hidden'),
+      configurable: true,
+    });
+  } catch (_) {}
 })();
 

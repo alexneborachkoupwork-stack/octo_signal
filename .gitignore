@@ -12,3 +12,4 @@ detail_analysis.py
 check_*.py
 .claude/
 extension/config.json
+/manager/node_modules
