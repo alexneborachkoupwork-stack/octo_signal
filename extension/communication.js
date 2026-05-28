@@ -154,7 +154,17 @@ self.Comm = (() => {
     }
 
     if (type === "apply") {
-      F_apply()
+      const su = {};
+      if (normalized.arrivalDate != null) su["visa-arrival-date"] = normalized.arrivalDate;
+      if (normalized.departureDate != null) su["visa-departure-date"] = normalized.departureDate;
+      if (normalized.consulPost != null) su["visa-consular-post"] = normalized.consulPost;
+      if (Object.keys(su).length) await chrome.storage.local.set(su);
+      F_apply({
+        applyParams: normalized.applyParams,
+        executeAt: normalized.executeAt,
+        consulPost: normalized.consulPost,
+        arrivalDate: normalized.arrivalDate,
+      })
         .then((r) => send({ type: "apply-done", ...r }))
         .catch(_onCommandError);
       return;
@@ -189,42 +199,60 @@ self.Comm = (() => {
 
   function connect(url) {
     if (!url) return;
-    _url = url;
     _stopReconnect = false;
 
-    if (_ws) {
-      try { _ws.close(); } catch (_) {}
+    if (_ws && _ws.readyState === WebSocket.OPEN && _url === url) {
+      return;
     }
 
+    _url = url;
+
+    if (_reconnectTimer) {
+      clearTimeout(_reconnectTimer);
+      _reconnectTimer = null;
+    }
+
+    const prev = _ws;
+    if (prev) {
+      prev.onopen = null;
+      prev.onmessage = null;
+      prev.onerror = null;
+      prev.onclose = null;
+      try { prev.close(); } catch (_) {}
+      _ws = null;
+    }
+
+    let socket;
     try {
-      _ws = new WebSocket(url);
+      socket = new WebSocket(url);
     } catch (e) {
       console.warn("[OctoComm] WebSocket construction failed:", e);
       _scheduleReconnect();
       return;
     }
+    _ws = socket;
 
-    _ws.onopen = () => {
+    socket.onopen = () => {
+      if (_ws !== socket) return;
       console.log("[OctoComm] Connected to manager:", url);
-      if (_reconnectTimer) {
-        clearTimeout(_reconnectTimer);
-        _reconnectTimer = null;
-      }
       const version = chrome.runtime.getManifest().version;
       send({ type: "hello", version });
     };
 
-    _ws.onmessage = (ev) => {
+    socket.onmessage = (ev) => {
+      if (_ws !== socket) return;
       let msg;
       try { msg = JSON.parse(ev.data); } catch (_) { return; }
       _handleCommand(msg).catch((e) => console.error("[OctoComm] Command error:", e));
     };
 
-    _ws.onerror = (e) => {
+    socket.onerror = (e) => {
+      if (_ws !== socket) return;
       console.warn("[OctoComm] WebSocket error:", e);
     };
 
-    _ws.onclose = () => {
+    socket.onclose = () => {
+      if (_ws !== socket) return;
       console.log("[OctoComm] Disconnected from manager");
       _ws = null;
       if (!_stopReconnect) _scheduleReconnect();
@@ -254,7 +282,12 @@ self.Comm = (() => {
 
   function _scheduleReconnect() {
     if (_stopReconnect || !_url) return;
-    _reconnectTimer = setTimeout(() => connect(_url), 5000);
+    if (_ws && _ws.readyState === WebSocket.OPEN) return;
+    if (_reconnectTimer) return;
+    _reconnectTimer = setTimeout(() => {
+      _reconnectTimer = null;
+      connect(_url);
+    }, 5000);
   }
 
   function isConnected() {
