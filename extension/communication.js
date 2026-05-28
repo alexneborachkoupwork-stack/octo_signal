@@ -9,6 +9,7 @@ self.Comm = (() => {
   let _stopReconnect = false;
   let _reconnectDelay = 6000;
   let _botId = null; // set by connectHub(), included in every outbound message
+  let _generation = 0; // incremented on every connect() call; stale onclose handlers compare against this
 
   function send(data) {
     if (_ws && _ws.readyState === WebSocket.OPEN) {
@@ -20,8 +21,8 @@ self.Comm = (() => {
     }
   }
 
-  function _onCommandError(e) {
-    self._runLog?.finish(`error: ${e.message}`);
+  async function _onCommandError(e) {
+    await self._runLog?.finish(`error: ${e.message}`);
     send({
       type:        "error",
       reason:      e.message,
@@ -72,11 +73,6 @@ self.Comm = (() => {
       return { type, ...payload };
     }
     return msg;
-  }
-
-  function _realPersonForWorkflow(person) {
-    if (!person) return null;
-    return { ...person, surnameAtBirth: "+", placeOfBirth: "+" };
   }
 
   async function _handleCommand(msg) {
@@ -131,7 +127,7 @@ self.Comm = (() => {
       if (normalized.cfWorkerUrl != null) su["cf-worker-url"] = normalized.cfWorkerUrl;
       if (normalized.cfWorkerSecret != null) su["cf-worker-secret"] = normalized.cfWorkerSecret;
       if (Object.keys(su).length) await chrome.storage.local.set(su);
-      _runRegister(_realPersonForWorkflow(normalized.realPerson));
+      _runRegister(normalized.realPerson);
       return;
     }
 
@@ -144,7 +140,7 @@ self.Comm = (() => {
       if (normalized.departureDate != null) su["visa-departure-date"] = normalized.departureDate;
       if (normalized.consulPost != null) su["visa-consular-post"] = normalized.consulPost;
       if (normalized.realPerson != null) {
-        su["real-person-input"] = _realPersonForWorkflow(normalized.realPerson);
+        su["real-person-input"] = normalized.realPerson;
       }
       if (Object.keys(su).length) await chrome.storage.local.set(su);
       const _creds = await chrome.storage.local.get(["username", "password"]);
@@ -153,7 +149,7 @@ self.Comm = (() => {
         password: _creds.password ?? "",
         idleStep: normalized.idleStep ?? "login",
       })
-        .then((r) => send({ type: "warmup-ready", ...r }))
+        .then((r) => send({ type: "warmup-done", ...r }))
         .catch(_onCommandError);
       return;
     }
@@ -176,15 +172,19 @@ self.Comm = (() => {
       if (normalized.departureDate != null) su["visa-departure-date"] = normalized.departureDate;
       if (normalized.consulPost != null) su["visa-consular-post"] = normalized.consulPost;
       if (normalized.realPerson != null) {
-        su["real-person-input"] = _realPersonForWorkflow(normalized.realPerson);
+        su["real-person-input"] = normalized.realPerson;
       }
       if (Object.keys(su).length) await chrome.storage.local.set(su);
       F_allInOne({
-        realPerson: _realPersonForWorkflow(normalized.realPerson),
+        realPerson: normalized.realPerson,
         arrivalDate: normalized.arrivalDate,
         consulPost: normalized.consulPost,
       })
-        .then((r) => send({ type: "all-in-one-done", ...r, proxyStatus: "ok" }))
+        .then((r) => {
+          // Only assert proxyStatus:"ok" on genuine success — don't misreport when F5 fails.
+          const extra = r.ok !== false ? { proxyStatus: "ok" } : {};
+          send({ type: "all-in-one-done", ...r, ...extra });
+        })
         .catch(_onCommandError);
       return;
     }
@@ -194,6 +194,9 @@ self.Comm = (() => {
     if (!url) return;
     _url = url;
     _stopReconnect = false;
+    // Bump generation so any pending onclose from the old socket knows it's stale
+    // and does not schedule a spurious reconnect.
+    const myGen = ++_generation;
 
     if (_ws) {
       try { _ws.close(); } catch (_) {}
@@ -208,12 +211,14 @@ self.Comm = (() => {
     }
 
     _ws.onopen = () => {
+      if (_generation !== myGen) return;
       _reconnectDelay = 6000;
       if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
       send({ type: "hello", version: chrome.runtime.getManifest().version });
     };
 
     _ws.onmessage = (ev) => {
+      if (_generation !== myGen) return;
       let msg;
       try { msg = JSON.parse(ev.data); } catch (_) { return; }
       _handleCommand(msg).catch((e) => console.error("[OctoComm] Command error:", e));
@@ -222,6 +227,8 @@ self.Comm = (() => {
     _ws.onerror = () => {};
 
     _ws.onclose = () => {
+      // Stale close — a newer connect() already replaced this socket; don't reconnect.
+      if (_generation !== myGen) return;
       _ws = null;
       if (!_stopReconnect) _scheduleReconnect();
     };
@@ -230,10 +237,17 @@ self.Comm = (() => {
   /** Hub worker-init: ws://host/ext?botId=… */
   function connectHub(botId, hubWsBase) {
     if (!botId || !hubWsBase) return;
-    _botId = botId; // used as sessionId in all outbound messages
     const base = String(hubWsBase).replace(/\?.*$/, "").replace(/\/$/, "");
     const url = `${base}?botId=${encodeURIComponent(botId)}`;
     chrome.storage.local.set({ botId, hubUrl: base, hubWsUrl: base });
+    // Idempotent: if a healthy socket to the same endpoint already exists, don't replace it.
+    // Both the IIFE auto-reconnect and WORKER_INIT call connectHub — whichever arrives second
+    // must not tear down the connection where the command was already sent.
+    if (_url === url && _ws && (_ws.readyState === WebSocket.OPEN || _ws.readyState === WebSocket.CONNECTING)) {
+      _botId = botId;
+      return;
+    }
+    _botId = botId;
     connect(url);
   }
 
@@ -268,13 +282,16 @@ self.Comm = (() => {
     }
   }
 
-  return { connect, connectHub, disconnect, send, isConnected, reconnectIfNeeded, dispatch: _handleCommand };
+  return { connect, connectHub, disconnect, send, isConnected, reconnectIfNeeded, dispatch: _handleCommand, getBotId: () => _botId };
 })();
 
 // Prefer hub session from worker-init; fall back to config.json for standalone popup testing.
+// getBotId() check: if WORKER_INIT already fired during this SW lifetime and called connectHub(),
+// _botId is set — skip auto-connect to avoid replacing the WS where the command was sent.
 (async () => {
   try {
     const stored = await chrome.storage.local.get(["botId", "hubWsUrl", "hubUrl"]);
+    if (self.Comm.getBotId()) return; // WORKER_INIT beat us to it — don't double-connect
     const botId = stored.botId;
     const hubBase = stored.hubWsUrl || stored.hubUrl;
     if (botId && hubBase) {

@@ -61,19 +61,24 @@ const _runLog = (() => {
     if (_label) _push(msg);
   }
 
-  function finish(status) {
+  async function finish(status) {
     if (!_label) return;
     _push(`=== finished: ${status} ===`);
-    const ts  = _ts().replace(/[:.]/g, "-").slice(0, 19);
-    // Include sessionId (botId) in log filename for traceability across layers
-    chrome.storage.local.get("botId").then(d => {
-      const sid = d.botId ? `_${d.botId.slice(0, 8)}` : "";
-      const filename = `${_label}${sid}_${ts}.log`;
-      const url = "data:text/plain;charset=utf-8," + encodeURIComponent(_lines.join("\n") + "\n");
-      chrome.downloads.download({ url, filename, saveAs: false }).catch(() => {});
-    }).catch(() => {});
+    const ts = _ts().replace(/[:.]/g, "-").slice(0, 19);
+    // Capture label + content as locals BEFORE clearing state.
+    // storage.get is async — without this, _label and _lines are already cleared
+    // by the time the .then() fires, so the downloaded file gets null/empty content.
+    const label   = _label;
+    const content = _lines.join("\n") + "\n";
     _lines = [];
     _label = null;
+    try {
+      const d   = await chrome.storage.local.get("botId");
+      const sid = d.botId ? `_${d.botId.slice(0, 8)}` : "";
+      const filename = `${label}${sid}_${ts}.log`;
+      const url = "data:text/plain;charset=utf-8," + encodeURIComponent(content);
+      await chrome.downloads.download({ url, filename, saveAs: false });
+    } catch (_) {}
   }
 
   return { start, entry, finish };
@@ -98,91 +103,7 @@ self._runLog = _runLog; // expose to communication.js (same SW scope, but const 
   }
 })();
 
-// ---------------------------------------------------------------------------
-// Fake person generator (JS port of data/person.py)
-// ---------------------------------------------------------------------------
-
-// CPV (Cape Verde) given names — authentic to Cape Verdean culture.
-const _FIRST_M = ["João","Carlos","Hélder","António","Manuel","Sérgio","Leandro","Dário","Orlando",
-                   "Arlindo","Paulo","Filipe","Osvaldo","Wilfredo","Adílson","Valdemar","Hailton",
-                   "Pedro","Rui","Nuno","Décio","Sandro","Edílson","Lúcio","Gilberto"];
-const _FIRST_F = ["Maria","Ana","Edna","Rosa","Lúcia","Eunice","Arminda","Sandra","Graça","Noemia",
-                   "Filomena","Carla","Nair","Isadora","Vera","Conceição","Milena","Suzete","Lisete",
-                   "Ercília","Anilsa","Dulce","Odete","Yara","Valdira"];
-
-// CPV surnames — most common Cape Verdean family names.
-// Double-surname form (maternal + paternal) is used ~50 % of the time.
-const _LAST  = ["Semedo","Tavares","Correia","Lima","Varela","Monteiro","Évora","Fernandes",
-                 "Rodrigues","Furtado","Mendes","Barros","Cruz","Veiga","Delgado","Pires",
-                 "Andrade","Soares","Cardoso","Lopes","Brito","Gonçalves","Neves","Spencer",
-                 "Borges","Moreno","Duarte","Fontes","Mascarenhas","Santos"];
-
-// Linking particles used in compound given names: "Maria da Graça", "João de Deus".
-const _PARTICLES = ["da","de","do","dos","das"];
-
-// Generate a compound CPV given name matching the gender.
-// Distribution: ~40 % single · ~35 % two-part · ~25 % particle compound.
-function _genGivenName(gender) {
-  const pool = gender === "M" ? _FIRST_M : _FIRST_F;
-  const a = _pick(pool);
-  const r = _rand(10);
-  if (r < 4) {
-    // Two-part: "João Carlos", "Ana Paula"
-    let b = _pick(pool);
-    if (b === a) b = _pick(pool);
-    return a + " " + b;
-  }
-  if (r < 7) {
-    // Particle compound: "Maria da Graça", "António de Jesus"
-    const p = _pick(_PARTICLES);
-    let b = _pick(pool);
-    if (b === a) b = _pick(pool);
-    return a + " " + p + " " + b;
-  }
-  return a;
-}
-
-// Generate a CPV surname: single or double (maternal + paternal).
-function _genSurname() {
-  const a = _pick(_LAST);
-  if (_rand(2)) {
-    let b = _pick(_LAST);
-    if (b === a) b = _pick(_LAST);
-    return a + " " + b;
-  }
-  return a;
-}
-const _NAT   = ["CPV"];
-
 function _pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
-
-function _rand(n) { return Math.floor(Math.random() * n); }
-
-function _genPassword() {
-  const specials = "!@#$%&*_+";
-  const digits   = "0123456789";
-  const uppers   = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-  const lowers   = "abcdefghijklmnopqrstuvwxyz";
-  const all      = specials + digits + uppers + lowers;
-  let chars = [
-    specials[_rand(specials.length)],
-    digits[_rand(digits.length)],
-    uppers[_rand(uppers.length)],
-  ];
-  for (let i = 0; i < 13; i++) chars.push(all[_rand(all.length)]);
-  for (let i = chars.length - 1; i > 0; i--) {
-    const j = _rand(i + 1);
-    [chars[i], chars[j]] = [chars[j], chars[i]];
-  }
-  return chars.join("");
-}
-
-function _genBirthdate() {
-  const year  = 1964 + _rand(41);   // age 20-60 from 2024
-  const month = 1  + _rand(12);
-  const day   = 1  + _rand(28);
-  return `${year}/${String(month).padStart(2,"0")}/${String(day).padStart(2,"0")}`;
-}
 
 // Parse passport DOB strings into YYYY/MM/DD.
 // Handles: DD-MM-YYYY, DD/MM/YYYY, DD - MM - YYYY,
@@ -225,26 +146,6 @@ function _parseDOB(raw) {
   return s;
 }
 
-function generatePerson() {
-  const gender  = _rand(2) ? "M" : "F";
-  const first   = _genGivenName(gender);
-  const last    = _genSurname();
-  // Username uses only the bare root of each (first word, no particles).
-  const _strip = s => s.split(" ").find(w => !_PARTICLES.includes(w.toLowerCase())) ?? s.split(" ")[0];
-  const uname = (_strip(first).slice(0,3) + _strip(last).slice(0,3) + (1000000 + _rand(99000000))).toLowerCase()
-                .normalize("NFD").replace(/[̀-ͯ]/g,"");
-  const traveldoc = "PA" + Array.from({length:6}, () => _rand(10)).join("");
-  return {
-    name:        first,
-    surname:     last,
-    username:    uname,
-    password:    _genPassword(),
-    birth_date:  _genBirthdate(),
-    gender,
-    nationality: _pick(_NAT),
-    traveldoc,
-  };
-}
 
 // ---------------------------------------------------------------------------
 // Email provider — switchable: "mailtm" (default) | "cloudflare"
@@ -812,6 +713,11 @@ async function F1_openAuthPage(tabId) {
     ({state} = await pageReady);
   }
 
+  if (state === "waf-challenge") {
+    const e = new Error("F1: WAF bot-challenge — IP or fingerprint flagged");
+    e.proxyStatus = "blocked"; e.nextAction = "rotate_proxy"; throw e;
+  }
+
   if (state === "auth") return {ok: true, status: "ready"};
 
   // Retry loop: lang switch + login link click.
@@ -830,6 +736,10 @@ async function F1_openAuthPage(tabId) {
         await chrome.tabs.update(tabId, {url: TARGET_URL});
         ({state} = await pr);
         if (state === "auth") return {ok: true, status: "ready"};
+        if (state === "waf-challenge") {
+          const e = new Error("F1: WAF bot-challenge — IP or fingerprint flagged");
+          e.proxyStatus = "blocked"; e.nextAction = "rotate_proxy"; throw e;
+        }
       }
     }
 
@@ -1060,14 +970,15 @@ async function F_warmup(config) {
     _runLog.entry("F_warmup: logging in");
     const _warmupLoginRes = await F3_login(tabId, {username: config.username, password: config.password});
     if (!_warmupLoginRes.ok) {
-      _runLog.finish(`error: F_warmup: login failed — status=${_warmupLoginRes.status}`);
-      return {ok: false, status: _warmupLoginRes.status};
+      await _runLog.finish(`error: F_warmup: login failed — status=${_warmupLoginRes.status}`);
+      // Include nextAction so the manager can retry with a different proxy.
+      return {ok: false, status: _warmupLoginRes.status, nextAction: "rotate_proxy"};
     }
     _runLog.entry("F_warmup: logged in");
 
     if (idleStep === "login") {
       F6_keepSession(tabId);
-      _runLog.finish("ok idleStep=login");
+      await _runLog.finish("ok idleStep=login");
       return {ok: true, idleStep: "login"};
     }
 
@@ -1087,7 +998,7 @@ async function F_warmup(config) {
     if (idleStep === "form") {
       await sendTabCmd(tabId, "cmd-fill-form-tabs").catch(() => {});
       F6_keepSession(tabId);
-      _runLog.finish("ok idleStep=form");
+      await _runLog.finish("ok idleStep=form");
       return {ok: true, idleStep: "form"};
     }
 
@@ -1098,7 +1009,7 @@ async function F_warmup(config) {
       const {state: sState} = await pageReady;
       if (sState !== "schedule") throw new Error(`F_warmup: expected schedule, got ${sState}`);
       F6_keepSession(tabId);
-      _runLog.finish("ok idleStep=schedule");
+      await _runLog.finish("ok idleStep=schedule");
       return {ok: true, idleStep: "schedule"};
     }
 
@@ -1117,35 +1028,37 @@ async function F_apply() {
   const _tabId = tabId ?? await _getActiveTab();
   _runLog.entry(`F_apply: idleState=${idleState}`);
 
-  if (idleState === "login") {
-    _runLog.entry("F_apply: running F4 form filling");
-    await F4_formFilling(_tabId);
-    _runLog.entry("F_apply: running F5 scheduling");
-    const r = await F5_scheduling(_tabId, {});
-    _runLog.finish(`ok status=${r.status ?? r.ok}`);
-    return r;
-  }
+  try {
+    let r;
+    if (idleState === "login") {
+      _runLog.entry("F_apply: running F4 form filling");
+      await F4_formFilling(_tabId);
+      _runLog.entry("F_apply: running F5 scheduling");
+      r = await F5_scheduling(_tabId, {});
+    } else if (idleState === "form") {
+      _runLog.entry("F_apply: submitting form from idle");
+      const pageReady = waitForPageReady(_tabId, 30000);
+      await sendTabCmd(_tabId, "cmd-submit-form").catch(() => {});
+      const {state: sState} = await pageReady;
+      if (sState !== "schedule") throw new Error(`F_apply: expected schedule, got ${sState}`);
+      _runLog.entry("F_apply: running F5 scheduling");
+      r = await F5_scheduling(_tabId, {});
+    } else if (idleState === "schedule") {
+      _runLog.entry("F_apply: running F5 scheduling from idle");
+      r = await F5_scheduling(_tabId, {});
+    } else {
+      throw new Error(`F_apply: unknown idleState "${idleState}"`);
+    }
 
-  if (idleState === "form") {
-    _runLog.entry("F_apply: submitting form from idle");
-    const pageReady = waitForPageReady(_tabId, 30000);
-    await sendTabCmd(_tabId, "cmd-submit-form").catch(() => {});
-    const {state: sState} = await pageReady;
-    if (sState !== "schedule") throw new Error(`F_apply: expected schedule, got ${sState}`);
-    _runLog.entry("F_apply: running F5 scheduling");
-    const r = await F5_scheduling(_tabId, {});
-    _runLog.finish(`ok status=${r.status ?? r.ok}`);
+    await _runLog.finish(r.ok !== false
+      ? `ok status=${r.status ?? "ok"}`
+      : `error: F5 failed — ${r.error ?? r.status ?? "unknown"}`);
     return r;
+  } finally {
+    // Always close the apply tab and clear warmup state — the appointment flow is terminal.
+    chrome.tabs.remove(_tabId).catch(() => {});
+    await chrome.storage.local.remove(["warmup-idle-state", "warmup-tab-id"]);
   }
-
-  if (idleState === "schedule") {
-    _runLog.entry("F_apply: running F5 scheduling from idle");
-    const r = await F5_scheduling(_tabId, {});
-    _runLog.finish(`ok status=${r.status ?? r.ok}`);
-    return r;
-  }
-
-  throw new Error(`F_apply: unknown idleState "${idleState}"`);
 }
 
 async function F_allInOne(config) {
@@ -1153,25 +1066,20 @@ async function F_allInOne(config) {
   stopF6();
   await _resetWorkflow();
 
-  // Build person data once — shared across both phases.
-  let person;
-  if (config.realPerson) {
-    const acct = generatePerson();
-    const rp   = config.realPerson;
-    const gRaw = String(rp.gender ?? "").trim().toUpperCase();
-    person = {
-      name:        String(rp.firstName ?? "").trim(),
-      surname:     String(rp.lastName  ?? "").trim(),
-      username:    acct.username,
-      password:    acct.password,
-      birth_date:  _parseDOB(rp.dob),
-      gender:      gRaw === "F" || gRaw === "FEMALE" || gRaw === "FEMININO" ? "F" : "M",
-      nationality: String(rp.nationality ?? "CPV").trim(),
-      traveldoc:   String(rp.traveldoc  ?? "").trim(),
-    };
-  } else {
-    person = generatePerson();
-  }
+  // Build person data from the manager-supplied realPerson payload.
+  const rp = config.realPerson;
+  if (!rp) throw new Error('F_allInOne: realPerson is required');
+  const gRaw = String(rp.gender ?? "").trim().toUpperCase();
+  const person = {
+    name:        String(rp.firstName ?? "").trim(),
+    surname:     String(rp.lastName  ?? "").trim(),
+    username:    String(rp.username  ?? "").trim(),
+    password:    String(rp.password  ?? "").trim(),
+    birth_date:  _parseDOB(rp.dob),
+    gender:      gRaw === "F" || gRaw === "FEMALE" || gRaw === "FEMININO" ? "F" : "M",
+    nationality: String(rp.nationality ?? "CPV").trim(),
+    traveldoc:   String(rp.traveldoc  ?? "").trim(),
+  };
   const emailAcct = await createTempEmail();
   await chrome.storage.local.set({
     "register-person":  person,
@@ -1214,7 +1122,9 @@ async function F_allInOne(config) {
 
     await F4_formFilling(loginTabId);
     const r = await F5_scheduling(loginTabId, {});
-    _runLog.finish(`ok status=${r.status ?? r.ok}`);
+    await _runLog.finish(r.ok !== false
+      ? `ok status=${r.status ?? "ok"}`
+      : `error: F5 failed — ${r.error ?? r.status ?? "unknown"}`);
     return r;
   } finally {
     chrome.tabs.remove(loginTabId).catch(() => {});
@@ -1254,28 +1164,21 @@ function _runRegister(realPerson) {
     try {
       stopF6();
       await _resetWorkflow();
-      const label = realPerson ? "register_real" : "register_auto";
-      _runLog.start(label);
+      if (!realPerson) throw new Error('_runRegister: realPerson is required');
+      _runLog.start("register_real");
       tabId = await _createSessionTab();
-      let person;
-      if (realPerson) {
-        const acct = generatePerson();
-        const gRaw = String(realPerson.gender ?? "").trim().toUpperCase();
-        person = {
-          name:        String(realPerson.firstName ?? "").trim(),
-          surname:     String(realPerson.lastName  ?? "").trim(),
-          username:    acct.username,
-          password:    acct.password,
-          birth_date:  _parseDOB(realPerson.dob),
-          gender:      gRaw === "F" || gRaw === "FEMALE" || gRaw === "FEMININO" ? "F" : "M",
-          nationality: String(realPerson.nationality ?? "").trim(),
-          traveldoc:   String(realPerson.traveldoc  ?? "").trim(),
-        };
-        _runLog.entry(`person: ${person.name} ${person.surname} ${person.nationality} ${person.traveldoc}`);
-      } else {
-        person = generatePerson();
-        _runLog.entry(`person (auto): ${person.name} ${person.surname}`);
-      }
+      const gRaw = String(realPerson.gender ?? "").trim().toUpperCase();
+      const person = {
+        name:        String(realPerson.firstName ?? "").trim(),
+        surname:     String(realPerson.lastName  ?? "").trim(),
+        username:    String(realPerson.username  ?? "").trim(),
+        password:    String(realPerson.password  ?? "").trim(),
+        birth_date:  _parseDOB(realPerson.dob),
+        gender:      gRaw === "F" || gRaw === "FEMALE" || gRaw === "FEMININO" ? "F" : "M",
+        nationality: String(realPerson.nationality ?? "").trim(),
+        traveldoc:   String(realPerson.traveldoc  ?? "").trim(),
+      };
+      _runLog.entry(`person: ${person.name} ${person.surname} ${person.nationality} ${person.traveldoc}`);
       const emailAcct = await createTempEmail();
       _runLog.entry(`email created: ${emailAcct.email}`);
       await chrome.storage.local.set({
@@ -1287,10 +1190,10 @@ function _runRegister(realPerson) {
       await F1_openAuthPage(tabId);
       await sendTabCmd(tabId, "cmd-log-ip").catch(() => {});
       const r = await F2_register(tabId, person, emailAcct);
-      _runLog.finish(`ok status=${r.status}`);
+      await _runLog.finish(`ok status=${r.status}`);
       self.Comm?.send({type: "register-done", ...r, email: emailAcct.email, username: person.username, password: person.password});
     } catch(e) {
-      _runLog.finish(`error: ${e.message ?? String(e)}`);
+      await _runLog.finish(`error: ${e.message ?? String(e)}`);
       self.Comm?.send({type: "error", reason: e.message ?? String(e)});
     } finally {
       if (tabId) chrome.tabs.remove(tabId).catch(() => {});

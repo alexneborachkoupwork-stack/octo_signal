@@ -2207,6 +2207,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     } else {
       setBadge(`Bot challenge — waiting… (${count}/2)`, "#888888");
     }
+    chrome.runtime.sendMessage({type: "page-ready", state: "waf-challenge", url: location.href}).catch(() => {});
     return;
   }
 

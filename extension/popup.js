@@ -69,16 +69,17 @@ chrome.storage.local.get(
 );
 
 // Auto-save real person fields to storage whenever they change.
-function _saveRpInput() {
+// Merges with existing entry so manager-injected username/password are preserved.
+async function _saveRpInput() {
+  const { "real-person-input": existing = {} } = await chrome.storage.local.get("real-person-input");
   chrome.storage.local.set({"real-person-input": {
-    firstName:      rpFirstname.value.trim(),
-    lastName:       rpLastname.value.trim(),
-    dob:            rpDob.value.trim(),
-    gender:         rpGender.value,
-    nationality:    "CPV",
-    traveldoc:      rpTraveldoc.value.trim(),
-    surnameAtBirth: "+",
-    placeOfBirth:   "+",
+    ...existing,
+    firstName:   rpFirstname.value.trim(),
+    lastName:    rpLastname.value.trim(),
+    dob:         rpDob.value.trim(),
+    gender:      rpGender.value,
+    nationality: "CPV",
+    traveldoc:   rpTraveldoc.value.trim(),
   }});
 }
 [rpFirstname, rpLastname, rpDob, rpTraveldoc].forEach(el =>
@@ -147,18 +148,10 @@ regBtn.addEventListener("click", () => {
   });
 });
 
-// Register (real person) — dispatch through the shared command layer
-btnRegReal.addEventListener("click", () => {
-  const realPerson = {
-    firstName:      rpFirstname.value.trim(),
-    lastName:       rpLastname.value.trim(),
-    dob:            rpDob.value.trim(),
-    gender:         rpGender.value,
-    nationality:    "CPV",
-    traveldoc:      rpTraveldoc.value.trim(),
-    surnameAtBirth: "+",
-    placeOfBirth:   "+",
-  };
+// Register (real person) — read from storage so manager-injected credentials are included.
+btnRegReal.addEventListener("click", async () => {
+  const { "real-person-input": realPerson } = await chrome.storage.local.get("real-person-input");
+  if (!realPerson) { setStatus("No real person data — fill the form.", true); return; }
   const REQUIRED_RP_KEYS = ["firstName","lastName","dob","gender","traveldoc"];
   const missing = REQUIRED_RP_KEYS.filter(k => !realPerson[k]);
   if (missing.length) {
