@@ -205,15 +205,11 @@ class AccountStore {
       // RUNNING from a crashed/killed run — re-queue so the workflow restarts cleanly
       if (rec.status === 'RUNNING') { rec.status = 'PENDING'; }
 
-      // Generate credentials at load time if absent
-      if (!rec.username || !rec.password) {
-        const creds = generateCredentials(rec);
-        if (!rec.username) rec.username = creds.username;
-        if (!rec.password) rec.password = creds.password;
-        rec.isDirty = true; // persist generated credentials on next flush
-      } else {
-        rec.isDirty = false;
-      }
+      // Always generate credentials at load time and write back to CSV
+      const creds = generateCredentials(rec);
+      rec.username = creds.username;
+      rec.password = creds.password;
+      rec.isDirty  = true;
 
       this._accounts.set(rec.accountId, rec);
       loaded++;
