@@ -160,6 +160,16 @@ class SessionManager {
       return;
     }
 
+    // Dual trigger messages — log only, do not route to session state machine.
+    if (type === 'target-post-available') {
+      log.info(botId, `Worker ready for apply — postId=${msg.postId}`);
+      return;
+    }
+    if (type === 'status-update') {
+      log.info(botId, `status-update  state=${msg.state}`);
+      return;
+    }
+
     const session = this._sessions.get(botId);
     if (!session) {
       log.gwarn(`SessionManager: message from unknown botId  botId=${botId}  type=${type}`);

@@ -125,6 +125,7 @@ const E = Object.freeze({
 // ---------------------------------------------------------------------------
 
 let _abortFlag = false;
+let _postMonitorId = null; // { mo: MutationObserver, poll: intervalId } | null
 function sleep(ms) {
   return new Promise((resolve, reject) => {
     if (_abortFlag) { reject(new DOMException("Aborted", "AbortError")); return; }
@@ -2223,6 +2224,11 @@ async function _registerSubmit() {
       console.warn("[OctoProbe] Register: IP block detected");
       return {ok: false, status: "ip_blocked"};
     }
+    // "Email indisponível" = email address already registered.
+    if (_al.includes("indispon") && _al.includes("email")) {
+      _logEntry(`register: email already taken — aborting (alert="${_registerAlert}")`);
+      return {ok: false, status: "email_taken"};
+    }
     // "Invalid username" / "utilizador inválido" = account already exists.
     const _isInvalid  = _al.includes("invalid") || _al.includes("inválid"); // inválid(o/a)
     if (_isInvalid && (_al.includes("username") || _al.includes("utilizador"))) {
@@ -2381,6 +2387,50 @@ const _CMD_HANDLERS = {
       const pos = Math.floor(Math.random() * maxScroll);
       window.scrollTo({top: pos, behavior: "smooth"});
     }
+    return {ok: true};
+  },
+
+  "cmd-start-post-monitor": async () => {
+    const { "target-post-id": targetPostId } = await storageGet(["target-post-id"]);
+    const target = String(targetPostId ?? "");
+    if (!target) return {ok: false, error: "target-post-id not set"};
+
+    // Always attempt to refresh consular post options (triggers AJAX for fresh data)
+    await _callPageFn(
+      `if(typeof loadPostos==="function") loadPostos();` +
+      ` else if(typeof carregarPostos==="function") carregarPostos();`
+    ).catch(() => {});
+
+    // If already monitoring, the refresh above is all we needed — done
+    if (_postMonitorId) return {ok: true};
+
+    const sel = document.getElementById("f0sf1");
+    if (!sel) return {ok: true}; // page not ready yet — F6 tick will retry
+
+    const found = () => {
+      if (_postMonitorId) {
+        _postMonitorId.mo.disconnect();
+        clearInterval(_postMonitorId.poll);
+        _postMonitorId = null;
+      }
+      chrome.runtime.sendMessage({ type: "target-post-available", postId: Number(target) }).catch(() => {});
+    };
+
+    // Immediate check
+    if ([...sel.options].some(o => String(o.value) === target && o.value !== "")) { found(); return {ok: true}; }
+
+    // MutationObserver (priority 1) — catches AJAX-loaded option additions
+    const mo = new MutationObserver(() => {
+      if ([...sel.options].some(o => String(o.value) === target && o.value !== "")) found();
+    });
+    mo.observe(sel, { childList: true });
+
+    // Polling fallback 500–800 ms jitter (priority 3)
+    const poll = setInterval(() => {
+      if ([...sel.options].some(o => String(o.value) === target && o.value !== "")) found();
+    }, 500 + Math.random() * 300);
+
+    _postMonitorId = { mo, poll };
     return {ok: true};
   },
 

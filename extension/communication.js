@@ -158,9 +158,12 @@ self.Comm = (() => {
       if (Object.keys(su).length) await chrome.storage.local.set(su);
       const _creds = await chrome.storage.local.get(["username", "password"]);
       F_warmup({
-        username: _creds.username ?? "",
-        password: _creds.password ?? "",
-        idleStep: normalized.idleStep ?? "login",
+        username:     _creds.username ?? "",
+        password:     _creds.password ?? "",
+        idleStep:     normalized.idleStep     ?? "login",
+        triggerMode:  normalized.triggerMode  ?? "AUTO_TRIGGER",
+        targetPostId: normalized.targetPostId ?? normalized.consulPost,
+        consulPost:   normalized.consulPost,
       })
         .then((r) => send({ type: "warmup-done", ...r }))
         .catch(_onCommandError);
@@ -180,6 +183,22 @@ self.Comm = (() => {
         arrivalDate: normalized.arrivalDate,
       })
         .then((r) => send({ type: "apply-done", ...r }))
+        .catch(_onCommandError);
+      return;
+    }
+
+    if (type === "signal-apply") {
+      if (!_waitingForSignal) return; // ignore stale or unexpected signals
+      _waitingForSignal = false;
+      const su = {};
+      if (normalized.consulPost != null) su["visa-consular-post"] = normalized.consulPost;
+      if (Object.keys(su).length) await chrome.storage.local.set(su);
+      _sendStatusUpdate("APPLYING");
+      F_apply({
+        consulPost:  normalized.consulPost,
+        arrivalDate: normalized.arrivalDate,
+      })
+        .then(r => { _sendStatusUpdate("DONE"); send({ type: "apply-done", ...r }); })
         .catch(_onCommandError);
       return;
     }

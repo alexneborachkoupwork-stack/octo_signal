@@ -75,6 +75,39 @@ class HubServer extends EventEmitter {
           return;
         }
 
+        // POST /signal/apply?workerId=<botId>&postId=<id>
+        // OR JSON body: { workerId, postId }
+        // workerId=* broadcasts to all connected workers.
+        if (url.pathname === '/signal/apply' && req.method === 'POST') {
+          let body = '';
+          req.on('data', chunk => { body += chunk; });
+          req.on('end', () => {
+            let workerId = url.searchParams.get('workerId');
+            let postId   = url.searchParams.get('postId');
+            try {
+              if (body) {
+                const parsed = JSON.parse(body);
+                workerId = workerId ?? parsed.workerId;
+                postId   = postId   ?? parsed.postId;
+              }
+            } catch (_) {}
+
+            const msg = { type: 'signal-apply', postId: postId ? Number(postId) : undefined };
+
+            if (workerId === '*') {
+              this.broadcast(msg);
+              res.writeHead(204); res.end();
+            } else if (workerId && this.isConnected(workerId)) {
+              this.send(workerId, msg);
+              res.writeHead(204); res.end();
+            } else {
+              res.writeHead(404);
+              res.end(JSON.stringify({ error: workerId ? 'worker not connected' : 'workerId required' }));
+            }
+          });
+          return;
+        }
+
         res.writeHead(404);
         res.end('Not found');
       });

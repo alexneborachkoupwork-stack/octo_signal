@@ -1,5 +1,7 @@
 'use strict';
 
+require('dotenv').config({ path: require('path').join(__dirname, '.env') });
+
 /**
  * Octo Manager — CLI entry point.
  *
@@ -7,18 +9,21 @@
  *   node index.js [options]
  *
  * Options:
- *   --workflow    <name>   test | register | warmup | apply  (default: test)
+ *   --workflow    <name>   test | register | warmup | apply | chain | csv-runtime  (default: test)
  *   --max-sessions <n>     max concurrent sessions           (default: 50)
- *   --interval    <ms>     ms between session starts         (default: 45000)
+ *   --interval    <ms>     ms between session starts         (default: 1000)
  *   --consul-post <id>     consular post ID                  (default: 5084)
  *   --proxies     <file>   path to JSON proxy list           (optional)
  *   --port        <n>      hub WebSocket port                (default: 9000)
  *   --octo-api-key <key>   Octo Browser API token            (default: env)
  *   --template    <uuid>   template profile UUID             (default: env)
+ *   --trigger-mode <mode>  AUTO_TRIGGER | EXTERNAL_SIGNAL   (default: AUTO_TRIGGER)
+ *   --accounts    <file>   path to accounts CSV              (default: ./accounts.csv)
  *
  * Environment:
  *   HUB_PORT, OCTO_API_URL, OCTO_API_KEY, TEMPLATE_PROFILE,
- *   MAX_RETRIES, BROWSER_START_TIMEOUT_MS, EXT_CONNECT_TIMEOUT_MS
+ *   MAX_RETRIES, BROWSER_START_TIMEOUT_MS, EXT_CONNECT_TIMEOUT_MS,
+ *   ACCOUNTS_CSV, CSV_FLUSH_INTERVAL_MS, MAX_WORKFLOW_TIMEOUT_MS
  */
 
 const fs   = require('fs');
@@ -32,6 +37,8 @@ const SessionManager = require('./session-manager');
 const { SlotPool }     = require('./slot-pool');
 const { WorkflowChain } = require('./workflow-chain');
 const { TestWorkflow } = require('./workflows/test-workflow');
+const AccountStore   = require('./account-store');
+const CsvScheduler   = require('./csv-scheduler');
 
 // ── CLI argument parser ───────────────────────────────────────────────────────
 
@@ -58,10 +65,12 @@ async function main() {
   if (args['octo-api-key']) cfg.octoApiKey = args['octo-api-key'];
   if (args.template)    cfg.templateProfile = args.template;
 
-  const workflow    = args.workflow     ?? 'test';
+  const workflow    = args.workflow       ?? 'test';
   const maxSessions = Number(args['max-sessions'] ?? 50);
-  const intervalMs  = Number(args.interval         ?? 15_000);
+  const intervalMs  = Number(args.interval         ?? 1_000);
   const consulPost  = args['consul-post']           ?? cfg.defaultConsulPost;
+  const triggerMode = args['trigger-mode']          ?? 'AUTO_TRIGGER';
+  const accountsCsv = args.accounts                 ?? cfg.accountsCsvPath;
 
   // Load proxy pool from file if specified
   let proxies = [];
@@ -96,6 +105,8 @@ async function main() {
   log.ginfo(`  maxSessions:  ${maxSessions}`);
   log.ginfo(`  intervalMs:   ${intervalMs}`);
   log.ginfo(`  consulPost:   ${consulPost}`);
+  log.ginfo(`  triggerMode:  ${triggerMode}`);
+  if (workflow === 'csv-runtime') log.ginfo(`  accountsCsv:  ${accountsCsv}`);
   log.ginfo(`  port:         ${cfg.port}`);
   log.ginfo(`  octoLocalUrl: ${cfg.octoLocalUrl}`);
   log.ginfo(`  proxies:      ${proxies.length}`);
@@ -151,8 +162,10 @@ async function main() {
     const { buildWarmupPayload } = require('./workflows/idle-workflow');
     const proxy   = proxies[0] ?? null;
     const session = sessionManager.createSession('warmup', buildWarmupPayload({
-      idleStep: args['idle-step'] ?? 'login',
+      idleStep:    args['idle-step'] ?? 'login',
       consulPost,
+      triggerMode,
+      targetPostId: consulPost,
     }), proxy);
     await session.start();
 
@@ -187,6 +200,7 @@ async function main() {
           consulPost,
           captchaSolver: 'capsolver',
           proxies: proxy ? [proxy] : [],
+          triggerMode,
         },
         templateUuid: template,
         sleepMs: 90_000,
@@ -198,6 +212,47 @@ async function main() {
       if (intervalMs > 0 && i < chainCount - 1) await new Promise(r => setTimeout(r, intervalMs));
     }
     await Promise.all(chains);
+    await shutdown('workflow-done');
+
+  } else if (workflow === 'csv-runtime') {
+    // ── CSV-driven all-in-one runtime ─────────────────────────────────────────
+    // Loads accounts.csv, launches all-in-one sessions up to maxSessions,
+    // persists results back to CSV, runs until every account is DONE/TERMINATED.
+    const accountStore = new AccountStore(accountsCsv, {
+      flushIntervalMs: cfg.csvFlushIntervalMs,
+    });
+    accountStore.load();
+
+    const total   = accountStore.size();
+    const pending = accountStore.getQueue().length;
+    log.ginfo(`AccountStore: ${total} total accounts, ${pending} pending`);
+
+    if (pending === 0) {
+      log.ginfo('No pending accounts — nothing to do');
+      await shutdown('workflow-done');
+      return;
+    }
+
+    const scheduler = new CsvScheduler({
+      accountStore,
+      sessionManager,
+      hubServer,
+      config: cfg,
+      options: {
+        maxSessions,
+        intervalMs,
+        consulPost,
+        triggerMode,
+        proxies,
+        templateUuids,
+        maxWorkflowTimeoutMs:      cfg.maxWorkflowTimeoutMs,
+        slotWaitMs:                cfg.slotWaitMs,
+        slotWaitCheckIntervalMs:   cfg.slotWaitCheckIntervalMs,
+      },
+    });
+
+    const result = await scheduler.run();
+    log.ginfo(`CsvScheduler finished  done=${result.done}  failed=${result.failed}  total=${result.total}`);
     await shutdown('workflow-done');
 
   } else {

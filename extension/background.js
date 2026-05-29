@@ -865,6 +865,11 @@ async function F2_register(tabId, person, emailAcct) {
     const e = new Error("F2: username already taken (collision on retry)");
     e.proxyStatus = "username_collision"; e.nextAction = "rotate_proxy"; throw e;
   }
+  if (result.status === "email_taken") {
+    // Email already registered — happens when retry reuses an email from a prior attempt.
+    const e = new Error("F2: email already registered");
+    e.proxyStatus = "email_taken"; e.nextAction = "rotate_proxy"; throw e;
+  }
   if (result.status === "captcha_fail") {
     const e = new Error("F2: register failed: captcha_fail");
     e.proxyStatus = "burned"; e.nextAction = "rotate_proxy"; throw e;
@@ -1044,7 +1049,13 @@ async function F5_scheduling(tabId, config) {
   return sendTabCmd(tabId, "cmd-schedule", config).catch(e => ({ok: false, error: e.message}));
 }
 
-let _f6Interval = null;
+let _f6Interval       = null;
+let _applyTriggerLock = false; // debounce: prevent duplicate apply starts
+let _waitingForSignal = false; // EXTERNAL_SIGNAL mode: waiting for signal-apply
+
+function _sendStatusUpdate(state) {
+  self.Comm?.send({ type: "status-update", state });
+}
 
 function F6_keepSession(tabId, idleStep) {
   if (_f6Interval) clearInterval(_f6Interval);
@@ -1052,6 +1063,11 @@ function F6_keepSession(tabId, idleStep) {
   // schedule: 15–25s  |  form: 40–60s  |  login / default: 90–120s
   const _f6Tick = () => {
     sendTabCmd(tabId, "cmd-keep-tick").catch(() => {});
+    // Re-arm post monitor on each tick when in form-monitor idle (for fresh options load)
+    chrome.storage.local.get(["warmup-idle-state"]).then(d => {
+      if (d["warmup-idle-state"] === "form-monitor")
+        sendTabCmd(tabId, "cmd-start-post-monitor").catch(() => {});
+    });
     // Reschedule with fresh jitter each tick
     if (_f6Interval) {
       clearInterval(_f6Interval);
@@ -1123,6 +1139,21 @@ async function F_warmup(config) {
       return {ok: true, idleStep: "form"};
     }
 
+    if (idleStep === "form-monitor") {
+      await sendTabCmd(tabId, "cmd-fill-form-tabs").catch(() => {});
+      await chrome.storage.local.set({
+        "trigger-mode":   config.triggerMode  ?? "AUTO_TRIGGER",
+        "target-post-id": String(config.targetPostId ?? config.consulPost ?? ""),
+      });
+      _applyTriggerLock = false;
+      _waitingForSignal = false;
+      await sendTabCmd(tabId, "cmd-start-post-monitor").catch(() => {});
+      F6_keepSession(tabId, "form");
+      _sendStatusUpdate("READY_FOR_APPLY_IDLE");
+      await _runLog.finish("ok idleStep=form-monitor");
+      return {ok: true, idleStep: "form-monitor"};
+    }
+
     if (idleStep === "schedule") {
       _runLog.entry("F_warmup: submitting form → schedule");
       pageReady = waitForPageReady(tabId, 90000);
@@ -1161,7 +1192,7 @@ async function F_apply() {
       await F4_formFilling(_tabId);
       _runLog.entry("F_apply: running F5 scheduling");
       r = await F5_scheduling(_tabId, {});
-    } else if (idleState === "form") {
+    } else if (idleState === "form" || idleState === "form-monitor") {
       _runLog.entry("F_apply: submitting form from idle");
       const pageReady = waitForPageReady(_tabId, 30000);
       await sendTabCmd(_tabId, "cmd-submit-form").catch(() => {});
@@ -1404,6 +1435,13 @@ const _MSG_HANDLERS = {
   "page-ready": (msg, sender, respond) => {
     const _prr = _pageReadyResolvers.get(sender.tab?.id);
     if (_prr) _prr.resolve({state: msg.state, url: msg.url});
+    // Restore post monitor after a page reload when in form-monitor idle state
+    if (msg.state === "form" && sender.tab?.id) {
+      chrome.storage.local.get(["warmup-idle-state"]).then(d => {
+        if (d["warmup-idle-state"] === "form-monitor")
+          sendTabCmd(sender.tab.id, "cmd-start-post-monitor").catch(() => {});
+      });
+    }
     respond({ok: true});
   },
 
@@ -1442,6 +1480,32 @@ const _MSG_HANDLERS = {
   "slot-success": (msg, _sender, respond) => {
     if (self.Comm) self.Comm.send({ type: "slot-success", slotKey: msg.slotKey });
     respond({ok: true});
+  },
+
+  // ── Dual trigger ─────────────────────────────────────────────────────────
+  // Fired by content.js when target post appears in #f0sf1 options.
+  "target-post-available": (msg, _sender, respond) => {
+    if (_applyTriggerLock) { respond({ok: true}); return; }
+    _applyTriggerLock = true;
+    stopF6();
+    chrome.storage.local.get(["trigger-mode"]).then(d => {
+      const triggerMode = d["trigger-mode"] ?? "AUTO_TRIGGER";
+      _runLog.entry(`target-post-available: postId=${msg.postId} triggerMode=${triggerMode}`);
+      if (triggerMode === "AUTO_TRIGGER") {
+        _sendStatusUpdate("AUTO_TRIGGER_PENDING");
+        F_apply()
+          .then(r => { _sendStatusUpdate("DONE"); self.Comm?.send({ type: "apply-done", ...r }); })
+          .catch(_onCommandError);
+      } else {
+        // EXTERNAL_SIGNAL — notify manager and wait for signal-apply
+        _waitingForSignal = true;
+        _applyTriggerLock = false;
+        self.Comm?.send({ type: "target-post-available", postId: msg.postId });
+        _sendStatusUpdate("WAITING_SIGNAL");
+      }
+    });
+    respond({ok: true});
+    return true;
   },
 
   "get-session-keys": (_msg, _sender, respond) => {
