@@ -5,7 +5,8 @@ const goBtn        = document.getElementById("btn-go");
 const regBtn       = document.getElementById("btn-register");
 const statusEl     = document.getElementById("status");
 const swEl         = document.getElementById("sw-status");
-const selSolver    = document.getElementById("sel-solver");
+const selSolver        = document.getElementById("sel-solver");
+const chkDirectClick   = document.getElementById("chk-direct-click");
 
 // Email provider elements
 const btnEmailMailtm = document.getElementById("btn-email-mailtm");
@@ -31,7 +32,7 @@ function setStatus(msg, isError = false) {
 
 // Load saved credentials, captcha settings, real person data, and workflow state on open.
 chrome.storage.local.get(
-  ["username","password","captcha-solver",
+  ["username","password","captcha-solver","captcha-direct-click",
    "workflow-type","workflow-step","real-person-input",
    "visa-consular-post",
    "email-provider"],
@@ -55,6 +56,7 @@ chrome.storage.local.get(
     }
 
     selSolver.value = data["captcha-solver"] ?? "capsolver";
+    chkDirectClick.checked = data["captcha-direct-click"] ?? false;
 
     setEmailProvider(data["email-provider"] ?? "mailtm");
 
@@ -89,6 +91,10 @@ rpGender.addEventListener("change", _saveRpInput);
 
 selSolver.addEventListener("change", () => {
   chrome.storage.local.set({"captcha-solver": selSolver.value});
+});
+
+chkDirectClick.addEventListener("change", () => {
+  chrome.storage.local.set({"captcha-direct-click": chkDirectClick.checked});
 });
 
 

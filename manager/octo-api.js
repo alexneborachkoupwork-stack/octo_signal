@@ -22,6 +22,21 @@ class OctoApi {
       headers,
       timeout: 30_000,
     });
+
+    // Retry 429 responses with exponential backoff.
+    // Octo Cloud API rate-limits profile CRUD; without this every session fails
+    // immediately when the API is under load.
+    this._cloud.interceptors.response.use(null, async (err) => {
+      const status = err.response?.status;
+      const cfg    = err.config;
+      if (status !== 429) throw err;
+      cfg._retries = (cfg._retries ?? 0) + 1;
+      if (cfg._retries > 6) throw err;                   // give up after 6 retries
+      const delay = Math.min(2000 * (2 ** (cfg._retries - 1)), 60_000); // 2s,4s,8s…60s
+      await new Promise(r => setTimeout(r, delay));
+      return this._cloud.request(cfg);
+    });
+
     // Extension directory to load in every profile — forward slashes required for Chromium
     this._extPath = (extensionPath ?? path.join(__dirname, '..', 'extension'))
       .replace(/\\/g, '/');

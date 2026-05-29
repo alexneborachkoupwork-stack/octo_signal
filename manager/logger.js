@@ -31,7 +31,9 @@ function _stream(sessionId) {
 
 function _write(level, sessionId, ...args) {
   const line = fmt(level, sessionId, ...args);
-  process.stdout.write(line + '\n');
+  // fs.writeSync bypasses Node's stdout stream buffer — output appears immediately
+  // even when stdout is piped through npm on Windows.
+  fs.writeSync(1, line + '\n');
   const s = _stream(sessionId);
   if (s) s.write(line + '\n');
 }

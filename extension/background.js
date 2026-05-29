@@ -383,21 +383,6 @@ const _SOLVER_URLS = {
   "capsolver":    "https://api.capsolver.com",
 };
 
-// All four services share the same getBalance request/response shape.
-// Returns null if the API is unreachable or returns an error — caller must not skip on null.
-async function _fetchBalance(baseUrl, apiKey) {
-  try {
-    const r = await fetch(`${baseUrl}/getBalance`, {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({clientKey: apiKey}),
-    });
-    const d = await r.json();
-    if (d.errorId === 0) return +(d.balance ?? 0);
-  } catch (_) {}
-  return null;
-}
-
 const _ANTICAPTCHA_KEYS = [
   "4b3f3ddf9569d07d3e66c47faa76f84b","f7772963b2e9974ee7e91c1da18e274f",
   "fc636707e6c69d93116eb45ae1a98dfd","51cfd3edeca41fc08e0ac3e4de89c884",
@@ -517,26 +502,8 @@ function _recaptchaInjectFunc(token, evtRcp) {
   document.dispatchEvent(new CustomEvent(evtRcp, {detail:{token}}));
 }
 
-// Unified solver dispatch — used by both solve-recaptcha-api and solve-and-inject-recaptcha.
+// Unified solver dispatch — races all solvers in parallel; first token wins.
 async function _doSolveRecaptcha(pageUrl, siteKey, action) {
-  // Always race all solvers in parallel — first successful token wins.
-  // This eliminates the sequential primary→fallback delay: if the primary solver
-  // returns error 1001 (unsolvable) or is slow, another solver's result is used
-  // immediately. Balance is checked asynchronously for reporting only.
-  const {"captcha-solver": solver = "capsolver"} =
-    await chrome.storage.local.get("captcha-solver");
-  const primary = (solver in _SOLVER_URLS) ? solver : "capsolver";
-  const pickedKey = primary === "anti-captcha" ? _pick(_ANTICAPTCHA_KEYS)
-    : primary === "2captcha"   ? _pick(_TWOCAPTCHA_KEYS)
-    : primary === "capmonster" ? _pick(_CAPMONSTER_KEYS)
-    : _CAPSOLVER_KEY;
-
-  // Non-blocking balance report for the configured primary.
-  _fetchBalance(_SOLVER_URLS[primary], pickedKey)
-    .then(bal => { if (bal !== null) self.Comm?.send({type:"solver-balance", solver:primary, balance:bal, ts:new Date().toISOString()}); })
-    .catch(() => {});
-
-  // Race every solver simultaneously; first valid token resolves.
   return _raceSolvers(pageUrl, siteKey, action);
 }
 
@@ -697,6 +664,30 @@ async function _waitForEmailCodeToken(maxMs = 120000) {
 // F1–F6 orchestration functions
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Service-worker keepalive
+// ---------------------------------------------------------------------------
+// Chrome MV3 terminates idle service workers after a few seconds of inactivity.
+// setInterval / storage calls inside the SW do NOT prevent termination — Chrome
+// only tracks active *event handler* execution as "work".
+//
+// The reliable fix: content.js opens a chrome.runtime.connect port ("sw-keepalive")
+// on every tab it injects into (<all_urls>).  As long as any such port is open
+// the SW is kept alive by Chrome's port-tracking infrastructure.  The worker-init
+// tab stays open throughout the entire workflow, guaranteeing coverage.
+//
+// _startSwKeepalive / _stopSwKeepalive are kept as no-ops so call sites are clean.
+
+const _keepalivePorts = new Set();
+chrome.runtime.onConnect.addListener(port => {
+  if (port.name !== "sw-keepalive") return;
+  _keepalivePorts.add(port);
+  port.onDisconnect.addListener(() => _keepalivePorts.delete(port));
+});
+
+function _startSwKeepalive() {}
+function _stopSwKeepalive()  {}
+
 // Minimal pre-session warmup — visits 2 real sites before the target.
 // Builds a browsing history entry so reCAPTCHA Enterprise sees a non-fresh session.
 // Sites are Google-affiliated (high trust) and topic-relevant (visa search).
@@ -787,7 +778,8 @@ async function F1_openAuthPage(tabId) {
     }
     _runLog.entry(`F1: attempt ${attempt + 1} got state=${state} — retrying`);
   }
-  throw new Error(`F1: expected auth, got ${state}`);
+  const _f1e = new Error(`F1: expected auth, got ${state}`);
+  _f1e.proxyStatus = "unknown"; _f1e.nextAction = "rotate_proxy"; throw _f1e;
 }
 
 async function F2_register(tabId, person, emailAcct) {
@@ -795,13 +787,23 @@ async function F2_register(tabId, person, emailAcct) {
   await sendTabCmd(tabId, "cmd-register-open-form");
   _runLog.entry("F2: form opened");
   const fillResult = await sendTabCmd(tabId, "cmd-register-fill", {person, email: emailAcct.email});
-  if (fillResult?.status === "form_incomplete") throw new Error("F2: form_incomplete — AJAX fields not loaded");
+  if (fillResult?.status === "form_incomplete") {
+    const e = new Error("F2: form_incomplete — AJAX fields not loaded");
+    e.proxyStatus = "proxy_slow"; e.nextAction = "rotate_proxy"; throw e;
+  }
   _runLog.entry("F2: form filled");
 
   // Arm BEFORE the submit loop — the server redirect to the token page can arrive
   // within milliseconds of the RGPD submit, before the loop exits and we could call
   // waitForPageReady.  If we armed it after, the page-ready signal would be lost.
-  const tokenPageReady = waitForPageReady(tabId, 360000);
+  // 600s budget: timer starts here (before submit) to avoid the race where the server
+  // redirects before we arm the listener.  Pre-captcha dwell (≤40s) + two captcha
+  // attempts (≤140s) consume up to ~180s before submit, leaving ≥420s for the redirect.
+  const tokenPageReady = waitForPageReady(tabId, 600000);
+  // Suppress unhandled rejection if we throw before reaching `await tokenPageReady`
+  // (e.g. ip_blocked, captcha_fail, username_taken).  The 600s timer will fire and
+  // reject the promise; without this, that becomes an unhandled SW rejection.
+  tokenPageReady.catch(() => {});
 
   // 2-attempt retry is handled inside cmd-register-submit (_registerSubmit).
   _runLog.entry("F2: captcha submit (up to 2 attempts internally)");
@@ -811,13 +813,20 @@ async function F2_register(tabId, person, emailAcct) {
     const e = new Error("F2: IP blocked by captcha rate-limit");
     e.proxyStatus = "blocked"; e.nextAction = "rotate_proxy"; throw e;
   }
+  if (result.status === "username_taken") {
+    // Account already exists — safety net for the username randomization in F_allInOne.
+    // nextAction: "rotate_proxy" lets the manager retry; F_allInOne will re-randomize
+    // the suffix on the next call so the new attempt uses a fresh username.
+    const e = new Error("F2: username already taken (collision on retry)");
+    e.proxyStatus = "username_collision"; e.nextAction = "rotate_proxy"; throw e;
+  }
   if (result.status === "captcha_fail") {
     const e = new Error("F2: register failed: captcha_fail");
     e.proxyStatus = "burned"; e.nextAction = "rotate_proxy"; throw e;
   }
   if (result.status !== "navigated" && result.status !== "submitted") {
     const e = new Error(`F2: register failed: ${result.status}`);
-    e.proxyStatus = "unknown"; throw e;
+    e.proxyStatus = "unknown"; e.nextAction = "rotate_proxy"; throw e;
   }
 
   _runLog.entry("F2: waiting for token page redirect + email code");
@@ -826,7 +835,10 @@ async function F2_register(tabId, person, emailAcct) {
   _runLog.entry("F2: token page reached — polling email");
 
   const codeToken = await _waitForEmailCodeToken(120000);
-  if (!codeToken) throw new Error("F2: email code token timeout");
+  if (!codeToken) {
+    const e = new Error("F2: email code token timeout");
+    e.proxyStatus = "proxy_slow"; e.nextAction = "rotate_proxy"; throw e;
+  }
   _runLog.entry(`F2: email code token received: ${codeToken}`);
 
   // Write pending-account BEFORE submit click — page navigates on success,
@@ -859,7 +871,8 @@ async function F2_register(tabId, person, emailAcct) {
 
   if (!tokenResult.ok) {
     await chrome.storage.local.remove("pending-account");
-    throw new Error(`F2: email verification failed: ${tokenResult.status}${tokenResult.alert ? ` — ${tokenResult.alert}` : ""}`);
+    const _f2e = new Error(`F2: email verification failed: ${tokenResult.status}${tokenResult.alert ? ` — ${tokenResult.alert}` : ""}`);
+    _f2e.proxyStatus = "unknown"; _f2e.nextAction = "rotate_proxy"; throw _f2e;
   }
 
   // Belt-and-suspenders: save directly from background in case the content.js
@@ -922,7 +935,10 @@ async function F4_formFilling(tabId) {
   let pageReady = waitForPageReady(tabId, 30000);
   await sendTabCmd(tabId, "cmd-go-questionnaire").catch(() => {});
   const {state: qState} = await pageReady;
-  if (qState !== "questionnaire") throw new Error(`F4: expected questionnaire, got ${qState}`);
+  if (qState !== "questionnaire") {
+    const e = new Error(`F4: expected questionnaire, got ${qState}`);
+    e.proxyStatus = "unknown"; e.nextAction = "rotate_proxy"; throw e;
+  }
 
   let fState;
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -931,7 +947,10 @@ async function F4_formFilling(tabId) {
     ({state: fState} = await pageReady);
     if (fState === "form") break;
     if (fState === "auth") break;  // server-side session expiry — handle below
-    if (fState !== "questionnaire") throw new Error(`F4: expected form, got ${fState}`);
+    if (fState !== "questionnaire") {
+      const e = new Error(`F4: expected form, got ${fState}`);
+      e.proxyStatus = "unknown"; e.nextAction = "rotate_proxy"; throw e;
+    }
     // questionnaire page reloaded — retry
   }
 
@@ -939,25 +958,39 @@ async function F4_formFilling(tabId) {
     // Server redirected to auth mid-questionnaire (session expired within ~24s).
     // Re-login once using stored credentials and retry questionnaire.
     const {"register-person": creds} = await chrome.storage.local.get("register-person");
-    if (!creds?.username || !creds?.password)
-      throw new Error("F4: session expired, no stored credentials for re-login");
+    if (!creds?.username || !creds?.password) {
+      const e = new Error("F4: session expired, no stored credentials for re-login");
+      e.proxyStatus = "unknown"; e.nextAction = "change_device"; throw e;
+    }
     const _reloginRes = await F3_login(tabId, {username: creds.username, password: creds.password});
-    if (!_reloginRes.ok) throw new Error(`F4: re-login failed — status=${_reloginRes.status}`);
+    if (!_reloginRes.ok) {
+      const e = new Error(`F4: re-login failed — status=${_reloginRes.status}`);
+      e.proxyStatus = "login_rejected"; e.nextAction = "rotate_proxy"; throw e;
+    }
     pageReady = waitForPageReady(tabId, 30000);
     await sendTabCmd(tabId, "cmd-go-questionnaire").catch(() => {});
     const {state: qState2} = await pageReady;
-    if (qState2 !== "questionnaire") throw new Error(`F4: after re-login, expected questionnaire, got ${qState2}`);
+    if (qState2 !== "questionnaire") {
+      const e = new Error(`F4: after re-login, expected questionnaire, got ${qState2}`);
+      e.proxyStatus = "unknown"; e.nextAction = "rotate_proxy"; throw e;
+    }
     pageReady = waitForPageReady(tabId, 150000);
     await sendTabCmd(tabId, "cmd-fill-questionnaire").catch(() => {});
     ({state: fState} = await pageReady);
   }
 
-  if (fState !== "form") throw new Error(`F4: questionnaire never reached form after retries`);
+  if (fState !== "form") {
+    const e = new Error(`F4: questionnaire never reached form after retries`);
+    e.proxyStatus = "unknown"; e.nextAction = "rotate_proxy"; throw e;
+  }
 
   pageReady = waitForPageReady(tabId, 150000);
   await sendTabCmd(tabId, "cmd-fill-form").catch(() => {});
   const {state: sState} = await pageReady;
-  if (sState !== "schedule") throw new Error(`F4: expected schedule, got ${sState}`);
+  if (sState !== "schedule") {
+    const e = new Error(`F4: expected schedule, got ${sState}`);
+    e.proxyStatus = "unknown"; e.nextAction = "rotate_proxy"; throw e;
+  }
 
   return {ok: true, status: "form-ready"};
 }
@@ -981,6 +1014,7 @@ async function F_warmup(config) {
   const idleStep = config.idleStep ?? "login";
   _runLog.start(`warmup_${idleStep}`);
   _runLog.entry(`username=${config.username} idleStep=${idleStep}`);
+  _startSwKeepalive();
   stopF6();
   await _resetWorkflow();
   const tabId = await _createSessionTab();
@@ -1008,13 +1042,19 @@ async function F_warmup(config) {
     let pageReady = waitForPageReady(tabId, 30000);
     await sendTabCmd(tabId, "cmd-go-questionnaire").catch(() => {});
     const {state: qState} = await pageReady;
-    if (qState !== "questionnaire") throw new Error(`F_warmup: expected questionnaire, got ${qState}`);
+    if (qState !== "questionnaire") {
+      const e = new Error(`F_warmup: expected questionnaire, got ${qState}`);
+      e.proxyStatus = "unknown"; e.nextAction = "rotate_proxy"; throw e;
+    }
     _runLog.entry("F_warmup: filling questionnaire");
 
     pageReady = waitForPageReady(tabId, 60000);
     await sendTabCmd(tabId, "cmd-fill-questionnaire").catch(() => {});
     const {state: fState} = await pageReady;
-    if (fState !== "form") throw new Error(`F_warmup: expected form, got ${fState}`);
+    if (fState !== "form") {
+      const e = new Error(`F_warmup: expected form, got ${fState}`);
+      e.proxyStatus = "unknown"; e.nextAction = "rotate_proxy"; throw e;
+    }
     _runLog.entry("F_warmup: on form page");
 
     if (idleStep === "form") {
@@ -1029,7 +1069,10 @@ async function F_warmup(config) {
       pageReady = waitForPageReady(tabId, 90000);
       await sendTabCmd(tabId, "cmd-fill-form").catch(() => {});
       const {state: sState} = await pageReady;
-      if (sState !== "schedule") throw new Error(`F_warmup: expected schedule, got ${sState}`);
+      if (sState !== "schedule") {
+        const e = new Error(`F_warmup: expected schedule, got ${sState}`);
+        e.proxyStatus = "unknown"; e.nextAction = "rotate_proxy"; throw e;
+      }
       F6_keepSession(tabId);
       await _runLog.finish("ok idleStep=schedule");
       return {ok: true, idleStep: "schedule"};
@@ -1037,6 +1080,7 @@ async function F_warmup(config) {
 
     throw new Error(`F_warmup: unknown idleStep "${idleStep}"`);
   } catch(e) {
+    _stopSwKeepalive();
     chrome.tabs.remove(tabId).catch(() => {});
     throw e;
   }
@@ -1044,6 +1088,7 @@ async function F_warmup(config) {
 
 async function F_apply() {
   _runLog.start("apply");
+  _startSwKeepalive();
   stopF6();
   const {"warmup-idle-state": idleState = "login", "warmup-tab-id": tabId} =
     await chrome.storage.local.get(["warmup-idle-state", "warmup-tab-id"]);
@@ -1062,7 +1107,10 @@ async function F_apply() {
       const pageReady = waitForPageReady(_tabId, 30000);
       await sendTabCmd(_tabId, "cmd-submit-form").catch(() => {});
       const {state: sState} = await pageReady;
-      if (sState !== "schedule") throw new Error(`F_apply: expected schedule, got ${sState}`);
+      if (sState !== "schedule") {
+        const e = new Error(`F_apply: expected schedule, got ${sState}`);
+        e.proxyStatus = "unknown"; e.nextAction = "rotate_proxy"; throw e;
+      }
       _runLog.entry("F_apply: running F5 scheduling");
       r = await F5_scheduling(_tabId, {});
     } else if (idleState === "schedule") {
@@ -1077,7 +1125,7 @@ async function F_apply() {
       : `error: F5 failed — ${r.error ?? r.status ?? "unknown"}`);
     return r;
   } finally {
-    // Always close the apply tab and clear warmup state — the appointment flow is terminal.
+    _stopSwKeepalive();
     chrome.tabs.remove(_tabId).catch(() => {});
     await chrome.storage.local.remove(["warmup-idle-state", "warmup-tab-id"]);
   }
@@ -1085,6 +1133,7 @@ async function F_apply() {
 
 async function F_allInOne(config) {
   _runLog.start("all_in_one");
+  _startSwKeepalive();
   stopF6();
   await _resetWorkflow();
 
@@ -1102,7 +1151,17 @@ async function F_allInOne(config) {
     nationality: String(rp.nationality ?? "CPV").trim(),
     traveldoc:   String(rp.traveldoc  ?? "").trim(),
   };
-  const emailAcct = await createTempEmail();
+  // Re-randomize the numeric suffix on every call — the manager sends the same realPerson
+  // payload on all retries, so the same base username would be reused and the server
+  // would reject attempt 2+ with "Invalid username" (account already exists).
+  const _uBase = person.username.replace(/\d+$/, "") ||
+    (person.name.slice(0, 3) + person.surname.slice(0, 3)).toLowerCase().replace(/[^a-z]/g, "");
+  person.username = _uBase + Math.floor(10000000 + Math.random() * 90000000);
+  const emailAcct = await createTempEmail().catch(err => {
+    err.proxyStatus = err.proxyStatus ?? "email_provider_error";
+    err.nextAction  = err.nextAction  ?? "rotate_proxy";
+    throw err;
+  });
   await chrome.storage.local.set({
     "register-person":  person,
     "register-email":   emailAcct,
@@ -1133,7 +1192,20 @@ async function F_allInOne(config) {
   try {
     await F0_warmupBrowse(loginTabId);
     await F1_openAuthPage(loginTabId);
-    const _loginRes = await F3_login(loginTabId, {username: person.username, password: person.password});
+
+    // Retry login up to 3 times on "rejected" — the server may not have activated
+    // the account yet (activation lag is typically 5–30s after registration completes).
+    // Non-retriable failures (login_failed = wrong credentials) exit immediately.
+    let _loginRes;
+    for (let _attempt = 0; _attempt < 3; _attempt++) {
+      if (_attempt > 0) {
+        const waitMs = 30000 + (_attempt - 1) * 30000; // 30 s, 60 s
+        _runLog.entry(`all_in_one: login rejected — waiting ${waitMs / 1000}s for account activation (attempt ${_attempt + 1}/3)`);
+        await new Promise(r => setTimeout(r, waitMs));
+      }
+      _loginRes = await F3_login(loginTabId, {username: person.username, password: person.password});
+      if (_loginRes.ok || _loginRes.status !== "rejected") break;
+    }
     if (!_loginRes.ok) {
       const e = new Error(`F3: login failed — status=${_loginRes.status}`);
       e.proxyStatus = "login_rejected";
@@ -1149,6 +1221,7 @@ async function F_allInOne(config) {
       : `error: F5 failed — ${r.error ?? r.status ?? "unknown"}`);
     return r;
   } finally {
+    _stopSwKeepalive();
     chrome.tabs.remove(loginTabId).catch(() => {});
   }
 }
@@ -1167,23 +1240,12 @@ function _runDispatchAbort() {
   if (_activeTabId) chrome.tabs.sendMessage(_activeTabId, {type: "abort"}).catch(() => {});
 }
 
-function _runCheckSolverBalances() {
-  const solverKeys = {
-    "anti-captcha": _pick(_ANTICAPTCHA_KEYS),
-    "2captcha":     _pick(_TWOCAPTCHA_KEYS),
-    "capmonster":   _pick(_CAPMONSTER_KEYS),
-    "capsolver":    _CAPSOLVER_KEY,
-  };
-  const balances = {};
-  Promise.all(Object.entries(_SOLVER_URLS).map(async ([name, url]) => {
-    balances[name] = await _fetchBalance(url, solverKeys[name]);
-  })).then(() => self.Comm?.send({type: "solver-balances", balances, ts: new Date().toISOString()}));
-}
 
 function _runRegister(realPerson) {
   (async () => {
     let tabId;
     try {
+      _startSwKeepalive();
       stopF6();
       await _resetWorkflow();
       if (!realPerson) throw new Error('_runRegister: realPerson is required');
@@ -1218,6 +1280,7 @@ function _runRegister(realPerson) {
       await _runLog.finish(`error: ${e.message ?? String(e)}`);
       self.Comm?.send({type: "error", reason: e.message ?? String(e)});
     } finally {
+      _stopSwKeepalive();
       if (tabId) chrome.tabs.remove(tabId).catch(() => {});
     }
   })();
@@ -1232,16 +1295,19 @@ chrome.runtime.onInstalled.addListener(() => {
   console.log("[OctoProbe] Extension installed.");
 });
 
-// WS keepalive alarm — prevents service worker suspension while WS is open.
+// WS keepalive alarm — wakes the SW periodically so reconnectIfNeeded() can fire
+// if the WS dropped while the SW was suspended.
+// Hub sends protocol-level WS pings every 5 s (server-side) which already keeps
+// the connection alive; this alarm handles the rare case where the SW is killed
+// and needs to reconnect from stored credentials.
 chrome.alarms.create("ws-ping", {periodInMinutes: 0.4});
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "ws-ping") {
-    if (self.Comm?.isConnected()) {
-      self.Comm.send({type: "ping"});
-    } else {
-      // SW may have been suspended — WS dropped silently without onclose firing.
-      self.Comm?.reconnectIfNeeded();
-    }
+  if (alarm.name !== "ws-ping") return;
+  if (self.Comm?.isConnected()) {
+    self.Comm.send({type: "ping"});
+  } else {
+    // SW may have been suspended — WS dropped silently without onclose firing.
+    self.Comm?.reconnectIfNeeded();
   }
 });
 
@@ -1280,6 +1346,12 @@ const _MSG_HANDLERS = {
 
   "ping": (_msg, _sender, respond) => {
     respond({type: "pong", version: chrome.runtime.getManifest().version});
+  },
+
+  // Sent by content.js every 20 s to reset Chrome's 30 s SW idle timer.
+  // Keeps the SW alive in Chrome 110+ where open ports alone are insufficient.
+  "sw-keepalive-ping": (_msg, _sender, respond) => {
+    respond({ok: true});
   },
 
   "get-creds": (_msg, _sender, respond) => {
@@ -1605,11 +1677,6 @@ const _MSG_HANDLERS = {
 
   "ws-send": (msg, _sender, respond) => {
     if (self.Comm) self.Comm.send(msg.data);
-    respond({ok: true});
-  },
-
-  "check-solver-balances": (_msg, _sender, respond) => {
-    _runCheckSolverBalances();
     respond({ok: true});
   },
 

@@ -131,12 +131,12 @@ class Session extends EventEmitter {
     this._sendWorkflowCommand();
   }
 
+  // Types that carry no workflow signal — logged at DEBUG only.
+  static _KEEPALIVE = new Set(['ping','pong','hello','status']);
+
   /**
    * Called by SessionManager when an inbound message arrives from the extension.
    */
-  // Types that carry no workflow signal — logged at DEBUG only.
-  static _KEEPALIVE = new Set(['ping','pong','hello','status','solver-balance','solver-balances']);
-
   onMessage(msg) {
     // Ignore messages that arrive after the session has already settled — prevents
     // double-fail / double-stop from stale sockets or delayed extension messages.

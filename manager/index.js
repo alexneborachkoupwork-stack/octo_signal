@@ -58,7 +58,7 @@ async function main() {
 
   const workflow    = args.workflow     ?? 'test';
   const maxSessions = Number(args['max-sessions'] ?? 50);
-  const intervalMs  = Number(args.interval         ?? 45_000);
+  const intervalMs  = Number(args.interval         ?? 15_000);
   const consulPost  = args['consul-post']           ?? cfg.defaultConsulPost;
 
   // Load proxy pool from file if specified
@@ -103,8 +103,7 @@ async function main() {
   // ── Initialise layers ──────────────────────────────────────────────────────
 
   const octoApi        = new OctoApi({ localUrl: cfg.octoLocalUrl, cloudUrl: cfg.octoCloudUrl, apiKey: cfg.octoApiKey });
-
-const hubServer      = new HubServer(cfg);
+  const hubServer      = new HubServer(cfg);
   const sessionManager = new SessionManager({ config: cfg, octoApi, hubServer });
 
   await hubServer.start();

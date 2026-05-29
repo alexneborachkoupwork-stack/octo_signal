@@ -13,6 +13,31 @@
  *   email-token     : string | null  (set by background when poll finds the message)
  */
 
+// ── Service-worker keepalive via persistent port ──────────────────────────────
+// Chrome MV3 terminates idle service workers after a few seconds of inactivity.
+// setInterval / storage calls from the SW itself are unreliable — Chrome only
+// tracks active *event handler* execution.  A chrome.runtime.connect port opened
+// from a content script IS tracked: as long as any tab has this script running,
+// the SW is kept alive indefinitely.  Content.js matches <all_urls> so it runs
+// on the worker-init tab and every workflow tab the extension opens.
+(function _swKeepalivePort() {
+  try {
+    const port = chrome.runtime.connect({name: "sw-keepalive"});
+    port.onDisconnect.addListener(() => {
+      setTimeout(_swKeepalivePort, 500);
+    });
+  } catch (_) {}
+})();
+
+// Chrome 110+ changed port behaviour: an open port no longer prevents SW
+// termination — it only gives a single 30 s window from the onConnect event.
+// Periodic sendMessage calls ARE tracked as chrome.runtime.onMessage events,
+// which reset the 30 s idle timer without killing the SW or losing execution
+// state.  20 s interval ensures the timer never reaches 0.
+setInterval(() => {
+  chrome.runtime.sendMessage({type: "sw-keepalive-ping"}).catch(() => {});
+}, 20_000);
+
 const TARGET_HOST = "pedidodevistos.mne.gov.pt";
 const MAILTM      = "https://api.mail.tm";
 
@@ -598,25 +623,31 @@ async function fillRegisterForm(person, email) {
 }
 
 async function waitForRecaptcha() {
-  // Always try direct CDP click first — generates a native browser token that Google
-  // Enterprise validates against the actual Octo Browser session (high score).
-  // Falls through to API solver only when CDP fails or a challenge grid appears.
-  const directToken = await _waitForRecaptchaClick();
-  if (directToken) {
-    _logEntry(`captcha: direct click passed — token obtained`);
-    console.log("[OctoProbe] reCAPTCHA passed via direct click.");
-    await _ensureEvtKeys();
-    const solved = await new Promise(resolve => {
-      document.addEventListener(_evtRcp, () => resolve(true), {once: true});
-      sendBgMessage({type: "inject-recaptcha-token", token: directToken})
-        .then(r => { if (!r?.ok) resolve(false); })
-        .catch(() => resolve(false));
-      setTimeout(() => resolve(false), 10000);
-    });
-    if (solved) return true;
+  // Direct CDP click is opt-in (storage key "captcha-direct-click", default false).
+  // When disabled, go straight to the API solver — avoids the 100% challenge-grid
+  // fallback that burns two solver attempts per session.
+  const {"captcha-direct-click": directClickEnabled = false} =
+    await chrome.storage.local.get("captcha-direct-click");
+
+  if (directClickEnabled) {
+    const directToken = await _waitForRecaptchaClick();
+    if (directToken) {
+      _logEntry(`captcha: direct click passed — token obtained`);
+      console.log("[OctoProbe] reCAPTCHA passed via direct click.");
+      await _ensureEvtKeys();
+      const solved = await new Promise(resolve => {
+        document.addEventListener(_evtRcp, () => resolve(true), {once: true});
+        sendBgMessage({type: "inject-recaptcha-token", token: directToken})
+          .then(r => { if (!r?.ok) resolve(false); })
+          .catch(() => resolve(false));
+        setTimeout(() => resolve(false), 10000);
+      });
+      if (solved) return true;
+    }
+    _logEntry(`captcha: direct click failed/challenge — using API solver`);
+  } else {
+    _logEntry(`captcha: direct click disabled — using API solver`);
   }
-  // Fallback: API solver (CDP failed, challenge appeared, or no iframe found).
-  _logEntry(`captcha: direct click failed/challenge — using API solver`);
   return _waitForRecaptchaApi();
 }
 
@@ -1991,6 +2022,12 @@ async function _registerSubmit() {
     if (_al.includes("blocked") && _al.includes("incremental") && !_al.includes("1 more attempt")) {
       console.warn("[OctoProbe] Register: IP block detected");
       return {ok: false, status: "ip_blocked"};
+    }
+    // "Invalid username" = account already exists (username collision from retry reusing
+    // the same person payload).  No point running attempt 2 with the same username.
+    if (_al.includes("invalid") && (_al.includes("username") || _al.includes("utilizador"))) {
+      _logEntry(`register: username already taken — aborting (alert="${_registerAlert}")`);
+      return {ok: false, status: "username_taken"};
     }
 
     if (rgpdAttempt < 2) {

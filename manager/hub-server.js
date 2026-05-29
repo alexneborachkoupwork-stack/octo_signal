@@ -40,6 +40,7 @@ class HubServer extends EventEmitter {
     this._sockets = new Map(); // botId → ws
     this._httpServer = null;
     this._wss        = null;
+    this._pingInterval = null;
   }
 
   start() {
@@ -84,6 +85,9 @@ class HubServer extends EventEmitter {
           try { old.close(1001, 'replaced by reconnect'); } catch (_) {}
         }
 
+        ws.isAlive = true;
+        ws.on('pong', () => { ws.isAlive = true; });
+
         this._sockets.set(botId, ws);
         log.ginfo(`HubServer: extension connected  botId=${botId}`);
         this.emit('connected', botId, ws);
@@ -109,6 +113,23 @@ class HubServer extends EventEmitter {
 
       this._httpServer.listen(this._port, () => {
         log.ginfo(`HubServer: listening on http/ws port ${this._port}`);
+
+        // Send WS protocol-level ping frames every 5 s.
+        // Chrome auto-responds with pong frames, preventing the browser from
+        // treating the WS as idle and terminating the service worker.
+        // Sockets that miss two consecutive pings (>10 s silent) are terminated.
+        this._pingInterval = setInterval(() => {
+          for (const [botId, ws] of this._sockets.entries()) {
+            if (!ws.isAlive) {
+              log.gwarn(`HubServer: ping timeout  botId=${botId} — closing`);
+              ws.terminate();
+              continue;
+            }
+            ws.isAlive = false;
+            ws.ping();
+          }
+        }, 5000);
+
         resolve();
       });
     });
@@ -116,6 +137,7 @@ class HubServer extends EventEmitter {
 
   stop() {
     return new Promise((resolve) => {
+      if (this._pingInterval) { clearInterval(this._pingInterval); this._pingInterval = null; }
       for (const ws of this._sockets.values()) {
         try { ws.close(1001, 'server shutting down'); } catch (_) {}
       }

@@ -102,11 +102,6 @@ self.Comm = (() => {
       return;
     }
 
-    if (type === "check-solver-balances") {
-      _runCheckSolverBalances();
-      return;
-    }
-
     if (type === "abort") {
       await chrome.storage.local.remove([
         "workflow-type", "workflow-step", "register-person", "register-email",
@@ -121,11 +116,12 @@ self.Comm = (() => {
 
     if (type === "register") {
       const su = {};
-      if (normalized.captchaSolver != null) su["captcha-solver"] = normalized.captchaSolver;
-      if (normalized.emailProvider != null) su["email-provider"] = normalized.emailProvider;
-      if (normalized.cfDomain != null) su["cf-mail-domain"] = normalized.cfDomain;
-      if (normalized.cfWorkerUrl != null) su["cf-worker-url"] = normalized.cfWorkerUrl;
-      if (normalized.cfWorkerSecret != null) su["cf-worker-secret"] = normalized.cfWorkerSecret;
+      if (normalized.captchaSolver    != null) su["captcha-solver"]       = normalized.captchaSolver;
+      if (normalized.captchaDirectClick != null) su["captcha-direct-click"] = !!normalized.captchaDirectClick;
+      if (normalized.emailProvider    != null) su["email-provider"]       = normalized.emailProvider;
+      if (normalized.cfDomain         != null) su["cf-mail-domain"]       = normalized.cfDomain;
+      if (normalized.cfWorkerUrl      != null) su["cf-worker-url"]        = normalized.cfWorkerUrl;
+      if (normalized.cfWorkerSecret   != null) su["cf-worker-secret"]     = normalized.cfWorkerSecret;
       if (Object.keys(su).length) await chrome.storage.local.set(su);
       _runRegister(normalized.realPerson);
       return;
@@ -133,9 +129,10 @@ self.Comm = (() => {
 
     if (type === "warmup") {
       const su = {};
-      if (normalized.username != null) su["username"] = normalized.username;
-      if (normalized.password != null) su["password"] = normalized.password;
-      if (normalized.captchaSolver != null) su["captcha-solver"] = normalized.captchaSolver;
+      if (normalized.username           != null) su["username"]             = normalized.username;
+      if (normalized.password           != null) su["password"]             = normalized.password;
+      if (normalized.captchaSolver      != null) su["captcha-solver"]       = normalized.captchaSolver;
+      if (normalized.captchaDirectClick != null) su["captcha-direct-click"] = !!normalized.captchaDirectClick;
       if (normalized.arrivalDate != null) su["visa-arrival-date"] = normalized.arrivalDate;
       if (normalized.departureDate != null) su["visa-departure-date"] = normalized.departureDate;
       if (normalized.consulPost != null) su["visa-consular-post"] = normalized.consulPost;
@@ -173,11 +170,12 @@ self.Comm = (() => {
 
     if (type === "all-in-one") {
       const su = {};
-      if (normalized.captchaSolver != null) su["captcha-solver"] = normalized.captchaSolver;
-      if (normalized.emailProvider != null) su["email-provider"] = normalized.emailProvider;
-      if (normalized.cfDomain != null) su["cf-mail-domain"] = normalized.cfDomain;
-      if (normalized.cfWorkerUrl != null) su["cf-worker-url"] = normalized.cfWorkerUrl;
-      if (normalized.cfWorkerSecret != null) su["cf-worker-secret"] = normalized.cfWorkerSecret;
+      if (normalized.captchaSolver      != null) su["captcha-solver"]       = normalized.captchaSolver;
+      if (normalized.captchaDirectClick != null) su["captcha-direct-click"] = !!normalized.captchaDirectClick;
+      if (normalized.emailProvider      != null) su["email-provider"]       = normalized.emailProvider;
+      if (normalized.cfDomain           != null) su["cf-mail-domain"]       = normalized.cfDomain;
+      if (normalized.cfWorkerUrl        != null) su["cf-worker-url"]        = normalized.cfWorkerUrl;
+      if (normalized.cfWorkerSecret     != null) su["cf-worker-secret"]     = normalized.cfWorkerSecret;
       if (normalized.arrivalDate != null) su["visa-arrival-date"] = normalized.arrivalDate;
       if (normalized.departureDate != null) su["visa-departure-date"] = normalized.departureDate;
       if (normalized.consulPost != null) su["visa-consular-post"] = normalized.consulPost;
@@ -316,23 +314,41 @@ self.Comm = (() => {
 
   // Reconnect if the WS is not open — called by the ws-ping alarm to recover from
   // SW suspension (SW sleep drops the WS silently without firing onclose).
+  // When the SW was terminated (not just suspended), _url is null; fall back to
+  // reading botId + hubWsUrl from storage to reconstruct the connection URL.
   function reconnectIfNeeded() {
-    if (_stopReconnect || !_url) return;
-    if (!_ws || _ws.readyState === WebSocket.CLOSED || _ws.readyState === WebSocket.CLOSING) {
-      connect(_url);
+    if (_stopReconnect) return;
+    if (_url) {
+      if (!_ws || _ws.readyState === WebSocket.CLOSED || _ws.readyState === WebSocket.CLOSING) {
+        connect(_url);
+      }
+      return;
     }
+    // _url is null — SW was terminated and restarted; read from storage.
+    chrome.storage.local.get(["botId", "hubWsUrl", "hubUrl"]).then(stored => {
+      const botId   = stored.botId;
+      const hubBase = stored.hubWsUrl || stored.hubUrl;
+      if (botId && hubBase && !_url) {
+        connectHub(botId, hubBase);
+      }
+    }).catch(() => {});
   }
 
   return { connect, connectHub, disconnect, send, isConnected, reconnectIfNeeded, dispatch: _handleCommand, getBotId: () => _botId };
 })();
 
 // Prefer hub session from worker-init; fall back to config.json for standalone popup testing.
-// getBotId() check: if WORKER_INIT already fired during this SW lifetime and called connectHub(),
-// _botId is set — skip auto-connect to avoid replacing the WS where the command was sent.
+// Delay the storage read so WORKER_INIT (fired by hub-init.js on the worker-init tab) has time
+// to call connectHub() with the correct sessionId first.  Without the delay, a profile cloned
+// from a template inherits stale botId/hubWsUrl in storage and the IIFE would connect with
+// that old botId, kicking the real live session off the hub.
+// If WORKER_INIT fires before the delay expires, getBotId() will be non-null and we skip.
 (async () => {
   try {
-    const stored = await chrome.storage.local.get(["botId", "hubWsUrl", "hubUrl"]);
+    await new Promise(r => setTimeout(r, 500));
     if (self.Comm.getBotId()) return; // WORKER_INIT beat us to it — don't double-connect
+    const stored = await chrome.storage.local.get(["botId", "hubWsUrl", "hubUrl"]);
+    if (self.Comm.getBotId()) return; // check again after async storage read
     const botId = stored.botId;
     const hubBase = stored.hubWsUrl || stored.hubUrl;
     if (botId && hubBase) {
