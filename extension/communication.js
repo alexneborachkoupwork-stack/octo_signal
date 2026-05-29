@@ -123,7 +123,10 @@ self.Comm = (() => {
       if (normalized.cfWorkerUrl      != null) su["cf-worker-url"]        = normalized.cfWorkerUrl;
       if (normalized.cfWorkerSecret   != null) su["cf-worker-secret"]     = normalized.cfWorkerSecret;
       if (Object.keys(su).length) await chrome.storage.local.set(su);
-      _runRegister(normalized.realPerson);
+      if (normalized.emailProvider === "cloudflare") {
+        await self._ensureCfEmailConfig?.();
+      }
+      _runRegister(normalized.realPerson, normalized.emailAccount);
       return;
     }
 
@@ -183,9 +186,12 @@ self.Comm = (() => {
         su["real-person-input"] = normalized.realPerson;
       }
       if (Object.keys(su).length) await chrome.storage.local.set(su);
+      if (normalized.emailProvider === "cloudflare") {
+        await self._ensureCfEmailConfig?.();
+      }
       F_allInOne({
         realPerson:  normalized.realPerson,
-        emailAcct:   normalized.emailAcct,
+        emailAccount: normalized.emailAccount ?? normalized.emailAcct,
         arrivalDate: normalized.arrivalDate,
         consulPost:  normalized.consulPost,
       })
