@@ -321,6 +321,16 @@ class Session extends EventEmitter {
     this._onResult({ ok: false, sessionId: this.sessionId, reason }); // stats correct
     await this.stop().catch(() => {});
   }
+
+  /**
+   * Force-terminate this session from outside (e.g. scheduler timeout).
+   * Triggers the full _fail lifecycle: emits 'failed', stops browser, deletes profile.
+   * No-op if session already settled.
+   */
+  terminate(reason = 'terminated by scheduler') {
+    if (this.state === STATES.DONE || this.state === STATES.FAILED) return;
+    this._fail(reason).catch(() => {});
+  }
 }
 
 Session.STATES = STATES;

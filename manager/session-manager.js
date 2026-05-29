@@ -67,8 +67,8 @@ class SessionManager {
     this._sessions.set(sessionId, session);
 
     metrics.recordSessionStart(workflowName);
-    session.on('done',       () => { this._sessions.delete(sessionId); metrics.recordSessionDone(); });
-    session.on('failed',     () => { this._sessions.delete(sessionId); metrics.recordSessionFailed(); });
+    session.on('done',   () => { this._sessions.delete(sessionId); metrics.recordSessionDone();   this._slotPool?.releaseWorker(sessionId); });
+    session.on('failed', () => { this._sessions.delete(sessionId); metrics.recordSessionFailed(); this._slotPool?.releaseWorker(sessionId); });
     session.on('state-change', (s) => { if (s === Session.STATES.RETRYING) metrics.recordSessionRetry(); });
 
     log.ginfo(`SessionManager: created  sessionId=${sessionId}  workflow=${workflowName}`);
@@ -108,8 +108,8 @@ class SessionManager {
     this._sessions.set(sessionId, session);
 
     metrics.recordSessionStart(workflowName);
-    session.on('done',       () => { this._sessions.delete(sessionId); metrics.recordSessionDone(); });
-    session.on('failed',     () => { this._sessions.delete(sessionId); metrics.recordSessionFailed(); });
+    session.on('done',   () => { this._sessions.delete(sessionId); metrics.recordSessionDone();   this._slotPool?.releaseWorker(sessionId); });
+    session.on('failed', () => { this._sessions.delete(sessionId); metrics.recordSessionFailed(); this._slotPool?.releaseWorker(sessionId); });
     session.on('state-change', (s) => { if (s === Session.STATES.RETRYING) metrics.recordSessionRetry(); });
 
     log.ginfo(`SessionManager: created (existing profile)  sessionId=${sessionId}  profileUuid=${existingProfileUuid}  workflow=${workflowName}`);

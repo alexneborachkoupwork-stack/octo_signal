@@ -42,6 +42,7 @@ class CsvScheduler extends EventEmitter {
     this._intervalMs           = options.intervalMs           ?? 15_000;
     this._consulPost           = options.consulPost           ?? config.defaultConsulPost ?? '5084';
     this._triggerMode          = options.triggerMode          ?? 'AUTO_TRIGGER';
+    this._emailProvider        = options.emailProvider        ?? 'mailtm';
     this._proxies              = options.proxies              ?? [];
     this._templateUuids        = options.templateUuids        ?? [];
     this._maxWorkflowTimeoutMs = options.maxWorkflowTimeoutMs ?? config.maxWorkflowTimeoutMs ?? 8 * 60 * 60 * 1000;
@@ -154,19 +155,13 @@ class CsvScheduler extends EventEmitter {
     this._store.update(acc.accountId, { workerId: session.sessionId });
     log.ginfo(`CsvScheduler: launched  accountId=${acc.accountId}  sessionId=${session.sessionId}`);
 
-    // Hard timeout — terminate if worker runs too long
+    // Hard timeout — force-terminate if worker runs too long.
+    // session.terminate() triggers _fail() → emits 'failed' → once handler below handles
+    // store update, profile deletion, and slot release via the normal failure path.
     const timeoutHandle = setTimeout(() => {
       if (!this._activeWorkers.has(acc.accountId)) return;
       log.gwarn(`CsvScheduler: timeout  accountId=${acc.accountId}  sessionId=${session.sessionId}`);
-      this._store.update(acc.accountId, {
-        status:        'TERMINATED',
-        terminated:    true,
-        failureReason: 'TIMEOUT',
-        finishedAt:    new Date().toISOString(),
-      });
-      this._activeWorkers.delete(acc.accountId);
-      session.stop().catch(() => {});
-      this._onWorkerFinished();
+      session.terminate('TIMEOUT');
     }, this._maxWorkflowTimeoutMs);
 
     this._activeWorkers.set(acc.accountId, { session, timeoutHandle });
@@ -210,8 +205,8 @@ class CsvScheduler extends EventEmitter {
 
       this._failedCount++;
 
-      // Auth/config errors are not retryable — terminate immediately
-      const fatal = /40[13]|unauthorized|forbidden|invalid.*key/i.test(reason);
+      // Non-retryable failure reasons — terminate immediately without burning retry slots
+      const fatal = /40[13]|unauthorized|forbidden|invalid.*key|^TIMEOUT$/i.test(reason);
 
       // Re-read latest acc state (may have been updated by hub messages)
       const latest     = this._store.get(acc.accountId) ?? acc;
@@ -379,18 +374,19 @@ class CsvScheduler extends EventEmitter {
   _buildPayload(acc) {
     return {
       realPerson: {
-        firstName:      acc.firstName      ?? '',
-        lastName:       acc.lastName       ?? '',
-        dateOfBirth:    acc.dateOfBirth    ?? '',
-        gender:         acc.gender         ?? '',
-        nationality:    acc.nationality    ?? '',
-        passportNumber: acc.passportNumber ?? '',
-        username:       acc.username       ?? '',
-        password:       acc.password       ?? '',
+        firstName:  acc.firstName      ?? '',
+        lastName:   acc.lastName       ?? '',
+        dob:        acc.dateOfBirth    ?? '',   // F_allInOne reads rp.dob
+        gender:     acc.gender         ?? '',
+        nationality:acc.nationality    ?? '',
+        traveldoc:  acc.passportNumber ?? '',   // F_allInOne reads rp.traveldoc
+        username:   acc.username       ?? '',
+        password:   acc.password       ?? '',
       },
       emailAddress:  acc.emailAddress ?? undefined,
       consulPost:    this._consulPost,
       triggerMode:   this._triggerMode,
+      emailProvider: this._emailProvider,
       captchaSolver: 'capsolver',
     };
   }

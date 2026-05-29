@@ -64,8 +64,15 @@
   } catch (_) {}
 
   function _native(fn, name) {
-    fn.toString = function() { return 'function ' + name + '() { [native code] }'; };
-    try { Object.defineProperty(fn, 'name', {value: name, configurable: true}); } catch(_) {}
+    // Non-enumerable, non-configurable toString so Object.getOwnPropertyDescriptor(fn,'toString')
+    // returns undefined — matching real native functions (which inherit toString, not own it).
+    try {
+      Object.defineProperty(fn, 'toString', {
+        value: function() { return 'function ' + name + '() { [native code] }'; },
+        writable: false, enumerable: false, configurable: false,
+      });
+    } catch(_) {}
+    try { Object.defineProperty(fn, 'name', {value: name, writable: false, enumerable: false, configurable: true}); } catch(_) {}
     return fn;
   }
 
@@ -98,8 +105,13 @@
 // matching a real unpatched browser.
 (function () {
   function _native(fn, name) {
-    fn.toString = function () { return 'function get ' + name + '() { [native code] }'; };
-    try { Object.defineProperty(fn, 'name', {value: name, configurable: true}); } catch (_) {}
+    try {
+      Object.defineProperty(fn, 'toString', {
+        value: function() { return 'function get ' + name + '() { [native code] }'; },
+        writable: false, enumerable: false, configurable: false,
+      });
+    } catch(_) {}
+    try { Object.defineProperty(fn, 'name', {value: name, writable: false, enumerable: false, configurable: true}); } catch(_) {}
     return fn;
   }
   try {

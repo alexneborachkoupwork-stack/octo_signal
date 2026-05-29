@@ -626,93 +626,18 @@ async function fillRegisterForm(person, email) {
   return true;
 }
 
+// CDP-based direct click was removed: it consistently triggers the challenge grid
+// (image CAPTCHA) on all sessions and creates a detectable debugger-attach timing spike.
+// All CAPTCHA solving now goes through the API solver path.
 async function waitForRecaptcha() {
-  // Direct CDP click is opt-in (storage key "captcha-direct-click", default false).
-  // When disabled, go straight to the API solver — avoids the 100% challenge-grid
-  // fallback that burns two solver attempts per session.
-  const {"captcha-direct-click": directClickEnabled = false} =
-    await chrome.storage.local.get("captcha-direct-click");
-
-  if (directClickEnabled) {
-    const directToken = await _waitForRecaptchaClick();
-    if (directToken) {
-      _logEntry(`captcha: direct click passed — token obtained`);
-      console.log("[OctoProbe] reCAPTCHA passed via direct click.");
-      await _ensureEvtKeys();
-      const solved = await new Promise(resolve => {
-        document.addEventListener(_evtRcp, () => resolve(true), {once: true});
-        sendBgMessage({type: "inject-recaptcha-token", token: directToken})
-          .then(r => { if (!r?.ok) resolve(false); })
-          .catch(() => resolve(false));
-        setTimeout(() => resolve(false), 10000);
-      });
-      if (solved) return true;
-    }
-    _logEntry(`captcha: direct click failed/challenge — using API solver`);
-  } else {
-    _logEntry(`captcha: direct click disabled — using API solver`);
-  }
   return _waitForRecaptchaApi();
 }
 
-// Direct click mode — uses CDP (isTrusted=true) to click the reCAPTCHA v2 checkbox.
-// Returns the token string if the click passed immediately, or null if a challenge
-// grid appeared (fall back to API solver) or if the iframe was not found.
+// Kept as dead stub — callers that reference it won't break.
 async function _waitForRecaptchaClick() {
-  const iframeEl = await waitFor(
-    () => {
-      const el = document.querySelector(
-        "iframe[src*='recaptcha/api2/anchor'], iframe[src*='recaptcha/enterprise/anchor']"
-      );
-      // Anchor iframe is 300×74. Exclude tiny/hidden iframes.
-      if (!el) return null;
-      const r = el.getBoundingClientRect();
-      return (r.width >= 50 && r.height >= 30) ? el : null;
-    },
-    10000
-  );
-  if (!iframeEl) {
-    console.warn("[OctoProbe] reCAPTCHA anchor iframe not found — skipping direct click");
-    return null;
-  }
-
-  iframeEl.scrollIntoView({block: "center", behavior: "smooth"});
-  await sleep(500 + Math.random() * 400);
-  await humanMoveTo(iframeEl);
-
-  // Get fresh rect after scroll — position changes after scrollIntoView settles.
-  // Checkbox center in the 300×74 anchor frame is at local (24, 37); convert to
-  // viewport coords and use cdp-click (Input.dispatchMouseEvent on the parent tab).
-  // Chrome's compositor routes CDP mouse events to the correct cross-origin frame
-  // renderer based on viewport hit-testing — no separate Target session needed.
-  const iframeRect = iframeEl.getBoundingClientRect();
-  const clickX = Math.round(iframeRect.left + 24);
-  const clickY = Math.round(iframeRect.top  + 37);
-  _logEntry(`captcha: CDP click via viewport coords (${clickX},${clickY})`);
-  const clickResult = await sendBgMessage({type: "cdp-click", x: clickX, y: clickY}).catch(() => null);
-  if (!clickResult?.ok) {
-    console.warn("[OctoProbe] cdp-click (recaptcha) failed:", clickResult?.error);
-    return null;
-  }
-
-  // Poll for token (pass) or challenge frame (image challenge → fall back to API solver).
-  const deadline = Date.now() + 15000;
-  while (Date.now() < deadline) {
-    await sleep(500);
-    const tokenEl = document.querySelector(
-      "textarea[name='g-recaptcha-response'], #g-recaptcha-response, #g-recaptcha-response-1"
-    );
-    if (tokenEl?.value?.length > 20) return tokenEl.value;
-    const challengeFrame = document.querySelector(
-      "iframe[src*='recaptcha/api2/bframe'], iframe[src*='recaptcha/enterprise/bframe']"
-    );
-    if (challengeFrame) {
-      _logEntry("captcha: challenge grid appeared — falling back to API solver");
-      return null;
-    }
-  }
-  return null; // 15 s timeout with no token
+  return null;
 }
+
 
 // Extract the reCAPTCHA site key from the current page.
 async function _extractSiteKey() {
@@ -730,15 +655,18 @@ async function _extractSiteKey() {
 // is a strong bot signal even if the token itself is valid.
 const _MIN_API_SOLVE_MS = 12000;
 
-// Session-random event names — fetched from background on first use to avoid detectable
-// static "octo-alert" / "octo-recaptcha-pass" strings in the DOM event namespace.
-let _evtAlert = "octo-alert";
-let _evtRcp   = "octo-recaptcha-pass";
-let _sessionSk = null;
+// Session-random event names — generated locally AND synced with background.
+// Never fall back to static "octo-*" strings — generate random names immediately.
+const _localSk   = Math.random().toString(36).slice(2, 10);
+let _evtAlert    = 'a' + _localSk;  // random at load — no static fingerprint
+let _evtRcp      = 'r' + _localSk;
+let _sessionSk   = _localSk;
 let _evtKeysReady = false;
 async function _ensureEvtKeys() {
   if (_evtKeysReady) return;
   const keys = await sendBgMessage({type: "get-session-keys"}).catch(() => null);
+  // Prefer background-generated keys (shared with inject-recaptcha-token handler);
+  // fall back to locally generated keys — never use static "octo-*" names.
   if (keys?.evtAlert) { _evtAlert = keys.evtAlert; _evtRcp = keys.evtRcp; }
   if (keys?.sk) _sessionSk = keys.sk;
   _evtKeysReady = true;
@@ -815,34 +743,10 @@ async function injectAlertCapture(confirmToo = false) {
     console.log(`[OctoProbe] alert${confirmToo ? "/confirm/prompt" : ""} suppressed (CSP-safe)`);
     return r;
   }
-  console.warn("[OctoProbe] scripting API injection failed:", r?.error, "— trying DOM fallback");
-  const _ea = _evtAlert;
-  const _fsk = _sessionSk ?? Math.random().toString(36).slice(2, 10);
-  const s = document.createElement("script");
-  s.textContent = `(function(confirmToo, evtAlert, sk){
-    var hk  = '_' + sk + 'h';
-    var ak  = '_' + sk + 'a';
-    var chk = '_' + sk + 'ch';
-    var ck  = '_' + sk + 'c';
-    if (!window[hk]) {
-      window[hk] = true;
-      window.alert = function(msg) {
-        window[ak] = String(msg);
-        document.dispatchEvent(new CustomEvent(evtAlert, {detail: {msg: String(msg)}}));
-      };
-    }
-    if (confirmToo && !window[chk]) {
-      window[chk] = true;
-      window.confirm = function(msg) {
-        window[ck] = String(msg);
-        document.dispatchEvent(new CustomEvent(evtAlert, {detail: {msg: String(msg)}}));
-        return true;
-      };
-      window.prompt = function(_msg, def) { return def != null ? def : ""; };
-    }
-  })(${confirmToo}, ${JSON.stringify(_ea)}, ${JSON.stringify(_fsk)})`;
-  (document.head || document.documentElement).appendChild(s);
-  s.remove();
+  // DOM <script> fallback removed: injecting a <script> tag into the page DOM is detectable
+  // via document.scripts enumeration and MutationObserver. If the scripting API fails,
+  // alerts will fire natively (browser default) — better than exposing an automation artifact.
+  console.warn("[OctoProbe] scripting API injection failed — alert capture skipped");
 }
 
 // ---------------------------------------------------------------------------
@@ -1880,11 +1784,13 @@ async function visaStepSchedule() {
   // the page context and kills the content script. Our override uses fetch() to
   // POST the same data and signals the result via postMessage.
   // FormData captures txthuman (filled by reCAPTCHA Enterprise) and back="" naturally.
+  // Use session-key-derived postMessage type so "octo-*" never appears in MAIN world
+  const _schedMsgType = 's' + _sessionSk;
   await _callPageFn(`
-    (function(){
+    (function(msgType, postoId){
       window.submitSlotsForm = async function() {
         var form = document.getElementById("vistoForm");
-        if (!form) { window.postMessage({type:"octo-sched-result",error:"no form"},"*"); return; }
+        if (!form) { window.postMessage({type:msgType,error:"no form"},"*"); return; }
         var fd   = new FormData(form);
         var body = new URLSearchParams({
           lang:       fd.get("lang")       ?? "ENG",
@@ -1893,9 +1799,8 @@ async function visaStepSchedule() {
           f_date_c:   fd.get("f_date_c")   ?? "",
           cmbPeriodo: fd.get("cmbPeriodo") ?? "",
         }).toString();
-        console.log("[OctoProbe] submitSlotsForm: posting to SubmeterVistoCriaPDF");
         try {
-          var resp = await fetch("/VistosOnline/SubmeterVistoCriaPDF?posto_id=${POSTO}", {
+          var resp = await fetch("/VistosOnline/SubmeterVistoCriaPDF?posto_id=" + postoId, {
             method:"POST", body:body,
             headers:{"Content-Type":"application/x-www-form-urlencoded","X-Requested-With":"XMLHttpRequest"},
             credentials:"include"
@@ -1903,16 +1808,16 @@ async function visaStepSchedule() {
           var ct = (resp.headers.get("content-type") ?? "").toLowerCase();
           if (ct.includes("pdf") || ct.includes("octet-stream")) {
             var blob = await resp.blob();
-            window.postMessage({type:"octo-sched-result", blobUrl:URL.createObjectURL(blob), isPdf:true}, "*");
+            window.postMessage({type:msgType, blobUrl:URL.createObjectURL(blob), isPdf:true}, "*");
           } else {
             var html = await resp.text();
-            window.postMessage({type:"octo-sched-result", html:html, isPdf:false}, "*");
+            window.postMessage({type:msgType, html:html, isPdf:false}, "*");
           }
         } catch(e) {
-          window.postMessage({type:"octo-sched-result", error:String(e)}, "*");
+          window.postMessage({type:msgType, error:String(e)}, "*");
         }
       };
-    })();
+    })(${JSON.stringify(_schedMsgType)}, ${JSON.stringify(POSTO)});
   `);
   await sleep(800 + Math.random() * 600);
 
@@ -1937,7 +1842,7 @@ async function visaStepSchedule() {
 
   // ── 12. Wait for booking confirmation from overridden submitSlotsForm ──────
   setBadge("Visa: waiting for booking confirmation…", "#9060cc");
-  const result = await _waitPageMessage("octo-sched-result", 45000);
+  const result = await _waitPageMessage(_schedMsgType, 45000);
   if (!result || result.error) {
     // Report failure to slot pool before exiting
     if (_chosenSlotKey) {
@@ -2481,18 +2386,33 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
   if (location.hostname !== TARGET_HOST) return;
 
-  // WAF bot-challenge — let bd.js run untouched; count consecutive hits to detect hard block.
+  // WAF bot-challenge — give bd.js time to fingerprint and auto-redirect.
+  // If bd.js passes: page navigates away, this context is destroyed, and content.js
+  // fires a normal page-ready on the destination. If bd.js fails: no redirect happens
+  // and we report waf-challenge after the dwell so background.js can abort.
   if (document.querySelector('script[src*="/ch/bd.js"]')) {
     const {"challenge-count": prev = 0} = await storageGet("challenge-count");
     const count = prev + 1;
     await storageSet({"challenge-count": count});
-    console.log(`[OctoProbe] Bot challenge page #${count} in sequence`);
+    console.log(`[OctoProbe] Bot challenge page #${count} — waiting 20s for bd.js auto-redirect`);
+    setBadge(`WAF challenge (${count}/2) — waiting…`, "#888888");
+
+    // Immediately notify background that a WAF challenge is in progress so it extends
+    // its waitForPageReady rather than timing out silently. Background only acts on this
+    // if the final "waf-challenge" fires after 20s (no redirect).
+    chrome.runtime.sendMessage({type: "page-ready", state: "waf-challenge-active", url: location.href}).catch(() => {});
+
+    // Dwell: bd.js fingerprints the browser and auto-redirects if it passes.
+    // If the page navigates (success), this setTimeout never fires — context is dead.
+    await new Promise(r => setTimeout(r, 20000));
+
+    // Still on the challenge page — bd.js did not redirect.
+    console.warn("[OctoProbe] WAF challenge not solved after 20s");
     if (count >= 2) {
-      console.warn("[OctoProbe] WAF challenge looped 2+ times — IP or profile flagged");
       await storageSet({"challenge-count": 0});
       setBadge("IP BLOCKED — switch proxy", "#ff0000");
     } else {
-      setBadge(`Bot challenge — waiting… (${count}/2)`, "#888888");
+      setBadge("WAF failed — reporting to bg", "#ff6b6b");
     }
     chrome.runtime.sendMessage({type: "page-ready", state: "waf-challenge", url: location.href}).catch(() => {});
     return;
@@ -2534,12 +2454,16 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 // ---------------------------------------------------------------------------
 
 function _installSlotsXhrHook() {
+  // Use session-key-derived names so no static "octo-*" or "__octo*" string appears in MAIN world.
+  const _hookFlag   = '_h' + _sessionSk;
+  const _slotsType  = '_s' + _sessionSk;
+
   // Run in MAIN world via executeScript so it can intercept page's own XHR instances.
   chrome.runtime.sendMessage({
     type: "exec-page-script",
-    code: `(function(){
-      if (window.__octoSlotsHooked) return;
-      window.__octoSlotsHooked = true;
+    code: `(function(hookFlag, msgType){
+      if (window[hookFlag]) return;
+      window[hookFlag] = true;
       var _open = XMLHttpRequest.prototype.open;
       XMLHttpRequest.prototype.open = function(method, url) {
         if (typeof url === "string" && url.includes("/VistosOnline/slots")) {
@@ -2559,19 +2483,19 @@ function _installSlotsXhrHook() {
                     if (t) slots.push({date: s.date, time: t});
                   }
                 }
-                if (slots.length) window.postMessage({type:"octo-slots-observed", postId, slots}, "*");
+                if (slots.length) window.postMessage({type:msgType, postId, slots}, "*");
               }
             } catch(_) {}
           });
         }
         return _open.apply(this, arguments);
       };
-    })();`,
+    })(${JSON.stringify(_hookFlag)}, ${JSON.stringify(_slotsType)});`,
   }).catch(() => {});
 
   // Forward postMessage observations to background
   window.addEventListener("message", (ev) => {
-    if (ev.source !== window || ev.data?.type !== "octo-slots-observed") return;
+    if (ev.source !== window || ev.data?.type !== _slotsType) return;
     chrome.runtime.sendMessage({
       type: "slot-observation",
       postId: ev.data.postId,

@@ -18,6 +18,7 @@ require('dotenv').config({ path: require('path').join(__dirname, '.env') });
  *   --octo-api-key <key>   Octo Browser API token            (default: env)
  *   --template    <uuid>   template profile UUID             (default: env)
  *   --trigger-mode <mode>  AUTO_TRIGGER | EXTERNAL_SIGNAL   (default: AUTO_TRIGGER)
+ *   --email-provider <p>  mailtm | cloudflare               (default: mailtm)
  *   --accounts    <file>   path to accounts CSV              (default: ./accounts.csv)
  *
  * Environment:
@@ -69,8 +70,9 @@ async function main() {
   const maxSessions = Number(args['max-sessions'] ?? 50);
   const intervalMs  = Number(args.interval         ?? 1_000);
   const consulPost  = args['consul-post']           ?? cfg.defaultConsulPost;
-  const triggerMode = args['trigger-mode']          ?? 'AUTO_TRIGGER';
-  const accountsCsv = args.accounts                 ?? cfg.accountsCsvPath;
+  const triggerMode   = args['trigger-mode']         ?? 'AUTO_TRIGGER';
+  const emailProvider = args['email-provider']       ?? 'mailtm';
+  const accountsCsv   = args.accounts                ?? cfg.accountsCsvPath;
 
   // Load proxy pool from file if specified
   let proxies = [];
@@ -106,6 +108,7 @@ async function main() {
   log.ginfo(`  intervalMs:   ${intervalMs}`);
   log.ginfo(`  consulPost:   ${consulPost}`);
   log.ginfo(`  triggerMode:  ${triggerMode}`);
+  log.ginfo(`  emailProvider:${emailProvider}`);
   if (workflow === 'csv-runtime') log.ginfo(`  accountsCsv:  ${accountsCsv}`);
   log.ginfo(`  port:         ${cfg.port}`);
   log.ginfo(`  octoLocalUrl: ${cfg.octoLocalUrl}`);
@@ -243,6 +246,7 @@ async function main() {
         intervalMs,
         consulPost,
         triggerMode,
+        emailProvider,
         proxies,
         templateUuids,
         maxWorkflowTimeoutMs:      cfg.maxWorkflowTimeoutMs,

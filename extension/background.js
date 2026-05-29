@@ -139,6 +139,77 @@ self._runLog = _runLog; // expose to communication.js (same SW scope, but const 
 })();
 
 function _pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+function _rand(n)   { return Math.floor(Math.random() * n); }
+
+// ---------------------------------------------------------------------------
+// Fake CPV person generator (used when manager does not supply realPerson)
+// ---------------------------------------------------------------------------
+
+const _FIRST_M = ["João","Carlos","Hélder","António","Manuel","Sérgio","Leandro","Dário","Orlando",
+                  "Arlindo","Paulo","Filipe","Osvaldo","Wilfredo","Adílson","Valdemar","Hailton",
+                  "Pedro","Rui","Nuno","Décio","Sandro","Edílson","Lúcio","Gilberto"];
+const _FIRST_F = ["Maria","Ana","Edna","Rosa","Lúcia","Eunice","Arminda","Sandra","Graça","Noemia",
+                  "Filomena","Carla","Nair","Isadora","Vera","Conceição","Milena","Suzete","Lisete",
+                  "Ercília","Anilsa","Dulce","Odete","Yara","Valdira"];
+const _LAST    = ["Semedo","Tavares","Correia","Lima","Varela","Monteiro","Évora","Fernandes",
+                  "Rodrigues","Furtado","Mendes","Barros","Cruz","Veiga","Delgado","Pires",
+                  "Andrade","Soares","Cardoso","Lopes","Brito","Gonçalves","Neves","Spencer",
+                  "Borges","Moreno","Duarte","Fontes","Mascarenhas","Santos"];
+const _PARTICLES = ["da","de","do","dos","das"];
+
+// Combining diacritical marks range U+0300–U+036F
+const _COMB = new RegExp("[\\u0300-\\u036f]","g");
+
+function _genGivenName(gender) {
+  const pool = gender === "M" ? _FIRST_M : _FIRST_F;
+  const a = _pick(pool);
+  const r = _rand(10);
+  if (r < 4) { let b = _pick(pool); if (b===a) b=_pick(pool); return `${a} ${b}`; }
+  if (r < 7) { const p=_pick(_PARTICLES); let b=_pick(pool); if(b===a)b=_pick(pool); return `${a} ${p} ${b}`; }
+  return a;
+}
+
+function _genSurname() {
+  const a = _pick(_LAST);
+  if (_rand(2)) { let b=_pick(_LAST); if(b===a)b=_pick(_LAST); return `${a} ${b}`; }
+  return a;
+}
+
+function _genPassword() {
+  const sp="!@#$%&*_+", di="0123456789", up="ABCDEFGHIJKLMNOPQRSTUVWXYZ", lo="abcdefghijklmnopqrstuvwxyz";
+  const all = sp+di+up+lo;
+  let c=[sp[_rand(sp.length)], di[_rand(di.length)], up[_rand(up.length)]];
+  for (let i=0;i<13;i++) c.push(all[_rand(all.length)]);
+  for (let i=c.length-1;i>0;i--) { const j=_rand(i+1); [c[i],c[j]]=[c[j],c[i]]; }
+  return c.join("");
+}
+
+function _genUsername(firstName, lastName) {
+  // Normalize accents (é→e, ã→a, ç→c) before extracting chars to avoid "srg" instead of "ser".
+  const norm = s => s.normalize("NFD").replace(_COMB,"").split(" ")[0].toLowerCase().replace(/[^a-z]/g,"");
+  const f = norm(firstName), l = norm(lastName);
+  return f.slice(0,3) + l.slice(0,3) + String(_rand(90000000)+10000000); // e.g. "serlim56027114"
+}
+
+function generatePerson() {
+  const gender    = _rand(2) === 0 ? "M" : "F";
+  const firstName = _genGivenName(gender);
+  const lastName  = _genSurname();
+  const year      = 1964 + _rand(41);
+  const month     = 1   + _rand(12);
+  const day       = 1   + _rand(28);
+  const pad       = n => String(n).padStart(2,"0");
+  return {
+    name:       firstName,
+    surname:    lastName,
+    username:   _genUsername(firstName, lastName),
+    password:   _genPassword(),
+    birth_date: `${year}/${pad(month)}/${pad(day)}`,
+    gender,
+    nationality: "CPV",
+    traveldoc:   _pick(["PA","PB","PC"]) + String(_rand(900000)+100000),
+  };
+}
 
 // Parse passport DOB strings into YYYY/MM/DD.
 // Handles: DD-MM-YYYY, DD/MM/YYYY, DD - MM - YYYY,
@@ -492,18 +563,11 @@ function _recaptchaInjectFunc(token, evtRcp) {
     ta.dispatchEvent(new Event("input",  {bubbles:true}));
     ta.dispatchEvent(new Event("change", {bubbles:true}));
   }
-  try {
-    function _native(fn, name) {
-      fn.toString = function() { return 'function ' + name + '() { [native code] }'; };
-      try { Object.defineProperty(fn, 'name', {value: name, configurable: true}); } catch(_) {}
-      return fn;
-    }
-    const _tok = token;
-    if (window.grecaptcha?.enterprise?.getResponse) window.grecaptcha.enterprise.getResponse = _native(function getResponse() { return _tok; }, 'getResponse');
-    if (window.grecaptcha?.getResponse)             window.grecaptcha.getResponse             = _native(function getResponse() { return _tok; }, 'getResponse');
-    if (window.grecaptcha?.enterprise?.execute)     window.grecaptcha.enterprise.execute      = _native(function execute() { return Promise.resolve(_tok); }, 'execute');
-    if (window.grecaptcha?.execute)                 window.grecaptcha.execute                 = _native(function execute() { return Promise.resolve(_tok); }, 'execute');
-  } catch(_) {}
+  // grecaptcha.getResponse / execute overrides removed:
+  // Setting these as own properties on the instance is detectable via
+  // Object.getOwnPropertyDescriptor(window.grecaptcha.enterprise, 'getResponse') returning
+  // a descriptor (real methods are prototype-inherited, so the descriptor is undefined).
+  // The textarea write + DFS callback walk below is sufficient to complete the solve.
   try {
     const _tok = token;
     const seen = new WeakSet();
@@ -518,9 +582,9 @@ function _recaptchaInjectFunc(token, evtRcp) {
       for (const v of Object.values(obj)) _findAndCallCb(v, depth + 1);
     }
     for (const client of Object.values(window.___grecaptcha_cfg?.clients ?? {})) _findAndCallCb(client, 0);
-    // Direct fallback: Enterprise clients use minified property names (not "callback"),
-    // so the traversal above may not fire onCaptchaSuccess. Call it directly if calendarDiv
-    // is still hidden after a short delay — runs within the same executeScript, no extra call.
+    // Direct fallback: fire onCaptchaSuccess if calendarDiv is still hidden.
+    // Randomize the delay (1.5–3s) — a fixed 400ms is a machine-regular timing signature.
+    var _cbDelay = 1500 + Math.floor(Math.random() * 1500);
     setTimeout(function() {
       try {
         const cal = document.getElementById("calendarDiv");
@@ -529,7 +593,7 @@ function _recaptchaInjectFunc(token, evtRcp) {
           window.onCaptchaSuccess(_tok);
         }
       } catch(_) {}
-    }, 400);
+    }, _cbDelay);
   } catch(_) {}
   try {
     const _anchor = document.querySelector("iframe[src*='recaptcha/api2/anchor'], iframe[src*='recaptcha/enterprise/anchor']");
@@ -567,6 +631,7 @@ async function _resetWorkflow() {
     "login-pending", "pending-account",
     "active-tab-id", "register-retried",
     "warmup-idle-state", "warmup-tab-id",
+    "challenge-count",
   ]);
 }
 
@@ -731,13 +796,30 @@ function _stopSwKeepalive()  {}
 // Minimal pre-session warmup — visits 2 real sites before the target.
 // Builds a browsing history entry so reCAPTCHA Enterprise sees a non-fresh session.
 // Sites are Google-affiliated (high trust) and topic-relevant (visa search).
-const _WARMUP_URLS = [
-  "https://www.google.com/search?q=apply+for+visa+portugal+schengen",
+// Warmup URL pool — pick 2 random sites each session.
+// Requirements: no Google affiliation, publicly accessible, high Alexa rank,
+// loads quickly, does not run reCAPTCHA itself.
+const _WARMUP_POOL = [
   "https://en.wikipedia.org/wiki/Visa_policy_of_Portugal",
+  "https://en.wikipedia.org/wiki/Schengen_Area",
+  "https://en.wikipedia.org/wiki/Portugal",
+  "https://www.bbc.com/news/world-europe",
+  "https://www.bbc.com/travel/article/20200127-visiting-portugal",
+  "https://www.reuters.com/world/europe/",
+  "https://www.theguardian.com/world/europe-news",
+  "https://en.wikipedia.org/wiki/Visa_requirements_for_Cape_Verdean_citizens",
 ];
 
+function _pickWarmupUrls() {
+  const pool = _WARMUP_POOL.slice();
+  const a = Math.floor(Math.random() * pool.length);
+  pool.splice(a, 1);
+  const b = Math.floor(Math.random() * pool.length);
+  return [_WARMUP_POOL[a], pool[b]];
+}
+
 async function F0_warmupBrowse(tabId) {
-  for (const url of _WARMUP_URLS) {
+  for (const url of _pickWarmupUrls()) {
     await chrome.tabs.update(tabId, {url});
     // Poll until the tab finishes loading (page-ready won't fire for non-target pages)
     await new Promise(resolve => {
@@ -761,14 +843,28 @@ async function F1_openAuthPage(tabId) {
 
   if (state !== "not-logged-in") {
     // Set up listener BEFORE navigation so page-ready can't arrive before we're listening.
-    const pageReady = waitForPageReady(tabId, 30000);
+    // 120s: each bd.js challenge dwell is 20s; 2 challenges + redirects + page loads ≈ 60–90s.
+    // The old 35s was too tight — bd1623aa showed 2 challenges consuming ~34s on a fast session.
+    const pageReady = waitForPageReady(tabId, 120000);
     await chrome.tabs.update(tabId, {url: TARGET_URL});
     ({state} = await pageReady);
   }
 
   if (state === "waf-challenge") {
-    const e = new Error("F1: WAF bot-challenge — IP or fingerprint flagged");
+    // content.js already waited 20s for bd.js to auto-redirect — it didn't.
+    const e = new Error("F1: WAF bot-challenge not resolved — IP or fingerprint flagged");
     e.proxyStatus = "blocked"; e.nextAction = "rotate_proxy"; throw e;
+  }
+
+  // waf-challenge-active = challenge is in progress; auto-redirect may still happen.
+  // Re-arm a fresh long wait so we don't miss the redirect completing.
+  if (state === "waf-challenge-active") {
+    const pr2 = waitForPageReady(tabId, 120000);
+    state = (await pr2.catch(() => ({state: "timeout"}))).state ?? "timeout";
+    if (state === "waf-challenge") {
+      const e = new Error("F1: WAF bot-challenge not resolved after extended wait");
+      e.proxyStatus = "blocked"; e.nextAction = "rotate_proxy"; throw e;
+    }
   }
 
   if (state === "auth") return {ok: true, status: "ready"};
@@ -784,14 +880,25 @@ async function F1_openAuthPage(tabId) {
       await new Promise(r => setTimeout(r, 1500 + attempt * 500));
       try { ({state} = await sendTabCmd(tabId, "cmd-get-state")); } catch (_) { state = "unknown"; }
       if (state === "auth") return {ok: true, status: "ready"};
-      if (state !== "not-logged-in") {
-        const pr = waitForPageReady(tabId, 30000);
+      // Don't re-navigate if we're off-site (SSO in progress) — just re-check state.
+      if (state !== "not-logged-in" && state !== "off-site") {
+        const pr = waitForPageReady(tabId, 120000);
         await chrome.tabs.update(tabId, {url: TARGET_URL});
         ({state} = await pr);
         if (state === "auth") return {ok: true, status: "ready"};
         if (state === "waf-challenge") {
           const e = new Error("F1: WAF bot-challenge — IP or fingerprint flagged");
           e.proxyStatus = "blocked"; e.nextAction = "rotate_proxy"; throw e;
+        }
+        if (state === "waf-challenge-active") {
+          // bd.js is running — wait for its auto-redirect
+          const prWaf = waitForPageReady(tabId, 120000);
+          state = (await prWaf.catch(() => ({state: "timeout"}))).state ?? "timeout";
+          if (state === "auth") return {ok: true, status: "ready"};
+          if (state === "waf-challenge") {
+            const e = new Error("F1: WAF bot-challenge — IP or fingerprint flagged");
+            e.proxyStatus = "blocked"; e.nextAction = "rotate_proxy"; throw e;
+          }
         }
       }
     }
@@ -812,15 +919,32 @@ async function F1_openAuthPage(tabId) {
     if (state === "auth") return {ok: true, status: "ready"};
 
     // Login-link click always navigates — arm listener first.
+    // If the site uses SSO (off-site auth), the click navigates to another domain and
+    // page-ready never fires.  In that case wait longer for the SSO to redirect back.
     const authReady = waitForPageReady(tabId, 20000);
     await sendTabCmd(tabId, "cmd-click-login-link").catch(() => {});
+    let authState;
     try {
-      const {state: authState} = await authReady;
-      if (authState === "auth") return {ok: true, status: "ready"};
-      state = authState;
+      ({state: authState} = await authReady);
     } catch (_) {
-      state = "timeout";
+      authState = "timeout";
     }
+    if (authState === "auth") return {ok: true, status: "ready"};
+
+    if (authState === "off-site" || authState === "timeout") {
+      // Login navigated off-site (SSO) or timed out — wait for the SSO to redirect back.
+      _runLog.entry(`F1: login led to ${authState} — waiting for SSO redirect (45s)`);
+      try {
+        const ssoReady = waitForPageReady(tabId, 45000);
+        ({state: authState} = await ssoReady);
+        if (authState === "auth") return {ok: true, status: "ready"};
+        if (authState === "not-logged-in") return {ok: true, status: "ready"}; // SSO returned to home
+      } catch (_) {
+        authState = "sso-timeout";
+      }
+    }
+
+    state = authState;
     _runLog.entry(`F1: attempt ${attempt + 1} got state=${state} — retrying`);
   }
   const _f1e = new Error(`F1: expected auth, got ${state}`);
@@ -829,7 +953,13 @@ async function F1_openAuthPage(tabId) {
 
 async function F2_register(tabId, person, emailAcct) {
   _runLog.entry(`F2: person=${person.name} ${person.surname} email=${emailAcct.email}`);
-  await sendTabCmd(tabId, "cmd-register-open-form");
+  // cmd-register-open-form clicks the register link which navigates the page.
+  // The navigation destroys the content script mid-response, so Chrome fires
+  // "message channel closed" — this is expected, not an error.
+  await sendTabCmd(tabId, "cmd-register-open-form").catch(e => {
+    if (!String(e).includes("message channel closed")) throw e;
+    // port closed = page navigated = form is opening on the new page
+  });
   _runLog.entry("F2: form opened");
   const fillResult = await sendTabCmd(tabId, "cmd-register-fill", {person, email: emailAcct.email});
   if (fillResult?.status === "form_incomplete") {
@@ -1058,27 +1188,19 @@ function _sendStatusUpdate(state) {
 }
 
 function F6_keepSession(tabId, idleStep) {
-  if (_f6Interval) clearInterval(_f6Interval);
-  // Jitter interval by idle position to prevent thundering-herd refreshes.
-  // schedule: 15–25s  |  form: 40–60s  |  login / default: 90–120s
+  if (_f6Interval) clearTimeout(_f6Interval);
+  // Use a truly random interval (60–180s) with no fixed base per idle state.
+  // Fixed base values (15/40/90s ± jitter) created a statistically detectable
+  // pattern — statistical analysis of request inter-arrival times would flag it.
+  function _nextMs() { return 60000 + Math.random() * 120000; } // 1–3 min, uniform
   const _f6Tick = () => {
     sendTabCmd(tabId, "cmd-keep-tick").catch(() => {});
-    // Re-arm post monitor on each tick when in form-monitor idle (for fresh options load)
-    chrome.storage.local.get(["warmup-idle-state"]).then(d => {
-      if (d["warmup-idle-state"] === "form-monitor")
-        sendTabCmd(tabId, "cmd-start-post-monitor").catch(() => {});
-    });
-    // Reschedule with fresh jitter each tick
     if (_f6Interval) {
-      clearInterval(_f6Interval);
-      const base   = idleStep === "schedule" ? 15000 : idleStep === "form" ? 40000 : 90000;
-      const jitter = Math.random() * base * 0.5;
-      _f6Interval  = setTimeout(_f6Tick, base + jitter);
+      clearTimeout(_f6Interval);
+      _f6Interval = setTimeout(_f6Tick, _nextMs());
     }
   };
-  const base   = idleStep === "schedule" ? 15000 : idleStep === "form" ? 40000 : 90000;
-  const jitter = Math.random() * base * 0.5;
-  _f6Interval = setTimeout(_f6Tick, base + jitter);
+  _f6Interval = setTimeout(_f6Tick, _nextMs());
 }
 
 function stopF6() {
@@ -1227,22 +1349,25 @@ async function F_allInOne(config) {
   stopF6();
   await _resetWorkflow();
 
-  // Build person data from the manager-supplied realPerson payload.
+  // Build person data. Use manager-supplied realPerson if provided; fall back to local generator.
   const rp = config.realPerson;
-  if (!rp) throw new Error('F_allInOne: realPerson is required');
-  const gRaw = String(rp.gender ?? "").trim().toUpperCase();
-  const person = {
-    name:        String(rp.firstName ?? "").trim(),
-    surname:     String(rp.lastName  ?? "").trim(),
-    username:    String(rp.username  ?? "").trim(),
-    password:    String(rp.password  ?? "").trim(),
-    birth_date:  _parseDOB(rp.dob),
-    gender:      gRaw === "F" || gRaw === "FEMALE" || gRaw === "FEMININO" ? "F" : "M",
-    nationality: String(rp.nationality ?? "CPV").trim(),
-    traveldoc:   String(rp.traveldoc  ?? "").trim(),
-  };
-  if (!person.username || !person.password) {
-    throw new Error('F_allInOne: username and password are required in realPerson');
+  let person;
+  if (rp && (rp.firstName || rp.name)) {
+    const gRaw = String(rp.gender ?? "").trim().toUpperCase();
+    const firstName = String(rp.firstName ?? rp.name ?? "").trim();
+    const lastName  = String(rp.lastName  ?? rp.surname ?? "").trim();
+    person = {
+      name:        firstName,
+      surname:     lastName,
+      username:    String(rp.username ?? "").trim() || _genUsername(firstName, lastName),
+      password:    String(rp.password ?? "").trim() || _genPassword(),
+      birth_date:  _parseDOB(rp.dob ?? rp.birth_date),
+      gender:      gRaw === "F" || gRaw === "FEMALE" || gRaw === "FEMININO" ? "F" : "M",
+      nationality: String(rp.nationality ?? "CPV").trim(),
+      traveldoc:   String(rp.traveldoc  ?? "").trim(),
+    };
+  } else {
+    person = generatePerson();
   }
   const _supplied = config.emailAccount ?? config.emailAcct;
   const emailAcct = _supplied?.email
@@ -1419,16 +1544,8 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 });
 
-// Attach the extension debugger to a tab, run fn(), then detach — always in a finally
-// so the debugger is released even when fn() throws.
-async function _withDebugger(tabId, fn) {
-  await chrome.debugger.attach({tabId}, "1.3");
-  try {
-    return await fn();
-  } finally {
-    await chrome.debugger.detach({tabId}).catch(() => {});
-  }
-}
+// _withDebugger removed: chrome.debugger.attach creates a measurable timing spike
+// in performance.timing that bd.js detects. CDP-based clicks are no longer used.
 
 const _MSG_HANDLERS = {
 
@@ -1630,25 +1747,34 @@ const _MSG_HANDLERS = {
       args: [!!msg.confirmToo, _SK, _EVT_ALERT],
       func: (confirmToo, sk, evtAlert) => {
         function _native(fn, name) {
-          fn.toString = function() { return 'function ' + name + '() { [native code] }'; };
-          try { Object.defineProperty(fn, 'name', {value: name, configurable: true}); } catch(_) {}
+          // Use non-enumerable, non-configurable toString so getOwnPropertyDescriptor(fn,'toString')
+          // returns undefined — matching real native behaviour.
+          try {
+            Object.defineProperty(fn, 'toString', {
+              value: function() { return 'function ' + name + '() { [native code] }'; },
+              writable: false, enumerable: false, configurable: false,
+            });
+            Object.defineProperty(fn, 'name', {value: name, writable: false, enumerable: false, configurable: true});
+          } catch(_) {}
           return fn;
         }
-        const _hookedKey = '_' + sk + 'h';
-        const _alertKey  = '_' + sk + 'a';
+        const _hookedKey  = '_' + sk + 'h';
+        const _alertKey   = '_' + sk + 'a';
         const _cHookedKey = '_' + sk + 'ch';
-        const _cKey = '_' + sk + 'c';
+        const _cKey       = '_' + sk + 'c';
         if (!window[_hookedKey]) {
-          window[_hookedKey] = true;
+          // Store the hook flag as a non-enumerable property — won't appear in Object.keys(window)
+          // or Object.getOwnPropertyNames(window), reducing fingerprint surface.
+          try { Object.defineProperty(window, _hookedKey, {value: true, writable: false, enumerable: false, configurable: false}); } catch(_) { window[_hookedKey] = true; }
           window.alert = _native(function alert(m) {
-            window[_alertKey] = String(m);
+            try { Object.defineProperty(window, _alertKey, {value: String(m), writable: true, enumerable: false, configurable: true}); } catch(_) { window[_alertKey] = String(m); }
             document.dispatchEvent(new CustomEvent(evtAlert, {detail: {msg: String(m)}}));
           }, 'alert');
         }
         if (confirmToo && !window[_cHookedKey]) {
-          window[_cHookedKey] = true;
+          try { Object.defineProperty(window, _cHookedKey, {value: true, writable: false, enumerable: false, configurable: false}); } catch(_) { window[_cHookedKey] = true; }
           window.confirm = _native(function confirm(m) {
-            window[_cKey] = String(m);
+            try { Object.defineProperty(window, _cKey, {value: String(m), writable: true, enumerable: false, configurable: true}); } catch(_) { window[_cKey] = String(m); }
             document.dispatchEvent(new CustomEvent(evtAlert, {detail: {msg: String(m)}}));
             return true;
           }, 'confirm');
@@ -1776,24 +1902,8 @@ const _MSG_HANDLERS = {
     return true;
   },
 
-  "cdp-click": (msg, sender, respond) => {
-    const tabId = sender.tab?.id;
-    if (!tabId) { respond({ok: false, error: "no sender tab"}); return; }
-    _withDebugger(tabId, async () => {
-      const {x, y} = msg;
-      const base = {x, y, modifiers: 0};
-      await chrome.debugger.sendCommand({tabId}, "Input.dispatchMouseEvent",
-        {...base, type: "mouseMoved", button: "none", clickCount: 0, buttons: 0});
-      await new Promise(r => setTimeout(r, 40 + Math.random() * 60));
-      await chrome.debugger.sendCommand({tabId}, "Input.dispatchMouseEvent",
-        {...base, type: "mousePressed", button: "left", clickCount: 1, buttons: 1});
-      await new Promise(r => setTimeout(r, 80 + Math.random() * 100));
-      await chrome.debugger.sendCommand({tabId}, "Input.dispatchMouseEvent",
-        {...base, type: "mouseReleased", button: "left", clickCount: 1, buttons: 0});
-    }).then(() => respond({ok: true}))
-      .catch(e => { console.warn("[OctoProbe BG] CDP click failed:", e.message); respond({ok: false, error: String(e)}); });
-    return true;
-  },
+  // cdp-click removed: chrome.debugger.attach creates a detectable latency spike
+  // in performance.timing. CDP mouse events are no longer used for reCAPTCHA.
 
   "get-recaptcha-sitekey": (_msg, sender, respond) => {
     const tabId = sender.tab?.id;

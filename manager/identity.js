@@ -81,11 +81,24 @@ function genTraveldoc() {
   return prefix + digits;
 }
 
+// Combining diacritical marks range U+0300–U+036F (produced by NFD decomposition).
+// Using RegExp constructor so the \u escapes are unambiguous in any text encoding.
+const _COMBINING = new RegExp('[\\u0300-\\u036f]', 'g');
+
+function _stripAccents(s) {
+  // NFD splits e.g. "é" into "e" + combining acute; stripping the combining mark leaves "e".
+  return s.normalize('NFD').replace(_COMBINING, '');
+}
+
 function genUsername(firstName, lastName) {
-  const f = firstName.split(' ')[0].toLowerCase().replace(/[^a-z]/g, '');
-  const l = lastName.split(' ')[0].toLowerCase().replace(/[^a-z]/g, '');
+  // Normalize accents first so é→e, ã→a, ç→c, etc. before stripping non-alpha.
+  // Without normalization: "Sérgio" → lowercase "sérgio" → strip non-a-z → "srgio" → slice "srg"
+  // With normalization:    "Sérgio" → NFD "sérgio" → strip marks "sergio" → slice "ser"  ✓
+  const norm = s => _stripAccents(s.split(' ')[0]).toLowerCase().replace(/[^a-z]/g, '');
+  const f = norm(firstName);
+  const l = norm(lastName);
   const n = String(rand(90000000) + 10000000);
-  return (f.slice(0,3) + l.slice(0,3) + n).slice(0, 20);
+  return f.slice(0,3) + l.slice(0,3) + n; // "serlim56027114" format (14 chars)
 }
 
 /**
