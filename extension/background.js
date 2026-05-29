@@ -3,18 +3,34 @@
 importScripts('communication.js');
 
 // Load static config into storage so CF email settings are available without popup interaction.
-(async () => {
+async function _loadExtensionConfig() {
   try {
-    const cfg = await fetch(chrome.runtime.getURL("config.json")).then(r => r.json());
+    const cfg = await fetch(chrome.runtime.getURL("config.json")).then(r => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json();
+    });
     const update = {};
     if (cfg.cfMailDomain)   update["cf-mail-domain"]   = cfg.cfMailDomain;
     if (cfg.cfWorkerUrl)    update["cf-worker-url"]    = cfg.cfWorkerUrl;
     if (cfg.cfWorkerSecret) update["cf-worker-secret"] = cfg.cfWorkerSecret;
     if (Object.keys(update).length) await chrome.storage.local.set(update);
+    return cfg;
   } catch (e) {
     console.warn("[OctoProbe] config.json CF load failed:", e);
+    return null;
   }
-})();
+}
+
+async function _ensureCfEmailConfig() {
+  const stored = await chrome.storage.local.get(["cf-mail-domain", "cf-worker-url", "cf-worker-secret"]);
+  if (String(stored["cf-mail-domain"] ?? "").trim()) return stored;
+  await _loadExtensionConfig();
+  return chrome.storage.local.get(["cf-mail-domain", "cf-worker-url", "cf-worker-secret"]);
+}
+
+self._ensureCfEmailConfig = _ensureCfEmailConfig;
+
+(async () => { await _loadExtensionConfig(); })();
 
 const TARGET_URL  = "https://pedidodevistos.mne.gov.pt/VistosOnline/";
 const TARGET_HOST = new URL(TARGET_URL).hostname;
@@ -315,8 +331,16 @@ async function _pollMailTM(jwt) {
 // jwt field stores the local part of the email address (the polling key).
 
 async function _createCloudflareMail() {
+  await _ensureCfEmailConfig();
   const {"cf-mail-domain": domain} = await chrome.storage.local.get("cf-mail-domain");
-  if (!domain) throw new Error("Cloudflare email domain not configured (cf-mail-domain)");
+  if (!String(domain ?? "").trim()) {
+    const err = new Error(
+      "Cloudflare email domain not configured — set cfMailDomain in octo_signal/extension/config.json (copy config.json.example), rebuild the extension, or let the hub send cfDomain on the register command",
+    );
+    err.proxyStatus = "email_provider_error";
+    err.nextAction = "rotate_proxy";
+    throw err;
+  }
   const local = Math.random().toString(36).slice(2, 12);
   const email = `${local}@${domain}`;
   return {email, password: "", jwt: email};  // jwt = full address used as polling key
@@ -1186,16 +1210,16 @@ async function F_allInOne(config) {
     nationality: String(rp.nationality ?? "CPV").trim(),
     traveldoc:   String(rp.traveldoc  ?? "").trim(),
   };
-  // Re-randomize the numeric suffix on every call — the manager sends the same realPerson
-  // payload on all retries, so the same base username would be reused and the server
-  // would reject attempt 2+ with "Invalid username" (account already exists).
-  const _uBase = person.username.replace(/\d+$/, "") ||
-    (person.name.slice(0, 3) + person.surname.slice(0, 3)).toLowerCase().replace(/[^a-z]/g, "");
-  person.username = _uBase + Math.floor(10000000 + Math.random() * 90000000);
-  // Use manager-supplied email account if provided; otherwise create one on-demand.
-  const _supplied = config.emailAcct;
-  const emailAcct = (_supplied?.email && _supplied?.password && _supplied?.jwt)
-    ? { email: _supplied.email, password: _supplied.password, jwt: _supplied.jwt }
+  if (!person.username || !person.password) {
+    throw new Error('F_allInOne: username and password are required in realPerson');
+  }
+  const _supplied = config.emailAccount ?? config.emailAcct;
+  const emailAcct = _supplied?.email
+    ? {
+        email: _supplied.email,
+        password: _supplied.password ?? "",
+        jwt: _supplied.jwt ?? _supplied.email,
+      }
     : await createTempEmail().catch(err => {
         err.proxyStatus = err.proxyStatus ?? "email_provider_error";
         err.nextAction  = err.nextAction  ?? "rotate_proxy";
@@ -1280,7 +1304,7 @@ function _runDispatchAbort() {
 }
 
 
-function _runRegister(realPerson) {
+function _runRegister(realPerson, emailAccount) {
   (async () => {
     let tabId;
     try {
@@ -1301,9 +1325,18 @@ function _runRegister(realPerson) {
         nationality: String(realPerson.nationality ?? "").trim(),
         traveldoc:   String(realPerson.traveldoc  ?? "").trim(),
       };
+      if (!person.username || !person.password) {
+        throw new Error('_runRegister: username and password are required in realPerson');
+      }
       _runLog.entry(`person: ${person.name} ${person.surname} ${person.nationality} ${person.traveldoc}`);
-      const emailAcct = await createTempEmail();
-      _runLog.entry(`email created: ${emailAcct.email}`);
+      const emailAcct = emailAccount?.email
+        ? {
+            email: emailAccount.email,
+            password: emailAccount.password ?? "",
+            jwt: emailAccount.jwt ?? emailAccount.email,
+          }
+        : await createTempEmail();
+      _runLog.entry(`email: ${emailAcct.email}`);
       await chrome.storage.local.set({
         "register-person":  person,
         "register-email":   emailAcct,
@@ -1317,7 +1350,12 @@ function _runRegister(realPerson) {
       self.Comm?.send({type: "register-done", ...r, email: emailAcct.email, username: person.username, password: person.password});
     } catch(e) {
       await _runLog.finish(`error: ${e.message ?? String(e)}`);
-      self.Comm?.send({type: "error", reason: e.message ?? String(e)});
+      self.Comm?.send({
+        type: "error",
+        reason: e.message ?? String(e),
+        proxyStatus: e.proxyStatus ?? null,
+        nextAction: e.nextAction ?? null,
+      });
     } finally {
       _stopSwKeepalive();
       if (tabId) chrome.tabs.remove(tabId).catch(() => {});

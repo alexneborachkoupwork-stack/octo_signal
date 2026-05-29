@@ -34,6 +34,13 @@ def build():
         import subprocess, sys
         subprocess.check_call([sys.executable, os.path.join(SRC_DIR, "gen_icons.py")])
 
+    config_path = os.path.join(SRC_DIR, "config.json")
+    if not os.path.exists(config_path):
+        example = os.path.join(SRC_DIR, "config.json.example")
+        print("\nWARNING: extension/config.json is missing.")
+        print("  Cloudflare email requires cfMailDomain, cfWorkerUrl, cfWorkerSecret.")
+        print(f"  Copy {example} → {config_path} and fill in your values.\n")
+
     os.makedirs(OUT_DIR, exist_ok=True)
 
     if os.path.exists(out_file):
