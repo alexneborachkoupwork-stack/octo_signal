@@ -184,9 +184,10 @@ self.Comm = (() => {
       }
       if (Object.keys(su).length) await chrome.storage.local.set(su);
       F_allInOne({
-        realPerson: normalized.realPerson,
+        realPerson:  normalized.realPerson,
+        emailAcct:   normalized.emailAcct,
         arrivalDate: normalized.arrivalDate,
-        consulPost: normalized.consulPost,
+        consulPost:  normalized.consulPost,
       })
         .then((r) => {
           // Only assert proxyStatus:"ok" on genuine success — don't misreport when F5 fails.

@@ -425,6 +425,9 @@ function setBadge() {}
 // ---------------------------------------------------------------------------
 
 async function switchToEnglish() {
+  const {"lang-switch-enabled": enabled = false} = await storageGet("lang-switch-enabled");
+  if (!enabled) { console.log("[OctoProbe] Lang switch disabled — skipping."); return; }
+
   await sleep(300);
   const langSel = await waitFor(
     () => LANG_SELECTORS.map(s => document.querySelector(s)).find(Boolean),

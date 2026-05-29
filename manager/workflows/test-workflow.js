@@ -1,6 +1,7 @@
 'use strict';
 
 const { generatePerson } = require('../identity');
+const { createAccount }  = require('../mailtm');
 const log = require('../logger');
 
 /**
@@ -127,9 +128,20 @@ class TestWorkflow {
 
     log.ginfo(`TestWorkflow: session #${idx}  person=${person.firstName} ${person.lastName}  proxy=${proxy?.host ?? 'none'}  template=${templateUuid ?? 'none'}`);
 
+    const emailAcct = await createAccount().catch(err => {
+      log.gerror(`TestWorkflow: mail.tm account creation failed for session #${idx}:`, err.message);
+      throw err;
+    });
+    log.ginfo(`TestWorkflow: session #${idx}  email=${emailAcct.email}`);
+
     const payload = {
       consulPost:    this._consulPost,
       captchaSolver: 'capsolver',
+      emailAcct: {
+        email:    emailAcct.email,
+        password: emailAcct.password,
+        jwt:      emailAcct.jwt,
+      },
       realPerson: {
         firstName:   person.firstName,
         lastName:    person.lastName,

@@ -757,10 +757,15 @@ async function F1_openAuthPage(tabId) {
     }
 
     // Language switch may reload the page — 15 s gives ample room past the reload time.
-    const langCmd = sendTabCmd(tabId, "cmd-switch-lang").catch(() => {});
-    const langReady = waitForPageReady(tabId, 15000);
-    await langCmd;
-    await langReady.catch(() => {}); // ignore timeout (already English) or navigation
+    // Skipped entirely when lang-switch-enabled is false (default) to avoid the 15 s wait.
+    const {"lang-switch-enabled": _langEnabled = false} =
+      await chrome.storage.local.get("lang-switch-enabled");
+    if (_langEnabled) {
+      const langCmd = sendTabCmd(tabId, "cmd-switch-lang").catch(() => {});
+      const langReady = waitForPageReady(tabId, 15000);
+      await langCmd;
+      await langReady.catch(() => {}); // ignore timeout (already English) or navigation
+    }
 
     // Confirm still on not-logged-in before arming the login listener.
     try { ({state} = await sendTabCmd(tabId, "cmd-get-state")); } catch (_) { state = "unknown"; }
@@ -1157,11 +1162,15 @@ async function F_allInOne(config) {
   const _uBase = person.username.replace(/\d+$/, "") ||
     (person.name.slice(0, 3) + person.surname.slice(0, 3)).toLowerCase().replace(/[^a-z]/g, "");
   person.username = _uBase + Math.floor(10000000 + Math.random() * 90000000);
-  const emailAcct = await createTempEmail().catch(err => {
-    err.proxyStatus = err.proxyStatus ?? "email_provider_error";
-    err.nextAction  = err.nextAction  ?? "rotate_proxy";
-    throw err;
-  });
+  // Use manager-supplied email account if provided; otherwise create one on-demand.
+  const _supplied = config.emailAcct;
+  const emailAcct = (_supplied?.email && _supplied?.password && _supplied?.jwt)
+    ? { email: _supplied.email, password: _supplied.password, jwt: _supplied.jwt }
+    : await createTempEmail().catch(err => {
+        err.proxyStatus = err.proxyStatus ?? "email_provider_error";
+        err.nextAction  = err.nextAction  ?? "rotate_proxy";
+        throw err;
+      });
   await chrome.storage.local.set({
     "register-person":  person,
     "register-email":   emailAcct,
