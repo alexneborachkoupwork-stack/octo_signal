@@ -80,29 +80,36 @@ function _normalize(str) {
 }
 
 /**
- * Generate a deterministic-ish username + random-suffix password for an account.
- * username: firstNameWord1.lastNameLastWord + passport_last4
- * password: 12-char mix — uppercase + lowercase + digit + special + random fill
+ * Generate credentials compliant with E-VISA rules:
+ *   username: alphanumeric only (no spaces, no special chars)
+ *   password: min 14 chars, at least 1 uppercase, 1 digit, 1 special char
  */
 function generateCredentials(rec) {
-  const fnWord  = _normalize(rec.firstName.trim().split(/\s+/)[0]);
+  const fnWord  = _normalize(rec.firstName.trim().split(/\s+/)[0]).slice(0, 4);
   const lnWords = rec.lastName.trim().split(/\s+/);
-  const lnWord  = _normalize(lnWords[lnWords.length - 1]);
-  const ppSufx  = (rec.passportNumber ?? '').slice(-4).padStart(4, '0');
+  const lnWord  = _normalize(lnWords[lnWords.length - 1]).slice(0, 4);
+  const ppSufx  = (rec.passportNumber ?? '').replace(/[^a-z0-9]/gi, '').slice(-4).padStart(4, '0');
 
-  const username = `${fnWord}.${lnWord}${ppSufx}`;
+  // No dots or special chars — only lowercase letters + digits
+  const username = `${fnWord}${lnWord}${ppSufx}`;
 
-  // Build a 12-char password: 1 upper, 1 lower, 1 digit, 1 special, 8 random lower/digit
+  // 14-char password: 1 upper + 1 lower + 1 digit + 1 special + 10 random lower/digit
   const pool = CHARS_LOWER + CHARS_LOWER + CHARS_DIGIT + CHARS_DIGIT;
   let fill = '';
-  for (let i = 0; i < 8; i++) fill += _randomFrom(pool);
-  const password = [
+  for (let i = 0; i < 10; i++) fill += _randomFrom(pool);
+  const chars = [
     _randomFrom(CHARS_UPPER),
     _randomFrom(CHARS_LOWER),
     _randomFrom(CHARS_DIGIT),
     _randomFrom(CHARS_SPEC),
     ...fill,
-  ].join('');
+  ];
+  // Shuffle so required chars aren't always at the front
+  for (let i = chars.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [chars[i], chars[j]] = [chars[j], chars[i]];
+  }
+  const password = chars.join('');
 
   return { username, password };
 }
