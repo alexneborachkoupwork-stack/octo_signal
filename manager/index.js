@@ -29,6 +29,8 @@ const log            = require('./logger');
 const OctoApi        = require('./octo-api');
 const HubServer      = require('./hub-server');
 const SessionManager = require('./session-manager');
+const { SlotPool }     = require('./slot-pool');
+const { WorkflowChain } = require('./workflow-chain');
 const { TestWorkflow } = require('./workflows/test-workflow');
 
 // ── CLI argument parser ───────────────────────────────────────────────────────
@@ -104,7 +106,9 @@ async function main() {
 
   const octoApi        = new OctoApi({ localUrl: cfg.octoLocalUrl, cloudUrl: cfg.octoCloudUrl, apiKey: cfg.octoApiKey });
   const hubServer      = new HubServer(cfg);
-  const sessionManager = new SessionManager({ config: cfg, octoApi, hubServer });
+  const slotPool       = new SlotPool();
+  hubServer.setSlotPool(slotPool);
+  const sessionManager = new SessionManager({ config: cfg, octoApi, hubServer, slotPool });
 
   await hubServer.start();
   log.ginfo(`Hub server ready on ws://localhost:${cfg.port}/ext`);
@@ -114,6 +118,7 @@ async function main() {
   async function shutdown(signal) {
     log.ginfo(`\nReceived ${signal} — shutting down`);
     await sessionManager.stopAll().catch(() => {});
+    slotPool.destroy();
     await hubServer.stop().catch(() => {});
     process.exit(0);
   }
@@ -156,6 +161,44 @@ async function main() {
     const proxy   = proxies[0] ?? null;
     const session = sessionManager.createSession('apply', buildApplyPayload(), proxy);
     await session.start();
+
+  } else if (workflow === 'chain') {
+    // Multi-step chain: register → sleep → warmup-idle → apply
+    // Runs a single chain by default; use --max-sessions for concurrent chains.
+    const { generatePerson } = require('./identity');
+    const { createAccount }  = require('./mailtm');
+    const chains = [];
+    const chainCount = maxSessions > 0 ? maxSessions : 1;
+    for (let i = 0; i < chainCount; i++) {
+      const person    = generatePerson();
+      const emailAcct = await createAccount().catch(err => {
+        log.gerror(`Failed to create mail.tm account for chain #${i+1}:`, err.message);
+        throw err;
+      });
+      const proxy     = proxies[i % Math.max(proxies.length, 1)] ?? null;
+      const template  = templateUuids[i % Math.max(templateUuids.length, 1)] ?? null;
+      const chain = new WorkflowChain({
+        sessionManager,
+        octoApi,
+        config: cfg,
+        payload: {
+          realPerson: person,
+          emailAcct,
+          consulPost,
+          captchaSolver: 'capsolver',
+          proxies: proxy ? [proxy] : [],
+        },
+        templateUuid: template,
+        sleepMs: 90_000,
+      });
+      chain.on('step',   (s) => log.ginfo(`Chain #${i+1}: step=${s}`));
+      chain.on('done',   (r) => log.ginfo(`Chain #${i+1}: DONE  ok=${r.ok}`));
+      chain.on('failed', (e) => log.gerror(`Chain #${i+1}: FAILED  reason=${e}`));
+      chains.push(chain.run().catch(e => log.gerror(`Chain #${i+1} threw:`, e.message)));
+      if (intervalMs > 0 && i < chainCount - 1) await new Promise(r => setTimeout(r, intervalMs));
+    }
+    await Promise.all(chains);
+    await shutdown('workflow-done');
 
   } else {
     log.gerror(`Unknown workflow: ${workflow}`);

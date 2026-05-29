@@ -41,6 +41,12 @@ class HubServer extends EventEmitter {
     this._httpServer = null;
     this._wss        = null;
     this._pingInterval = null;
+    this._slotPool   = null; // set by setSlotPool() after construction
+  }
+
+  /** Attach the shared SlotPool so /metrics can include slot stats. */
+  setSlotPool(pool) {
+    this._slotPool = pool;
   }
 
   start() {
@@ -52,6 +58,20 @@ class HubServer extends EventEmitter {
         if (url.pathname.includes('worker-init')) {
           res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
           res.end(WORKER_INIT_HTML);
+          return;
+        }
+
+        if (url.pathname === '/metrics') {
+          try {
+            const metrics  = require('./metrics');
+            const slotPool = this._slotPool ?? null;
+            const body = JSON.stringify(metrics.snapshot(slotPool), null, 2);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(body);
+          } catch (e) {
+            res.writeHead(500);
+            res.end(JSON.stringify({ error: e.message }));
+          }
           return;
         }
 

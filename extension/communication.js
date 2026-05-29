@@ -11,6 +11,9 @@ self.Comm = (() => {
   let _botId = null; // set by connectHub(), included in every outbound message
   let _generation = 0; // incremented on every connect() call; stale onclose handlers compare against this
 
+  // Pending slot-assignment-request: only one outstanding at a time.
+  let _pendingSlotAssignment = null;
+
   function send(data) {
     if (_ws && _ws.readyState === WebSocket.OPEN) {
       try {
@@ -83,6 +86,16 @@ self.Comm = (() => {
 
     if (type === "ping") {
       send({ type: "pong" });
+      return;
+    }
+
+    // Manager reply to a slot-assignment-request forwarded from background.js
+    if (type === "slot-assignment") {
+      if (_pendingSlotAssignment) {
+        clearTimeout(_pendingSlotAssignment.timer);
+        _pendingSlotAssignment.resolve(normalized);
+        _pendingSlotAssignment = null;
+      }
       return;
     }
 
@@ -335,7 +348,29 @@ self.Comm = (() => {
     }).catch(() => {});
   }
 
-  return { connect, connectHub, disconnect, send, isConnected, reconnectIfNeeded, dispatch: _handleCommand, getBotId: () => _botId };
+  /**
+   * Forward a slot-assignment-request to the manager and await the reply.
+   * Resolves with the assignment object or rejects after timeoutMs.
+   * Only one pending request at a time — a second call cancels the previous.
+   */
+  function requestSlotAssignment(payload, timeoutMs = 3000) {
+    return new Promise((resolve, reject) => {
+      // Cancel any previous pending request
+      if (_pendingSlotAssignment) {
+        clearTimeout(_pendingSlotAssignment.timer);
+        _pendingSlotAssignment.reject(new Error('superseded'));
+        _pendingSlotAssignment = null;
+      }
+      const timer = setTimeout(() => {
+        _pendingSlotAssignment = null;
+        reject(new Error('slot-assignment timeout'));
+      }, timeoutMs);
+      _pendingSlotAssignment = { resolve, reject, timer };
+      send({ type: 'slot-assignment-request', ...payload });
+    });
+  }
+
+  return { connect, connectHub, disconnect, send, isConnected, reconnectIfNeeded, dispatch: _handleCommand, getBotId: () => _botId, requestSlotAssignment };
 })();
 
 // Prefer hub session from worker-init; fall back to config.json for standalone popup testing.

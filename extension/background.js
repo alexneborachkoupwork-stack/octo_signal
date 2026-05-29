@@ -487,9 +487,25 @@ function _recaptchaInjectFunc(token, evtRcp) {
       if (!obj || depth > 8 || typeof obj !== "object" || seen.has(obj)) return;
       seen.add(obj);
       if (typeof obj.callback === "function") { try { obj.callback(_tok); } catch(_) {} }
+      // Enterprise may store data-callback as a string name rather than a resolved function ref
+      if (typeof obj.callback === "string" && typeof window[obj.callback] === "function") {
+        try { window[obj.callback](_tok); } catch(_) {}
+      }
       for (const v of Object.values(obj)) _findAndCallCb(v, depth + 1);
     }
     for (const client of Object.values(window.___grecaptcha_cfg?.clients ?? {})) _findAndCallCb(client, 0);
+    // Direct fallback: Enterprise clients use minified property names (not "callback"),
+    // so the traversal above may not fire onCaptchaSuccess. Call it directly if calendarDiv
+    // is still hidden after a short delay — runs within the same executeScript, no extra call.
+    setTimeout(function() {
+      try {
+        const cal = document.getElementById("calendarDiv");
+        const alreadyVisible = cal && cal.style.display !== "none" && cal.style.visibility !== "hidden" && cal.offsetParent !== null;
+        if (!alreadyVisible && typeof window.onCaptchaSuccess === "function") {
+          window.onCaptchaSuccess(_tok);
+        }
+      } catch(_) {}
+    }, 400);
   } catch(_) {}
   try {
     const _anchor = document.querySelector("iframe[src*='recaptcha/api2/anchor'], iframe[src*='recaptcha/enterprise/anchor']");
@@ -1006,13 +1022,27 @@ async function F5_scheduling(tabId, config) {
 
 let _f6Interval = null;
 
-function F6_keepSession(tabId) {
+function F6_keepSession(tabId, idleStep) {
   if (_f6Interval) clearInterval(_f6Interval);
-  _f6Interval = setInterval(() => sendTabCmd(tabId, "cmd-keep-tick").catch(() => {}), 30000);
+  // Jitter interval by idle position to prevent thundering-herd refreshes.
+  // schedule: 15–25s  |  form: 40–60s  |  login / default: 90–120s
+  const _f6Tick = () => {
+    sendTabCmd(tabId, "cmd-keep-tick").catch(() => {});
+    // Reschedule with fresh jitter each tick
+    if (_f6Interval) {
+      clearInterval(_f6Interval);
+      const base   = idleStep === "schedule" ? 15000 : idleStep === "form" ? 40000 : 90000;
+      const jitter = Math.random() * base * 0.5;
+      _f6Interval  = setTimeout(_f6Tick, base + jitter);
+    }
+  };
+  const base   = idleStep === "schedule" ? 15000 : idleStep === "form" ? 40000 : 90000;
+  const jitter = Math.random() * base * 0.5;
+  _f6Interval = setTimeout(_f6Tick, base + jitter);
 }
 
 function stopF6() {
-  if (_f6Interval) { clearInterval(_f6Interval); _f6Interval = null; }
+  if (_f6Interval) { clearTimeout(_f6Interval); _f6Interval = null; }
 }
 
 async function F_warmup(config) {
@@ -1038,7 +1068,7 @@ async function F_warmup(config) {
     _runLog.entry("F_warmup: logged in");
 
     if (idleStep === "login") {
-      F6_keepSession(tabId);
+      F6_keepSession(tabId, "login");
       await _runLog.finish("ok idleStep=login");
       return {ok: true, idleStep: "login"};
     }
@@ -1064,7 +1094,7 @@ async function F_warmup(config) {
 
     if (idleStep === "form") {
       await sendTabCmd(tabId, "cmd-fill-form-tabs").catch(() => {});
-      F6_keepSession(tabId);
+      F6_keepSession(tabId, "form");
       await _runLog.finish("ok idleStep=form");
       return {ok: true, idleStep: "form"};
     }
@@ -1078,7 +1108,7 @@ async function F_warmup(config) {
         const e = new Error(`F_warmup: expected schedule, got ${sState}`);
         e.proxyStatus = "unknown"; e.nextAction = "rotate_proxy"; throw e;
       }
-      F6_keepSession(tabId);
+      F6_keepSession(tabId, "schedule");
       await _runLog.finish("ok idleStep=schedule");
       return {ok: true, idleStep: "schedule"};
     }
@@ -1346,6 +1376,33 @@ const _MSG_HANDLERS = {
 
   "comm-dispatch": (msg, _sender, respond) => {
     if (self.Comm) self.Comm.dispatch(msg.payload).catch(e => console.error("[OctoProbe BG] comm-dispatch error:", e));
+    respond({ok: true});
+  },
+
+  // ── Slot intelligence relay ───────────────────────────────────────────────
+  // content.js → background → manager (fire-and-forget)
+  "slot-observation": (msg, _sender, respond) => {
+    if (self.Comm) self.Comm.send({ type: "slot-observation", postId: msg.postId, slots: msg.slots, timestamp: Date.now() });
+    respond({ok: true});
+  },
+
+  // content.js → background → manager → background → content.js (3s timeout)
+  "slot-assignment-request": (msg, _sender, respond) => {
+    if (!self.Comm) { respond({ok: false}); return; }
+    self.Comm.requestSlotAssignment({ postId: msg.postId, visibleSlots: msg.visibleSlots }, 3000)
+      .then(assignment => respond({ ok: true, ...assignment }))
+      .catch(() => respond({ ok: false }));
+    return true; // async response
+  },
+
+  // content.js → background → manager (fire-and-forget)
+  "slot-failure": (msg, _sender, respond) => {
+    if (self.Comm) self.Comm.send({ type: "slot-failure", slotKey: msg.slotKey, reason: msg.reason });
+    respond({ok: true});
+  },
+
+  "slot-success": (msg, _sender, respond) => {
+    if (self.Comm) self.Comm.send({ type: "slot-success", slotKey: msg.slotKey });
     respond({ok: true});
   },
 

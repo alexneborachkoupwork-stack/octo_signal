@@ -448,7 +448,7 @@ async function switchToEnglish() {
 async function clickLoginLink() {
   setBadge("Finding Login…", "#f0c040");
   const el = await waitFor(
-    () => findBySelectors(LOGIN_LINK_SELECTORS) || findByText(["a","button"], ["login","log in"]),
+    () => findBySelectors(LOGIN_LINK_SELECTORS) || findByText(["a","button"], ["login","log in","entrar","iniciar sessão"]),
     6000
   );
   if (!el) { setBadge("Login button not found", "#ff6b6b"); return; }
@@ -1578,222 +1578,416 @@ async function visaStepForm({submitAfter = true} = {}) {
 // Visa workflow — step: schedule appointment
 // ---------------------------------------------------------------------------
 
+// Parse HTML response from SubmeterVistoCriaPDF to find the PDF resource URL.
+// The server returns an HTML page embedding the PDF via iframe/object/anchor.
+function _extractPdfUrl(html) {
+  const patterns = [
+    /iframe[^>]+src=["']([^"']*MostrarPdf[^"']*)["']/i,
+    /object[^>]+data=["']([^"']*MostrarPdf[^"']*)["']/i,
+    /<embed[^>]+src=["']([^"']*MostrarPdf[^"']*)["']/i,
+    /href=["']([^"']*MostrarPdf[^"']*)["']/i,
+    /iframe[^>]+src=["']([^"']*\.pdf[^"']*)["']/i,
+    /href=["']([^"']*\.pdf[^"']*)["']/i,
+  ];
+  for (const pat of patterns) {
+    const m = html.match(pat);
+    if (m?.[1]) return m[1];
+  }
+  return null;
+}
+
+// Download a blob URL using chrome.downloads when available, anchor click otherwise.
+async function _downloadBlobUrl(blobUrl, filename) {
+  try {
+    await chrome.downloads.download({ url: blobUrl, filename, saveAs: false });
+    console.log("[OctoProbe] PDF download triggered via chrome.downloads:", filename);
+  } catch (_) {
+    const a = document.createElement("a");
+    a.href = blobUrl; a.download = filename;
+    document.body.appendChild(a); a.click();
+    setTimeout(() => { try { URL.revokeObjectURL(blobUrl); } catch(__) {} a.remove(); }, 6000);
+    console.log("[OctoProbe] PDF download triggered via anchor:", filename);
+  }
+}
+
 async function visaStepSchedule() {
   setBadge("Visa: schedule — waiting for page…", "#9060cc");
 
-  const {"visa-consular-post": postoId} =
-    await storageGet(["visa-consular-post"]);
+  const {"visa-consular-post": postoId, "direct-slots-fetch": directFetch = false} =
+    await storageGet(["visa-consular-post", "direct-slots-fetch"]);
   const POSTO = postoId ?? "5088";
 
-  // Wait for captcha div to appear.
+  // ── 1. Wait for captchaDiv ────────────────────────────────────────────────
   const captchaDiv = await waitFor(
-    () => {
-      const el = document.querySelector("#captchaDiv, [id*='captcha' i], iframe[src*='recaptcha']");
-      return el && isVisible(el) ? el : null;
-    },
+    () => { const el = document.getElementById("captchaDiv"); return el && isVisible(el) ? el : null; },
     20000
   );
   if (!captchaDiv) { await _clearWorkflowFailed("Visa: schedule captcha not found", E.VISA_FAILED); return; }
 
-  // Human dwell: read the page before touching captcha.
-  await sleep(1200 + Math.random() * 1300);
+  await sleep(1200 + Math.random() * 1300); // human dwell
 
-  // Solve reCAPTCHA — try CDP direct click first (native browser token → server accepts it
-  // and reveals the calendar/slot UI). Falls back to API solver if challenge appears.
+  // ── 2. Solve reCAPTCHA ────────────────────────────────────────────────────
   setBadge("Visa: solving schedule reCAPTCHA…", "#9060cc");
   await injectAlertCapture();
   await _ensureEvtKeys();
   console.log("[OctoProbe] Schedule captcha: starting solve");
   const schedSolveStart = Date.now();
   const schedSolved = await waitForRecaptcha();
-  if (!schedSolved) {
-    await _clearWorkflowFailed("Visa: schedule reCAPTCHA failed", E.VISA_FAILED);
-    return;
-  }
+  if (!schedSolved) { await _clearWorkflowFailed("Visa: schedule reCAPTCHA failed", E.VISA_FAILED); return; }
   console.log("[OctoProbe] Schedule captcha: solved in " + (Date.now() - schedSolveStart) + "ms");
 
-  // Server validates the token via Google Enterprise. On success it sets window.data
-  // (the page-level `data` variable) and reveals calendarDiv. Wait for calendarDiv.
-  // Once calendarDiv is visible, window.data is guaranteed to be populated.
+  // ── 3. Optional direct slots fetch (off by default — potentially detectable) ──
+  // When enabled, the extension fetches available slots via the same XHR the page
+  // uses, without waiting for the native handleServerResponse. Useful for probing
+  // slot availability early or with test accounts.
+  let prefetchedSlotsRaw = null;
+  if (directFetch) {
+    const tok = await _callPageFn(
+      `var ta=document.querySelector("#g-recaptcha-response-1,#g-recaptcha-response"); return ta?ta.value:null;`
+    ).then(r => r?.result ?? null).catch(() => null);
+    if (tok && tok.length > 20) {
+      try {
+        const r = await fetch(`/VistosOnline/slots?posto_id=${POSTO}`, {
+          method: "POST",
+          headers: {"Content-Type": "application/x-www-form-urlencoded"},
+          body: `posto_id=${encodeURIComponent(POSTO)}&captcha=${encodeURIComponent(tok)}`,
+          credentials: "include",
+        });
+        if (r.ok) {
+          prefetchedSlotsRaw = await r.text();
+          console.log("[OctoProbe] Direct slots fetch: received", prefetchedSlotsRaw.length, "chars");
+        }
+      } catch(e) { console.warn("[OctoProbe] Direct slots fetch failed:", e); }
+    }
+  }
+
+  // ── 5. Wait for calendarDiv ───────────────────────────────────────────────
   setBadge("Visa: waiting for calendar…", "#9060cc");
   const calendarVisible = await waitFor(() => {
     const el = document.getElementById("calendarDiv");
     return el && el.style.display !== "none" ? el : null;
   }, 30000);
-
   if (!calendarVisible) {
     await _clearWorkflowFailed("Visa: calendar did not appear — token rejected or no slots", E.VISA_FAILED);
     return;
   }
-  console.log("[OctoProbe] Calendar revealed — reading available dates from window.data");
+  console.log("[OctoProbe] Calendar revealed");
 
-  // window.data is set by handleServerResponse() as an array:
-  // [{date: "YYYY-MM-DD", periods: [{id, description}]}, ...]
-  const slotsResp = await _callPageFn(
-    `return Array.isArray(data) ? JSON.stringify(data) : null;`
-  ).catch(() => null);
-  const slotsRaw = slotsResp?.result ?? null;
+  // ── 6. Read available slots from window.data ──────────────────────────────
+  // handleServerResponse() parses JSON into page-global `data` variable.
+  const slotsRaw = prefetchedSlotsRaw
+    ?? await _callPageFn(`return Array.isArray(data) ? JSON.stringify(data) : null;`).then(r => r?.result ?? null).catch(() => null);
 
-  let chosenDate = null;
+  let chosenDateISO = null; // "YYYY-MM-DD" — calendar key format
+  let chosenDate    = null; // "YYYY/MM/DD" — field value format
+  let _chosenSlotKey = null; // for slot reporting to manager
   if (slotsRaw) {
     try {
-      const slots = JSON.parse(slotsRaw); // [{date:"YYYY-MM-DD", periods:[...]}, ...]
+      const slots = JSON.parse(slotsRaw);
       const today = new Date(); today.setHours(0,0,0,0);
       const valid = slots
-        .map(s => s.date?.replace(/-/g, "/"))
-        .filter(d => d && /^\d{4}\/\d{2}\/\d{2}$/.test(d))
-        .filter(d => { const dt = new Date(d.replace(/\//g,"-")); dt.setHours(0,0,0,0); return dt > today; })
+        .filter(s => s.date && s.periods?.length)
+        .map(s => s.date) // "YYYY-MM-DD"
+        .filter(d => { const dt = new Date(d); dt.setHours(0,0,0,0); return dt > today; })
         .sort();
       console.log("[OctoProbe] Available dates:", valid);
-      if (valid.length) chosenDate = valid[0];
+
+      if (valid.length) {
+        // ── Slot intelligence: observe + request assignment ───────────────────
+        // Build flat {date, time} list from all visible slots for the pool.
+        const visibleSlots = [];
+        for (const s of slots) {
+          if (!s.date || !s.periods?.length) continue;
+          for (const p of s.periods) {
+            const time = typeof p === "string" ? p : (p.time ?? p.hour ?? "");
+            if (time) visibleSlots.push({ date: s.date, time });
+          }
+        }
+
+        // Fire-and-forget observation — non-blocking
+        chrome.runtime.sendMessage({ type: "slot-observation", postId: Number(POSTO), slots: visibleSlots }).catch(() => {});
+
+        // Soft-blocking assignment request (3s timeout — falls back to local logic)
+        const assignment = await chrome.runtime.sendMessage({
+          type: "slot-assignment-request",
+          postId: Number(POSTO),
+          visibleSlots,
+        }).catch(() => null);
+
+        if (assignment?.ok && assignment.primary?.date) {
+          chosenDateISO  = assignment.primary.date;
+          chosenDate     = assignment.primary.date.replace(/-/g, "/");
+          _chosenSlotKey = assignment.primary.slotKey;
+          console.log("[OctoProbe] Slot assignment: primary=", _chosenSlotKey,
+            "fallbacks=", assignment.fallbacks?.length ?? 0);
+          // Store fallbacks on window for use in submit retry (if needed)
+          window._octoSlotFallbacks = assignment.fallbacks ?? [];
+        } else {
+          // No manager assignment — pick earliest available locally
+          chosenDateISO = valid[0];
+          chosenDate    = valid[0].replace(/-/g, "/");
+          if (visibleSlots.length) {
+            const fb = visibleSlots.find(s => s.date === chosenDateISO);
+            _chosenSlotKey = fb ? `${POSTO}-${fb.date}-${fb.time}` : null;
+          }
+        }
+      }
     } catch(_) {}
   }
+  if (!chosenDate) { await _clearWorkflowFailed("Visa: no available slots found", E.VISA_FAILED); return; }
 
-  if (!chosenDate) {
-    await _clearWorkflowFailed("Visa: no available slots found in server response", E.VISA_FAILED);
-    return;
+  setBadge(`Visa: selecting date ${chosenDate}…`, "#9060cc");
+  await sleep(800 + Math.random() * 600);
+
+  // ── 7. Human-like date selection via the calendar widget ──────────────────
+  // Click the f_trigger_c icon to open the Calendar.js popup, navigate to the
+  // correct month, then click the target day cell. The page's dateChanged()
+  // callback fires natively — setting f_date_c and calling ajaxFunctionPeriodos().
+
+  const trigger = document.getElementById("f_trigger_c");
+  if (!trigger) { await _clearWorkflowFailed("Visa: calendar trigger not found", E.VISA_FAILED); return; }
+  trigger.scrollIntoView({behavior: "smooth", block: "center"});
+  await sleep(400 + Math.random() * 300);
+  await humanClick(trigger);
+
+  // Wait for Calendar.js popup div to appear (div.calendar with non-hidden visibility)
+  const calPopup = await waitFor(() => {
+    for (const d of document.querySelectorAll("div.calendar")) {
+      const s = window.getComputedStyle(d);
+      if (s.visibility !== "hidden" && s.display !== "none" && s.opacity !== "0") return d;
+    }
+    return null;
+  }, 5000);
+
+  if (calPopup) {
+    // Navigate to the correct month/year
+    const [targetYear, targetMonth, targetDay] = chosenDateISO.split("-").map(Number);
+    // Map month labels to 1-based index — supports both English (lang-switch enabled)
+    // and Portuguese (lang-switch disabled, the default).
+    const MONTH_MAP = {
+      january:1,  february:2,  march:3,      april:4,    may:5,      june:6,
+      july:7,     august:8,    september:9,  october:10, november:11,december:12,
+      janeiro:1,  fevereiro:2, março:3,       abril:4,    maio:5,     junho:6,
+      julho:7,    agosto:8,    setembro:9,   outubro:10, novembro:11,dezembro:12,
+      // normalised (strip diacritics) fallbacks
+      marco:3,
+    };
+
+    for (let nav = 0; nav < 24; nav++) {
+      const monthLabel = calPopup.querySelector(".label.month, td.label.month, .calHead .month");
+      const yearLabel  = calPopup.querySelector(".label.year,  td.label.year,  .calHead .year");
+      if (!monthLabel || !yearLabel) break;
+
+      const rawMonth = monthLabel.textContent.trim().toLowerCase();
+      const monthKey = rawMonth.normalize("NFD").replace(/[̀-ͯ]/g, ""); // strip diacritics (e.g. março → marco)
+      const curMonth = MONTH_MAP[rawMonth] ?? MONTH_MAP[monthKey] ?? 0;
+      const curYear  = parseInt(yearLabel.textContent.trim(), 10);
+      if (isNaN(curYear) || curMonth === 0) break;
+      if (curYear === targetYear && curMonth === targetMonth) break;
+
+      // Click prev (<) or next (>) navigation button
+      const navDivs = [...calPopup.querySelectorAll("td.button > div.nav, td.button > .nav, .button.nav")];
+      const isAhead = (targetYear * 12 + targetMonth) > (curYear * 12 + curMonth);
+      const navBtn  = isAhead ? navDivs[navDivs.length - 1] : navDivs[0];
+      if (!navBtn) break;
+      await humanClick(navBtn);
+      await sleep(250 + Math.random() * 150);
+    }
+
+    // Click the day cell matching targetDay (skip disabled/out-of-range cells)
+    await sleep(300 + Math.random() * 200);
+    const dayCells = [...calPopup.querySelectorAll("td.day")];
+    const targetCell = dayCells.find(td => {
+      if (td.classList.contains("disabled") || td.classList.contains("out-of-range")) return false;
+      return parseInt(td.textContent.trim(), 10) === targetDay;
+    });
+
+    if (targetCell) {
+      await humanClick(targetCell);
+      console.log("[OctoProbe] Calendar: clicked day", targetDay);
+    } else {
+      console.warn("[OctoProbe] Calendar: day cell not found — using programmatic fallback");
+      await _callPageFn(`
+        (function(){
+          var inp = document.getElementById("f_date_c");
+          if (!inp) return;
+          inp.removeAttribute("readonly");
+          var ns = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,"value")?.set;
+          if (ns) ns.call(inp,"${chosenDate}"); else inp.value = "${chosenDate}";
+          inp.setAttribute("readonly","1");
+          inp.dispatchEvent(new Event("input",{bubbles:true}));
+          inp.dispatchEvent(new Event("change",{bubbles:true}));
+          if (typeof ajaxFunctionPeriodos === "function") ajaxFunctionPeriodos("${chosenDate}");
+        })();
+      `);
+    }
+  } else {
+    // Calendar popup never appeared — set date programmatically
+    console.warn("[OctoProbe] Calendar popup not found — using programmatic date set");
+    await _callPageFn(`
+      (function(){
+        var inp = document.getElementById("f_date_c");
+        if (!inp) return;
+        inp.removeAttribute("readonly");
+        var ns = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,"value")?.set;
+        if (ns) ns.call(inp,"${chosenDate}"); else inp.value = "${chosenDate}";
+        inp.setAttribute("readonly","1");
+        inp.dispatchEvent(new Event("input",{bubbles:true}));
+        inp.dispatchEvent(new Event("change",{bubbles:true}));
+        if (typeof ajaxFunctionPeriodos === "function") ajaxFunctionPeriodos("${chosenDate}");
+      })();
+    `);
   }
 
-  setBadge(`Visa: slot ${chosenDate}…`, "#9060cc");
+  // Confirm f_date_c is set (dateChanged sets it; programmatic fallback sets it directly)
+  const dateSet = await waitFor(() => {
+    const el = document.getElementById("f_date_c");
+    return el && el.value === chosenDate ? el : null;
+  }, 8000);
+  if (!dateSet) {
+    console.warn("[OctoProbe] f_date_c not confirmed — forcing value");
+    await _callPageFn(`
+      (function(){
+        var inp = document.getElementById("f_date_c");
+        if (!inp) return;
+        inp.removeAttribute("readonly");
+        var ns = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,"value")?.set;
+        if (ns) ns.call(inp,"${chosenDate}"); else inp.value = "${chosenDate}";
+        inp.setAttribute("readonly","1");
+        if (typeof ajaxFunctionPeriodos === "function") ajaxFunctionPeriodos("${chosenDate}");
+      })();
+    `);
+  }
 
-  // Set the chosen date and let ajaxFunctionPeriodos (page-native) populate #inputPeriodos.
-  // ajaxFunctionPeriodos reads from the already-populated window.data — no XHR needed.
-  await _callPageFn(`
-    (function(){
-      var inp = document.getElementById("f_date_c");
-      if(!inp) return;
-      var nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,"value")?.set;
-      if(nativeSetter) nativeSetter.call(inp,"${chosenDate}"); else inp.value="${chosenDate}";
-      inp.removeAttribute("readonly");
-      inp.dispatchEvent(new Event("input",{bubbles:true}));
-      inp.dispatchEvent(new Event("change",{bubbles:true}));
-      inp.setAttribute("readonly","1");
-      if(typeof ajaxFunctionPeriodos==="function") ajaxFunctionPeriodos("${chosenDate}");
-    })();
-  `);
-
-  // Wait for period dropdown to populate.
+  // ── 8. Wait for period dropdown and select first option ───────────────────
   setBadge("Visa: waiting for time slots…", "#9060cc");
   const periodSel = await waitFor(() => {
-    const el = document.querySelector("#inputPeriodos");
-    return el && el.options.length > 1 ? el : null;
+    const el = document.getElementById("inputPeriodos");
+    return el && !el.disabled && el.options.length > 1 ? el : null;
   }, 15000);
-
   if (!periodSel) { await _clearWorkflowFailed("Visa: no period options loaded", E.VISA_FAILED); return; }
 
-  // Pick first valid period option.
   const firstPeriod = [...periodSel.options].find(o => o.value && o.value.trim() !== "");
   if (!firstPeriod) { await _clearWorkflowFailed("Visa: no valid period option", E.VISA_FAILED); return; }
 
   await humanSelect(periodSel, firstPeriod.value);
-  await sleep(500 + Math.random() * 400);
+  await sleep(600 + Math.random() * 500);
+  console.log("[OctoProbe] Period selected:", firstPeriod.text, "value=" + firstPeriod.value);
 
-  // Override submitSlotsForm in MAIN world BEFORE clicking submit — the function uses
-  // document.write() which would destroy the page context.
+  // ── 9. Override submitSlotsForm before clicking submit ────────────────────
+  // The page's submitSlotsForm() calls document.write(resultData) which destroys
+  // the page context and kills the content script. Our override uses fetch() to
+  // POST the same data and signals the result via postMessage.
+  // FormData captures txthuman (filled by reCAPTCHA Enterprise) and back="" naturally.
   await _callPageFn(`
     (function(){
       window.submitSlotsForm = async function() {
         var form = document.getElementById("vistoForm");
-        if(!form) { window.postMessage({type:"octo-pdf-error",error:"no form"},"*"); return; }
+        if (!form) { window.postMessage({type:"octo-sched-result",error:"no form"},"*"); return; }
+        var fd   = new FormData(form);
         var body = new URLSearchParams({
-          lang:       form.lang?.value      ?? "ENG",
-          txtHuman:   form.txtHuman?.value  ?? "",
-          back:       form.back?.value      ?? "",
-          f_date_c:   form.f_date_c?.value  ?? "",
-          cmbPeriodo: form.cmbPeriodo?.value ?? "",
+          lang:       fd.get("lang")       ?? "ENG",
+          txtHuman:   fd.get("txtHuman")   ?? "",
+          back:       fd.get("back")       ?? "",
+          f_date_c:   fd.get("f_date_c")   ?? "",
+          cmbPeriodo: fd.get("cmbPeriodo") ?? "",
         }).toString();
+        console.log("[OctoProbe] submitSlotsForm: posting to SubmeterVistoCriaPDF");
         try {
           var resp = await fetch("/VistosOnline/SubmeterVistoCriaPDF?posto_id=${POSTO}", {
             method:"POST", body:body,
             headers:{"Content-Type":"application/x-www-form-urlencoded","X-Requested-With":"XMLHttpRequest"},
             credentials:"include"
           });
-          var ct = resp.headers.get("content-type") ?? "";
-          if (ct.includes("pdf")) {
+          var ct = (resp.headers.get("content-type") ?? "").toLowerCase();
+          if (ct.includes("pdf") || ct.includes("octet-stream")) {
             var blob = await resp.blob();
-            var blobUrl = URL.createObjectURL(blob);
-            window.postMessage({type:"octo-pdf-html", html:null, blobUrl:blobUrl}, "*");
+            window.postMessage({type:"octo-sched-result", blobUrl:URL.createObjectURL(blob), isPdf:true}, "*");
           } else {
             var html = await resp.text();
-            window.postMessage({type:"octo-pdf-html", html:html}, "*");
+            window.postMessage({type:"octo-sched-result", html:html, isPdf:false}, "*");
           }
         } catch(e) {
-          window.postMessage({type:"octo-pdf-error", error:String(e)}, "*");
+          window.postMessage({type:"octo-sched-result", error:String(e)}, "*");
         }
       };
     })();
   `);
-  await sleep(1200 + Math.random() * 800);
+  await sleep(800 + Math.random() * 600);
 
-  // Click the schedule submit button.
+  // ── 10. Click submit → submeter() validates → openPopUpPreVisto() ─────────
   setBadge("Visa: submitting schedule…", "#9060cc");
-  const schedSubmit = document.querySelector("#btnSubmit");
-  if (!schedSubmit) { await _clearWorkflowFailed("Visa: schedule submit button not found", E.VISA_FAILED); return; }
-  await humanClick(schedSubmit);
+  const btnSubmit = document.getElementById("btnSubmit");
+  if (!btnSubmit) { await _clearWorkflowFailed("Visa: submit button not found", E.VISA_FAILED); return; }
+  await humanClick(btnSubmit);
 
-  // Wait for pre-visto confirmation popup.
+  // ── 11. Confirm pre-visto popup ───────────────────────────────────────────
   const previstoPopup = await waitFor(() => {
-    const el = document.querySelector("#previstoMsg");
+    const el = document.getElementById("previstoMsg");
     return el && isVisible(el) ? el : null;
   }, 15000);
+  if (!previstoPopup) { await _clearWorkflowFailed("Visa: confirmation popup did not appear", E.VISA_FAILED); return; }
 
-  if (!previstoPopup) {
-    await _clearWorkflowFailed("Visa: confirmation popup did not appear", E.VISA_FAILED);
-    return;
-  }
   setBadge("Visa: confirming appointment…", "#9060cc");
-  await sleep(800 + Math.random() * 600);
-  const previstoSubmit = document.querySelector("#previstoSubmit");
-  if (previstoSubmit) await humanClick(previstoSubmit);
+  await sleep(800 + Math.random() * 800);
+  const previstoSubmit = document.getElementById("previstoSubmit");
+  if (!previstoSubmit) { await _clearWorkflowFailed("Visa: previstoSubmit not found", E.VISA_FAILED); return; }
+  await humanClick(previstoSubmit); // → closePopUPrevisto() + submitSlotsForm() (our override)
 
-  // Intercept the PDF response posted by our overridden submitSlotsForm.
-  setBadge("Visa: waiting for PDF…", "#9060cc");
-  const pdfMsg = await _waitPageMessage("octo-pdf-html", 45000);
-
-  if (!pdfMsg?.html && !pdfMsg?.blobUrl) {
-    const errMsg = pdfMsg?.error ?? "timeout";
-    await _clearWorkflowFailed(`Visa: PDF failed — ${errMsg}`, E.VISA_FAILED);
+  // ── 12. Wait for booking confirmation from overridden submitSlotsForm ──────
+  setBadge("Visa: waiting for booking confirmation…", "#9060cc");
+  const result = await _waitPageMessage("octo-sched-result", 45000);
+  if (!result || result.error) {
+    // Report failure to slot pool before exiting
+    if (_chosenSlotKey) {
+      chrome.runtime.sendMessage({ type: "slot-failure", slotKey: _chosenSlotKey, reason: result?.error ?? "timeout" }).catch(() => {});
+    }
+    await _clearWorkflowFailed(`Visa: booking failed — ${result?.error ?? "timeout"}`, E.VISA_FAILED);
     return;
   }
 
+  // ── 13. Download PDF ──────────────────────────────────────────────────────
   setBadge("Visa: downloading PDF…", "#9060cc");
-  const _pdfFilename = `visa_appointment_${chosenDate.replace(/\//g,"-")}.pdf`;
-  const _triggerDownload = (url) => {
-    const a = document.createElement("a");
-    a.href = url; a.download = _pdfFilename;
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 5000);
-  };
+  const pdfFilename = `visa_appt_${chosenDate.replace(/\//g,"-")}_${Date.now()}.pdf`;
 
-  if (pdfMsg.blobUrl) {
-    _triggerDownload(pdfMsg.blobUrl);
-    setBadge("Visa: PDF downloaded!", "#00d4aa");
-  } else {
-    try {
-      const form = document.querySelector("form[name='vistoForm'], form");
-      const formData = form ? new URLSearchParams(new FormData(form)).toString() : "";
-      const pdfResp = await fetch(`/VistosOnline/SubmeterVistoCriaPDF?posto_id=${POSTO}`, {
-        method: "POST",
-        headers: {"Content-Type": "application/x-www-form-urlencoded"},
-        body: formData,
-        credentials: "include",
-      });
-      const contentType = pdfResp.headers.get("content-type") ?? "";
-      if (contentType.includes("pdf")) {
-        _triggerDownload(URL.createObjectURL(await pdfResp.blob()));
-        setBadge("Visa: PDF downloaded!", "#00d4aa");
-      } else {
-        console.warn("[OctoProbe] PDF response not PDF content-type:", contentType);
-        setBadge("Visa: PDF response received (check downloads)", "#00d4aa");
+  if (result.isPdf && result.blobUrl) {
+    // Server returned the PDF binary directly
+    await _downloadBlobUrl(result.blobUrl, pdfFilename);
+    setBadge("Visa: appointment confirmed!", "#00d4aa");
+  } else if (result.html) {
+    // Server returned HTML — extract MostrarPdf URL and fetch the actual PDF
+    const pdfPath = _extractPdfUrl(result.html);
+    if (pdfPath) {
+      const fullUrl = pdfPath.startsWith("http") ? pdfPath
+        : pdfPath.startsWith("/") ? pdfPath
+        : "/VistosOnline/" + pdfPath;
+      try {
+        const pdfResp = await fetch(fullUrl, {credentials: "include"});
+        if (pdfResp.ok) {
+          const blob = await pdfResp.blob();
+          await _downloadBlobUrl(URL.createObjectURL(blob), pdfFilename);
+          setBadge("Visa: appointment confirmed!", "#00d4aa");
+        } else {
+          console.warn("[OctoProbe] PDF fetch returned", pdfResp.status);
+          setBadge("Visa: confirmed (PDF fetch failed)", "#f0c040");
+        }
+      } catch(e) {
+        console.error("[OctoProbe] PDF download error:", e);
+        setBadge("Visa: confirmed (PDF error)", "#f0c040");
       }
-    } catch (e) {
-      console.error("[OctoProbe] PDF download error:", e);
-      setBadge("Visa: PDF fetch error", "#ff6b6b");
+    } else {
+      // No PDF link — likely a text/HTML confirmation page; still a success
+      console.log("[OctoProbe] No PDF URL in response HTML — confirmation page received");
+      setBadge("Visa: appointment confirmed!", "#00d4aa");
     }
   }
 
-  console.log("[OctoProbe] Visa: schedule complete");
+  // Report slot success to pool
+  if (_chosenSlotKey) {
+    chrome.runtime.sendMessage({ type: "slot-success", slotKey: _chosenSlotKey }).catch(() => {});
+  }
+
+  console.log("[OctoProbe] Visa: schedule complete  date=" + chosenDate + "  period=" + firstPeriod.text);
 }
 
 // ---------------------------------------------------------------------------
@@ -2021,14 +2215,17 @@ async function _registerSubmit() {
 
     const _al = (_registerAlert ?? "").toLowerCase();
     // "1 more attempts" = first rejection, quota still available → let attempt 2 run.
-    // True block = "blocked"+"incremental" WITHOUT a remaining-attempt hint.
-    if (_al.includes("blocked") && _al.includes("incremental") && !_al.includes("1 more attempt")) {
+    // True block = "blocked"/"bloqueado" + "incremental"/"incremento" WITHOUT a remaining-attempt hint.
+    const _isBlocked  = _al.includes("blocked") || _al.includes("bloqueado");
+    const _isIncrem   = _al.includes("incremental") || _al.includes("incremento");
+    const _hasRemain  = _al.includes("1 more attempt") || /mais\s+[1-9]\d*\s+tentativ/i.test(_al);
+    if (_isBlocked && _isIncrem && !_hasRemain) {
       console.warn("[OctoProbe] Register: IP block detected");
       return {ok: false, status: "ip_blocked"};
     }
-    // "Invalid username" = account already exists (username collision from retry reusing
-    // the same person payload).  No point running attempt 2 with the same username.
-    if (_al.includes("invalid") && (_al.includes("username") || _al.includes("utilizador"))) {
+    // "Invalid username" / "utilizador inválido" = account already exists.
+    const _isInvalid  = _al.includes("invalid") || _al.includes("inválid"); // inválid(o/a)
+    if (_isInvalid && (_al.includes("username") || _al.includes("utilizador"))) {
       _logEntry(`register: username already taken — aborting (alert="${_registerAlert}")`);
       return {ok: false, status: "username_taken"};
     }
@@ -2274,5 +2471,61 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   console.log(`[OctoProbe] page-ready: state=${state} url=${location.href}`);
   chrome.runtime.sendMessage({type: "page-ready", state, url: location.href}).catch(() => {});
 
+  // On schedule pages, install a passive XHR intercept to report slot observations.
+  // This runs in the background during warmup idle — workers on the schedule page
+  // continuously see slot data as the page polls /VistosOnline/slots.
+  if (state === "schedule") _installSlotsXhrHook();
+
   setBadge(`Octo Probe v${chrome.runtime.getManifest().version}`, "#00d4aa");
 })();
+
+// ---------------------------------------------------------------------------
+// Passive XHR intercept — reports /VistosOnline/slots responses to manager
+// ---------------------------------------------------------------------------
+
+function _installSlotsXhrHook() {
+  // Run in MAIN world via executeScript so it can intercept page's own XHR instances.
+  chrome.runtime.sendMessage({
+    type: "exec-page-script",
+    code: `(function(){
+      if (window.__octoSlotsHooked) return;
+      window.__octoSlotsHooked = true;
+      var _open = XMLHttpRequest.prototype.open;
+      XMLHttpRequest.prototype.open = function(method, url) {
+        if (typeof url === "string" && url.includes("/VistosOnline/slots")) {
+          this.addEventListener("load", function() {
+            try {
+              var data = JSON.parse(this.responseText);
+              if (Array.isArray(data)) {
+                var m = url.match(/posto_id=(\\d+)/);
+                var postId = m ? Number(m[1]) : 0;
+                var slots = [];
+                for (var i = 0; i < data.length; i++) {
+                  var s = data[i];
+                  if (!s.date || !s.periods) continue;
+                  for (var j = 0; j < s.periods.length; j++) {
+                    var p = s.periods[j];
+                    var t = typeof p === "string" ? p : (p.time || p.hour || "");
+                    if (t) slots.push({date: s.date, time: t});
+                  }
+                }
+                if (slots.length) window.postMessage({type:"octo-slots-observed", postId, slots}, "*");
+              }
+            } catch(_) {}
+          });
+        }
+        return _open.apply(this, arguments);
+      };
+    })();`,
+  }).catch(() => {});
+
+  // Forward postMessage observations to background
+  window.addEventListener("message", (ev) => {
+    if (ev.source !== window || ev.data?.type !== "octo-slots-observed") return;
+    chrome.runtime.sendMessage({
+      type: "slot-observation",
+      postId: ev.data.postId,
+      slots:  ev.data.slots,
+    }).catch(() => {});
+  });
+}

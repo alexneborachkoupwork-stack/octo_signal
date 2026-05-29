@@ -1,8 +1,12 @@
 'use strict';
 
 const { v4: uuidv4 } = require('uuid');
-const Session = require('./session');
-const log     = require('./logger');
+const Session  = require('./session');
+const log      = require('./logger');
+const metrics  = require('./metrics');
+
+// Slot message types that bypass the session state machine and go straight to the pool.
+const SLOT_MSG_TYPES = new Set(['slot-observation', 'slot-assignment-request', 'slot-failure', 'slot-success']);
 
 /**
  * SessionManager — creates and tracks all Session instances.
@@ -14,11 +18,13 @@ class SessionManager {
    * @param {object}    opts.config
    * @param {OctoApi}   opts.octoApi
    * @param {HubServer} opts.hubServer
+   * @param {SlotPool}  [opts.slotPool]  - shared slot intelligence pool
    */
-  constructor({ config, octoApi, hubServer }) {
+  constructor({ config, octoApi, hubServer, slotPool = null }) {
     this._config    = config;
     this._octoApi   = octoApi;
     this._hub       = hubServer;
+    this._slotPool  = slotPool;
     this._sessions  = new Map(); // sessionId → Session
 
     // Wire hub events to session routing
@@ -30,15 +36,17 @@ class SessionManager {
   // ── Public API ───────────────────────────────────────────────────────────────
 
   /**
-   * Create a new session for the given workflow.
+   * Create a new session for the given workflow (creates a new Octo profile).
    *
-   * @param {string} workflowName  - e.g. 'all-in-one', 'register', 'warmup'
-   * @param {object} payload       - command payload merged with { type, sessionId }
-   * @param {object} [proxy]       - proxy config for this session
-   * @param {Function} [onResult]  - called when session finishes
+   * @param {string}   workflowName
+   * @param {object}   payload
+   * @param {object}   [proxy]
+   * @param {Function} [onResult]
+   * @param {string}   [templateUuid]
+   * @param {object}   [sessionOpts]    - extra Session constructor options (e.g. { keepProfile })
    * @returns {Session}
    */
-  createSession(workflowName, payload = {}, proxy = null, onResult = null, templateUuid = null) {
+  createSession(workflowName, payload = {}, proxy = null, onResult = null, templateUuid = null, sessionOpts = {}) {
     const sessionId = uuidv4();
 
     const session = new Session({
@@ -53,14 +61,58 @@ class SessionManager {
         log.info(sessionId, `Session result: ok=${r.ok}  status=${r.status ?? r.reason ?? ''}`);
         log.closeSession(sessionId);
       }),
+      ...sessionOpts,
     });
 
     this._sessions.set(sessionId, session);
 
-    session.on('done',   ()       => this._sessions.delete(sessionId));
-    session.on('failed', ()       => this._sessions.delete(sessionId));
+    metrics.recordSessionStart(workflowName);
+    session.on('done',       () => { this._sessions.delete(sessionId); metrics.recordSessionDone(); });
+    session.on('failed',     () => { this._sessions.delete(sessionId); metrics.recordSessionFailed(); });
+    session.on('state-change', (s) => { if (s === Session.STATES.RETRYING) metrics.recordSessionRetry(); });
 
     log.ginfo(`SessionManager: created  sessionId=${sessionId}  workflow=${workflowName}`);
+    return session;
+  }
+
+  /**
+   * Create a session that reuses an existing Octo profile (no profile creation).
+   * Used by WorkflowChain to chain steps on the same browser profile.
+   *
+   * @param {string} workflowName
+   * @param {object} payload
+   * @param {string} existingProfileUuid
+   * @param {object} [proxy]
+   * @param {object} [sessionOpts]       - e.g. { keepProfile: true }
+   * @returns {Session}
+   */
+  createSessionOnExistingProfile(workflowName, payload = {}, existingProfileUuid, proxy = null, sessionOpts = {}) {
+    const sessionId = uuidv4();
+
+    const session = new Session({
+      sessionId,
+      config:    this._config,
+      octoApi:   this._octoApi,
+      hubServer: this._hub,
+      workflow:  { name: workflowName, payload },
+      proxy,
+      templateUuid:    null,
+      existingProfile: existingProfileUuid,
+      onResult: (r) => {
+        log.info(sessionId, `Session result: ok=${r.ok}  status=${r.status ?? r.reason ?? ''}`);
+        log.closeSession(sessionId);
+      },
+      ...sessionOpts,
+    });
+
+    this._sessions.set(sessionId, session);
+
+    metrics.recordSessionStart(workflowName);
+    session.on('done',       () => { this._sessions.delete(sessionId); metrics.recordSessionDone(); });
+    session.on('failed',     () => { this._sessions.delete(sessionId); metrics.recordSessionFailed(); });
+    session.on('state-change', (s) => { if (s === Session.STATES.RETRYING) metrics.recordSessionRetry(); });
+
+    log.ginfo(`SessionManager: created (existing profile)  sessionId=${sessionId}  profileUuid=${existingProfileUuid}  workflow=${workflowName}`);
     return session;
   }
 
@@ -100,12 +152,51 @@ class SessionManager {
   }
 
   _onMessage(botId, msg) {
+    const type = msg.type;
+
+    // Slot intelligence messages are handled here; they don't affect the session state machine.
+    if (SLOT_MSG_TYPES.has(type) && this._slotPool) {
+      this._handleSlotMessage(botId, msg);
+      return;
+    }
+
     const session = this._sessions.get(botId);
     if (!session) {
-      log.gwarn(`SessionManager: message from unknown botId  botId=${botId}  type=${msg.type}`);
+      log.gwarn(`SessionManager: message from unknown botId  botId=${botId}  type=${type}`);
       return;
     }
     session.onMessage(msg);
+  }
+
+  _handleSlotMessage(botId, msg) {
+    const pool = this._slotPool;
+    const { type, postId, slots, visibleSlots, slotKey, reason } = msg;
+
+    if (type === 'slot-observation') {
+      if (postId && Array.isArray(slots)) {
+        pool.observe(botId, postId, slots);
+        log.debug(botId, `slot-observation  postId=${postId}  count=${slots.length}  pool=${pool.stats().available} avail`);
+      }
+
+    } else if (type === 'slot-assignment-request') {
+      const assignment = pool.assign(botId, postId, visibleSlots ?? []);
+      log.info(botId, `slot-assignment  primary=${assignment.primary?.slotKey ?? 'none'}  fallbacks=${assignment.fallbacks.length}`);
+      this._hub.send(botId, { type: 'slot-assignment', ...assignment });
+
+    } else if (type === 'slot-failure') {
+      if (slotKey) {
+        pool.reportFailure(slotKey, reason);
+        metrics.recordBookingFailure();
+        log.info(botId, `slot-failure  slotKey=${slotKey}  reason=${reason ?? ''}`);
+      }
+
+    } else if (type === 'slot-success') {
+      if (slotKey) {
+        pool.reportSuccess(slotKey);
+        metrics.recordBookingSuccess();
+        log.info(botId, `slot-success  slotKey=${slotKey}`);
+      }
+    }
   }
 
   _onDisconnected(botId) {

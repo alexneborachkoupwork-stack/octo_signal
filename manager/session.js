@@ -33,7 +33,7 @@ class Session extends EventEmitter {
    * @param {object}    [opts.proxy]    - proxy config for this session
    * @param {Function}  [opts.onResult] - called with final result when done/failed
    */
-  constructor({ sessionId, config, octoApi, hubServer, workflow, proxy, templateUuid, onResult }) {
+  constructor({ sessionId, config, octoApi, hubServer, workflow, proxy, templateUuid, existingProfile, onResult, keepProfile = false }) {
     super();
     this.sessionId    = sessionId;
     this._config      = config;
@@ -41,8 +41,10 @@ class Session extends EventEmitter {
     this._hub         = hubServer;
     this.workflow     = workflow;  // { name: 'all-in-one', payload: {...} }
     this._proxy       = proxy ?? null;
-    this._templateUuid = templateUuid ?? null;
+    this._templateUuid  = templateUuid ?? null;
+    this._existingProfile = existingProfile ?? null; // skip profile creation, use this UUID
     this._onResult    = onResult ?? (() => {});
+    this._keepProfile  = keepProfile;  // when true, stop() only stops browser; does not delete profile
 
     this.state       = STATES.CREATED;
     this.profileUuid = null;   // set after profile creation
@@ -64,8 +66,12 @@ class Session extends EventEmitter {
   async start() {
     this._setState(STATES.PROFILE_STARTING);
     try {
-      // 1. Create profile — clone template if one is configured, otherwise create blank
-      if (this._templateUuid) {
+      // 1. Create or reuse profile
+      if (this._existingProfile) {
+        // WorkflowChain hands us an already-created profile — no creation needed
+        this.profileUuid = this._existingProfile;
+        log.info(this.sessionId, `Reusing existing profile  uuid=${this.profileUuid}`);
+      } else if (this._templateUuid) {
         log.info(this.sessionId, `Cloning template profile  template=${this._templateUuid}`);
         const clone = await this._octoApi.cloneProfile(
           this._templateUuid,
@@ -202,17 +208,18 @@ class Session extends EventEmitter {
   }
 
   /**
-   * Stop the browser and delete the profile. Called after DONE or FAILED.
+   * Stop the browser (and delete the profile unless keepProfile is true).
+   * Called after DONE or FAILED.
    */
   async stop() {
     if (this._connectTimer) { clearTimeout(this._connectTimer); this._connectTimer = null; }
     if (!this.profileUuid) return;
     const uuid = this.profileUuid;
-    this.profileUuid = null; // null immediately so concurrent/double calls are no-ops
-    log.info(this.sessionId, 'Stopping profile');
+    if (!this._keepProfile) this.profileUuid = null; // null immediately so concurrent/double calls are no-ops
+    log.info(this.sessionId, `Stopping profile  keepProfile=${this._keepProfile}`);
     try {
       await this._octoApi.stopProfile(uuid);
-      await this._octoApi.deleteProfile(uuid);
+      if (!this._keepProfile) await this._octoApi.deleteProfile(uuid);
     } catch (err) {
       log.warn(this.sessionId, 'stop() cleanup error:', err.message);
     }
