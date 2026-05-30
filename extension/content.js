@@ -577,7 +577,7 @@ async function _refillMissing(missing, person, email) {
 async function fillRegisterForm(person, email) {
   // Wait for AJAX-loaded fields before touching anything (slow proxies load skeleton
   // first, then inject fields after a network round-trip).
-  const nameField = await waitFor(() => document.querySelector("#name"), 15000);
+  const nameField = await waitFor(() => document.querySelector("#name"), 45000);
   if (!nameField) {
     console.warn("[OctoProbe] Registration form fields did not load (form_incomplete)");
     return false;

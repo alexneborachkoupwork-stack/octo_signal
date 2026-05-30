@@ -931,14 +931,23 @@ async function F1_openAuthPage(tabId) {
     }
     if (authState === "auth") return {ok: true, status: "ready"};
 
-    if (authState === "off-site" || authState === "timeout") {
-      // Login navigated off-site (SSO) or timed out — wait for the SSO to redirect back.
-      _runLog.entry(`F1: login led to ${authState} — waiting for SSO redirect (45s)`);
+    if (authState === "off-site" || authState === "timeout" || authState === "waf-challenge-active") {
+      // Login navigated off-site (SSO), timed out, or hit a bd.js challenge on the auth page.
+      // Wait for the redirect to complete (SSO back or bd.js auto-resolve).
+      const label = authState === "waf-challenge-active" ? "WAF challenge on auth page" : authState;
+      _runLog.entry(`F1: login led to ${label} — waiting for redirect (120s)`);
       try {
-        const ssoReady = waitForPageReady(tabId, 45000);
+        const ssoReady = waitForPageReady(tabId, 120000);
         ({state: authState} = await ssoReady);
         if (authState === "auth") return {ok: true, status: "ready"};
-        if (authState === "not-logged-in") return {ok: true, status: "ready"}; // SSO returned to home
+        if (authState === "not-logged-in") {
+          state = authState; // let the retry loop click login again
+          continue;
+        }
+        if (authState === "waf-challenge") {
+          const _e = new Error("F1: WAF bot-challenge — IP or fingerprint flagged");
+          _e.proxyStatus = "blocked"; _e.nextAction = "rotate_proxy"; throw _e;
+        }
       } catch (_) {
         authState = "sso-timeout";
       }
