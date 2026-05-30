@@ -4,7 +4,7 @@
   "version": "3.2.9",
   "description": "Runs login and registration workflows on the E-VISA site inside an Octo Browser profile.",
 
-  "permissions": ["storage", "activeTab", "scripting", "tabs", "downloads", "alarms", "debugger"],
+  "permissions": ["storage", "activeTab", "scripting", "tabs", "downloads", "alarms"],
   "host_permissions": ["<all_urls>"],
 
   "background": {

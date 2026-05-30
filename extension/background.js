@@ -995,6 +995,25 @@ async function F2_register(tabId, person, emailAcct) {
   }
   _runLog.entry("F2: form filled");
 
+  // Check whether this proxy IP is already burned before spending captcha quota.
+  // Entries older than 24h are pruned (server block is incremental, not permanent).
+  let _proxyIp = null;
+  try {
+    const _ipRes = await sendTabCmd(tabId, "cmd-log-ip");
+    _proxyIp = _ipRes?.ip ?? null;
+  } catch (_) {}
+  if (_proxyIp) {
+    const {"burned-proxies": _burned = []} = await chrome.storage.local.get("burned-proxies");
+    const _now = Date.now();
+    const _active = _burned.filter(e => (_now - e.burnedAt) < 86400000);
+    if (_active.length !== _burned.length) await chrome.storage.local.set({"burned-proxies": _active});
+    if (_active.some(e => e.ip === _proxyIp)) {
+      const _be = new Error(`F2: proxy ${_proxyIp} already burned — rotate`);
+      _be.proxyStatus = "burned"; _be.nextAction = "rotate_proxy"; throw _be;
+    }
+    _runLog.entry(`F2: proxy ${_proxyIp} — not burned, proceeding`);
+  }
+
   // Arm BEFORE the submit loop — the server redirect to the token page can arrive
   // within milliseconds of the RGPD submit, before the loop exits and we could call
   // waitForPageReady.  If we armed it after, the page-ready signal would be lost.
@@ -1028,6 +1047,16 @@ async function F2_register(tabId, person, emailAcct) {
     e.proxyStatus = "email_taken"; e.nextAction = "rotate_proxy"; throw e;
   }
   if (result.status === "captcha_fail") {
+    if (_proxyIp) {
+      const {"burned-proxies": _bl = []} = await chrome.storage.local.get("burned-proxies");
+      const _now = Date.now();
+      const _al = _bl.filter(e => (_now - e.burnedAt) < 86400000);
+      if (!_al.some(e => e.ip === _proxyIp)) {
+        _al.push({ip: _proxyIp, burnedAt: _now});
+        await chrome.storage.local.set({"burned-proxies": _al});
+        _runLog.entry(`F2: proxy ${_proxyIp} marked as burned`);
+      }
+    }
     const e = new Error("F2: register failed: captcha_fail");
     e.proxyStatus = "burned"; e.nextAction = "rotate_proxy"; throw e;
   }
@@ -1214,7 +1243,7 @@ function _sendStatusUpdate(state) {
   self.Comm?.send({ type: "status-update", state });
 }
 
-function F6_keepSession(tabId, idleStep) {
+function F6_keepSession(tabId) {
   if (_f6Interval) clearTimeout(_f6Interval);
   // Use a truly random interval (60–180s) with no fixed base per idle state.
   // Fixed base values (15/40/90s ± jitter) created a statistically detectable
@@ -1446,8 +1475,13 @@ async function F_allInOne(config) {
     for (let _attempt = 0; _attempt < 3; _attempt++) {
       if (_attempt > 0) {
         const waitMs = 30000 + (_attempt - 1) * 30000; // 30 s, 60 s
-        _runLog.entry(`all_in_one: login rejected — waiting ${waitMs / 1000}s for account activation (attempt ${_attempt + 1}/3)`);
+        _runLog.entry(`all_in_one: login rejected — waiting ${waitMs / 1000}s then hard-reloading (attempt ${_attempt + 1}/3)`);
         await new Promise(r => setTimeout(r, waitMs));
+        // Hard reload (Ctrl+F5 equivalent) — clears server-side captcha failure session
+        // state and issues a fresh reCAPTCHA widget with a new challenge ID.
+        const _freshPage = waitForPageReady(loginTabId, 30000);
+        await chrome.tabs.reload(loginTabId, {bypassCache: true});
+        await _freshPage.catch(() => {});
       }
       _loginRes = await F3_login(loginTabId, {username: person.username, password: person.password});
       if (_loginRes.ok || _loginRes.status !== "rejected") break;
