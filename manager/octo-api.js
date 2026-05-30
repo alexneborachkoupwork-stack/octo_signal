@@ -118,8 +118,11 @@ class OctoApi {
     const tmpl = tr.data?.data ?? tr.data;
     const body = { title: title ?? `clone-${templateUuid.slice(0, 8)}`, tags: ['auto-session'] };
 
-    if (tmpl.proxy)       body.proxy       = tmpl.proxy;
-    if (tmpl.fingerprint) body.fingerprint = tmpl.fingerprint;
+    if (tmpl.proxy) body.proxy = tmpl.proxy;
+    // Always generate a fresh fingerprint per clone — passing only {os} causes Octo to
+    // randomise canvas seed, AudioContext seed, screen geometry, etc. independently.
+    // Sharing the template's full fingerprint makes all clones correlatable to Google Enterprise.
+    body.fingerprint = { os: tmpl.fingerprint?.os ?? 'win' };
     // Copy Octo-managed extensions (installed via the UI, stored as "id@version" strings).
     if (Array.isArray(tmpl.extensions) && tmpl.extensions.length) {
       body.extensions = tmpl.extensions;
