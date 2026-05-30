@@ -575,11 +575,11 @@ async function _refillMissing(missing, person, email) {
 }
 
 async function fillRegisterForm(person, email) {
-  // Wait for AJAX-loaded fields before touching anything (slow proxies load skeleton
-  // first, then inject fields after a network round-trip).
-  const nameField = await waitFor(() => document.querySelector("#name"), 45000);
+  // #name is guaranteed present by _registerOpenForm() which waits for AJAX fields
+  // before returning. If it's missing here something went badly wrong upstream.
+  const nameField = document.querySelector("#name");
   if (!nameField) {
-    console.warn("[OctoProbe] Registration form fields did not load (form_incomplete)");
+    console.warn("[OctoProbe] Registration form fields missing — cmd-register-open-form must complete first");
     return false;
   }
 
@@ -1966,18 +1966,31 @@ async function _loginSubmit() {
 async function _registerOpenForm() {
   const net = await checkNetworkQuality();
   if (!net.good) return {ok: false, status: "network_poor", avg: net.avg};
-  setBadge("Register: finding link…", "#f0c040");
-  const regEl = await waitFor(
-    () => findBySelectors(REGISTER_LINK_SELECTORS) || findByText(["span","a","button","div"], REGISTER_LINK_TEXTS),
-    8000
-  );
-  if (!regEl) return {ok: false, status: "link_not_found"};
-  await sleep(900 + Math.random() * 1000);
-  await humanClick(regEl);
-  await sleep(300 + Math.random() * 300);
-  setBadge("Register: waiting for form…", "#f0c040");
-  const form = await waitFor(() => document.querySelector("#formReg"), 12000);
-  if (!form) return {ok: false, status: "form_blocked"};
+
+  // If #formReg is already on the page (e.g. after a full-navigation redirect back to
+  // the registration URL), skip the link-click and go straight to waiting for fields.
+  if (!document.querySelector("#formReg")) {
+    setBadge("Register: finding link…", "#f0c040");
+    const regEl = await waitFor(
+      () => findBySelectors(REGISTER_LINK_SELECTORS) || findByText(["span","a","button","div"], REGISTER_LINK_TEXTS),
+      8000
+    );
+    if (!regEl) return {ok: false, status: "link_not_found"};
+    await sleep(900 + Math.random() * 1000);
+    await humanClick(regEl);
+    await sleep(300 + Math.random() * 300);
+    setBadge("Register: waiting for form…", "#f0c040");
+    const form = await waitFor(() => document.querySelector("#formReg"), 12000);
+    if (!form) return {ok: false, status: "form_blocked"};
+  }
+
+  // Wait for AJAX-injected fields. The skeleton (#formReg) appears immediately but
+  // field elements are populated via a server call that bd.js on this page delays by
+  // ~20 s. 90 s is the upper bound before declaring hard failure.
+  setBadge("Register: waiting for fields…", "#f0c040");
+  const nameField = await waitFor(() => document.querySelector("#name"), 90000);
+  if (!nameField) return {ok: false, status: "form_fields_timeout"};
+
   await sleep(2500 + Math.random() * 2000);
   return {ok: true, status: "form_ready"};
 }

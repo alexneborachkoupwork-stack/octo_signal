@@ -962,17 +962,35 @@ async function F1_openAuthPage(tabId) {
 
 async function F2_register(tabId, person, emailAcct) {
   _runLog.entry(`F2: person=${person.name} ${person.surname} email=${emailAcct.email}`);
-  // cmd-register-open-form clicks the register link which navigates the page.
-  // The navigation destroys the content script mid-response, so Chrome fires
-  // "message channel closed" — this is expected, not an error.
-  await sendTabCmd(tabId, "cmd-register-open-form").catch(e => {
+
+  // Pre-arm page-ready BEFORE the link click. If the click causes a full navigation
+  // the old context dies (channel close) and this listener catches the new page signal
+  // without a gap.
+  const regPageReady = waitForPageReady(tabId, 90000);
+  regPageReady.catch(() => {});
+
+  let openResult;
+  try {
+    openResult = await sendTabCmd(tabId, "cmd-register-open-form");
+  } catch (e) {
     if (!String(e).includes("message channel closed")) throw e;
-    // port closed = page navigated = form is opening on the new page
-  });
+    // Full-page navigation: wait for new content.js to fire page-ready, then re-send.
+    // _registerOpenForm sees #formReg already present and skips the link-click, going
+    // straight to waiting for #name.
+    const {state} = await regPageReady.catch(() => ({state: "timeout"}));
+    _runLog.entry(`F2: form page navigated — new page state=${state}`);
+    openResult = await sendTabCmd(tabId, "cmd-register-open-form");
+  }
+  if (!openResult?.ok) {
+    const status = openResult?.status ?? "form_open_failed";
+    const e = new Error(`F2: ${status}`);
+    e.proxyStatus = "proxy_slow"; e.nextAction = "rotate_proxy"; throw e;
+  }
   _runLog.entry("F2: form opened");
+
   const fillResult = await sendTabCmd(tabId, "cmd-register-fill", {person, email: emailAcct.email});
   if (fillResult?.status === "form_incomplete") {
-    const e = new Error("F2: form_incomplete — AJAX fields not loaded");
+    const e = new Error("F2: form_incomplete — fill guard triggered (fields missing after open)");
     e.proxyStatus = "proxy_slow"; e.nextAction = "rotate_proxy"; throw e;
   }
   _runLog.entry("F2: form filled");
