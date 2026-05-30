@@ -266,6 +266,9 @@ async function humanMoveTo(el) {
     }));
     window._mX = Math.round(tx); window._mY = Math.round(ty);
     await sleep(10 + Math.random() * 20);
+    const _t  = i / Math.max(steps, 1);
+    const _spd = 0.3 + 1.4 * (_t < 0.5 ? 2*_t*_t : 1 - Math.pow(-2*_t+2, 2)/2);
+    await sleep(Math.max(3, Math.round((5 + Math.random() * 8) / _spd)));
   }
   await sleep(30 + Math.random() * 50);
   return {x: Math.round(tx), y: Math.round(ty)};
@@ -633,12 +636,6 @@ async function waitForRecaptcha() {
   return _waitForRecaptchaApi();
 }
 
-// Kept as dead stub — callers that reference it won't break.
-async function _waitForRecaptchaClick() {
-  return null;
-}
-
-
 // Extract the reCAPTCHA site key from the current page.
 async function _extractSiteKey() {
   const el = document.querySelector("[data-sitekey]");
@@ -749,11 +746,6 @@ async function injectAlertCapture(confirmToo = false) {
   console.warn("[OctoProbe] scripting API injection failed — alert capture skipped");
 }
 
-// ---------------------------------------------------------------------------
-// Email token wait helper (used by cmd-token-fill handler)
-// ---------------------------------------------------------------------------
-
-
 // Returns {linkToken, codeToken} where linkToken is the short-hex from the email URL
 // and codeToken is the UUID code to enter in the form — or null if not found in time.
 async function waitForEmailToken(jwt, maxMs = 120000) {
@@ -836,7 +828,6 @@ async function waitForEmailToken(jwt, maxMs = 120000) {
   chrome.runtime.onMessage.removeListener(bgListener);
   return null;
 }
-
 
 // Returns {linkToken, codeToken} where:
 //   linkToken  = raw 32-char hex from the email's verification URL (?token=…)
@@ -1529,7 +1520,8 @@ async function visaStepSchedule() {
   );
   if (!captchaDiv) { await _clearWorkflowFailed("Visa: schedule captcha not found", E.VISA_FAILED); return; }
 
-  await sleep(1200 + Math.random() * 1300); // human dwell
+  // Human dwell: read the page before touching captcha.
+  await sleep(1200 + Math.random() * 1300);
 
   // ── 2. Solve reCAPTCHA ────────────────────────────────────────────────────
   setBadge("Visa: solving schedule reCAPTCHA…", "#9060cc");
