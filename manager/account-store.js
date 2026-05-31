@@ -29,6 +29,7 @@ const CSV_HEADERS = [
   'Retry Count',
   'Terminated',
   'Failure Reason',
+  'Profile UUID',
 ];
 
 // Lowercase header → AccountRecord field name
@@ -55,6 +56,7 @@ const HEADER_TO_FIELD = {
   'retry count':           'retryCount',
   'terminated':            'terminated',
   'failure reason':        'failureReason',
+  'profile uuid':          'profileUuid',
 };
 
 const FIELD_TO_HEADER = Object.fromEntries(

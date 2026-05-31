@@ -963,35 +963,54 @@ async function F1_openAuthPage(tabId) {
 async function F2_register(tabId, person, emailAcct) {
   _runLog.entry(`F2: person=${person.name} ${person.surname} email=${emailAcct.email}`);
 
-  // Pre-arm page-ready BEFORE the link click. If the click causes a full navigation
-  // the old context dies (channel close) and this listener catches the new page signal
-  // without a gap.
-  const regPageReady = waitForPageReady(tabId, 90000);
-  regPageReady.catch(() => {});
+  // Retry loop: on fill failure navigate back to home for a fresh form.
+  // Does NOT burn retryCount — fill errors are transient, not proxy burns.
+  const MAX_FORM_ATTEMPTS = 3;
+  for (let _fa = 1; _fa <= MAX_FORM_ATTEMPTS; _fa++) {
+    if (_fa > 1) {
+      _runLog.entry(`F2: form retry ${_fa} — navigating home for a fresh form`);
+      const _homeReady = waitForPageReady(tabId, 30000);
+      _homeReady.catch(() => {});
+      await chrome.tabs.update(tabId, {url: TARGET_URL});
+      await _homeReady.catch(() => {});
+    }
 
-  let openResult;
-  try {
-    openResult = await sendTabCmd(tabId, "cmd-register-open-form");
-  } catch (e) {
-    if (!String(e).includes("message channel closed")) throw e;
-    // Full-page navigation: wait for new content.js to fire page-ready, then re-send.
-    // _registerOpenForm sees #formReg already present and skips the link-click, going
-    // straight to waiting for #name.
-    const {state} = await regPageReady.catch(() => ({state: "timeout"}));
-    _runLog.entry(`F2: form page navigated — new page state=${state}`);
-    openResult = await sendTabCmd(tabId, "cmd-register-open-form");
-  }
-  if (!openResult?.ok) {
-    const status = openResult?.status ?? "form_open_failed";
-    const e = new Error(`F2: ${status}`);
-    e.proxyStatus = "proxy_slow"; e.nextAction = "rotate_proxy"; throw e;
-  }
-  _runLog.entry("F2: form opened");
+    // Pre-arm page-ready BEFORE the link click. If the click causes a full navigation
+    // the old context dies (channel close) and this listener catches the new page signal
+    // without a gap.
+    const regPageReady = waitForPageReady(tabId, 90000);
+    regPageReady.catch(() => {});
 
-  const fillResult = await sendTabCmd(tabId, "cmd-register-fill", {person, email: emailAcct.email});
-  if (fillResult?.status === "form_incomplete") {
-    const e = new Error("F2: form_incomplete — fill guard triggered (fields missing after open)");
-    e.proxyStatus = "proxy_slow"; e.nextAction = "rotate_proxy"; throw e;
+    let openResult;
+    try {
+      openResult = await sendTabCmd(tabId, "cmd-register-open-form");
+    } catch (e) {
+      if (!String(e).includes("message channel closed")) throw e;
+      // Full-page navigation: wait for new content.js to fire page-ready, then re-send.
+      // _registerOpenForm sees #formReg already present and skips the link-click, going
+      // straight to waiting for #name.
+      const {state} = await regPageReady.catch(() => ({state: "timeout"}));
+      _runLog.entry(`F2: form page navigated — new page state=${state}`);
+      openResult = await sendTabCmd(tabId, "cmd-register-open-form");
+    }
+    if (!openResult?.ok) {
+      const _os = openResult?.status ?? openResult?.error ?? "form_open_failed";
+      _runLog.entry(`F2: open failed — ${_os} (attempt ${_fa}/${MAX_FORM_ATTEMPTS})`);
+      if (_fa < MAX_FORM_ATTEMPTS) continue; // navigate home and retry
+      const _oe = new Error(`F2: ${_os} after ${MAX_FORM_ATTEMPTS} attempts`);
+      _oe.proxyStatus = "proxy_slow"; _oe.nextAction = "rotate_proxy"; throw _oe;
+    }
+    _runLog.entry(`F2: form opened (attempt ${_fa})`);
+
+    const fillResult = await sendTabCmd(tabId, "cmd-register-fill", {person, email: emailAcct.email});
+    if (fillResult?.ok) break;
+
+    const _fs = fillResult?.status ?? "form_incomplete";
+    _runLog.entry(`F2: fill ${_fs} (attempt ${_fa}/${MAX_FORM_ATTEMPTS})`);
+    if (_fa === MAX_FORM_ATTEMPTS) {
+      const _fe = new Error(`F2: ${_fs} after ${MAX_FORM_ATTEMPTS} attempts`);
+      _fe.proxyStatus = "proxy_slow"; _fe.nextAction = "rotate_proxy"; throw _fe;
+    }
   }
   _runLog.entry("F2: form filled");
 

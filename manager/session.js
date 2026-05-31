@@ -33,7 +33,7 @@ class Session extends EventEmitter {
    * @param {object}    [opts.proxy]    - proxy config for this session
    * @param {Function}  [opts.onResult] - called with final result when done/failed
    */
-  constructor({ sessionId, config, octoApi, hubServer, workflow, proxy, templateUuid, existingProfile, onResult, keepProfile = false }) {
+  constructor({ sessionId, config, octoApi, hubServer, workflow, proxy, templateUuid, existingProfile, onResult, keepProfile = false, updateProxyOnStart = false }) {
     super();
     this.sessionId    = sessionId;
     this._config      = config;
@@ -44,7 +44,8 @@ class Session extends EventEmitter {
     this._templateUuid  = templateUuid ?? null;
     this._existingProfile = existingProfile ?? null; // skip profile creation, use this UUID
     this._onResult    = onResult ?? (() => {});
-    this._keepProfile  = keepProfile;  // when true, stop() only stops browser; does not delete profile
+    this._keepProfile        = keepProfile;        // when true, stop() only stops browser; does not delete profile
+    this._updateProxyOnStart = updateProxyOnStart; // update proxy on existing profile before browser start
 
     this.state       = STATES.CREATED;
     this.profileUuid = null;   // set after profile creation
@@ -68,9 +69,13 @@ class Session extends EventEmitter {
     try {
       // 1. Create or reuse profile
       if (this._existingProfile) {
-        // WorkflowChain hands us an already-created profile — no creation needed
+        // Reuse a previously saved profile — fingerprint is preserved.
         this.profileUuid = this._existingProfile;
         log.info(this.sessionId, `Reusing existing profile  uuid=${this.profileUuid}`);
+        if (this._updateProxyOnStart && this._proxy) {
+          await this._octoApi.updateProxy(this.profileUuid, this._proxy);
+          log.info(this.sessionId, 'Proxy updated on saved profile (fingerprint unchanged)');
+        }
       } else if (this._templateUuid) {
         log.info(this.sessionId, `Cloning template profile  template=${this._templateUuid}`);
         const clone = await this._octoApi.cloneProfile(
@@ -290,6 +295,15 @@ class Session extends EventEmitter {
   /** Update the proxy for next retry (called by TestWorkflow from the proxy pool) */
   setNextProxy(proxy) {
     this._proxy = proxy;
+  }
+
+  /**
+   * Prevent this session's stop() from deleting the Octo profile.
+   * Call synchronously inside a 'failed' listener (before stop() is awaited)
+   * when the profile should be preserved for the next session.
+   */
+  keepAliveProfile() {
+    this._keepProfile = true;
   }
 
   // ── Helpers ──────────────────────────────────────────────────────────────────

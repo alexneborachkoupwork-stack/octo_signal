@@ -40,7 +40,7 @@ class CsvScheduler extends EventEmitter {
 
     this._maxSessions          = options.maxSessions          ?? 50;
     this._intervalMs           = options.intervalMs           ?? 15_000;
-    this._consulPost           = options.consulPost           ?? config.defaultConsulPost ?? '5084';
+    this._consulPost           = options.consulPost           ?? config.defaultConsulPost;
     this._triggerMode          = options.triggerMode          ?? 'AUTO_TRIGGER';
     this._emailProvider        = options.emailProvider        ?? 'mailtm';
     this._proxies              = options.proxies              ?? [];
@@ -131,9 +131,6 @@ class CsvScheduler extends EventEmitter {
     const proxy    = this._proxies.length
       ? this._proxies[this._proxyIdx++ % this._proxies.length]
       : null;
-    const template = this._templateUuids.length
-      ? this._templateUuids[this._templateIdx++ % this._templateUuids.length]
-      : null;
 
     this._store.update(acc.accountId, {
       status:       'RUNNING',
@@ -143,14 +140,31 @@ class CsvScheduler extends EventEmitter {
       workflowState: '',
     });
 
-    const session = this._sm.createSession(
-      'all-in-one',
-      this._buildPayload(acc),
-      proxy,
-      null,
-      template,
-      { keepProfile: false },
-    );
+    // Reuse saved profile if available — preserves fingerprint across retries.
+    // On a fresh account (no profileUuid) clone from template as usual.
+    const savedProfile = acc.profileUuid || null;
+    let session;
+    if (savedProfile) {
+      session = this._sm.createSessionOnExistingProfile(
+        'all-in-one',
+        this._buildPayload(acc),
+        savedProfile,
+        proxy,
+        { keepProfile: false, updateProxyOnStart: !!(proxy) },
+      );
+    } else {
+      const template = this._templateUuids.length
+        ? this._templateUuids[this._templateIdx++ % this._templateUuids.length]
+        : null;
+      session = this._sm.createSession(
+        'all-in-one',
+        this._buildPayload(acc),
+        proxy,
+        null,
+        template,
+        { keepProfile: false },
+      );
+    }
 
     this._store.update(acc.accountId, { workerId: session.sessionId });
     log.ginfo(`CsvScheduler: launched  accountId=${acc.accountId}  sessionId=${session.sessionId}`);
@@ -175,6 +189,7 @@ class CsvScheduler extends EventEmitter {
         workflowState: 'DONE',
         finishedAt:    new Date().toISOString(),
         fileName:      result.fileName ?? '',
+        profileUuid:   '',   // profile deleted after successful session
       });
       log.ginfo(`CsvScheduler: done  accountId=${acc.accountId}  done=${this._doneCount}`);
       this._onWorkerFinished();
@@ -184,11 +199,16 @@ class CsvScheduler extends EventEmitter {
     session.once('failed', (reason) => {
       this._clearWorker(acc.accountId);
 
+      // Capture profileUuid NOW — still set here because 'failed' fires synchronously
+      // inside _fail(), before stop() is awaited and the profile is deleted.
+      const profileUuid = session.profileUuid ?? '';
+
       // ── No-slots: idle and retry, don't burn retryCount ──────────────────
       const noSlots = /no available slots|no.*slot.*found|calendar did not appear/i.test(reason);
       if (noSlots) {
         const waitMins = Math.round(this._slotWaitMs / 60_000);
         log.gwarn(`CsvScheduler: no-slots — idling ${waitMins}min before retry  accountId=${acc.accountId}`);
+        if (profileUuid) session.keepAliveProfile(); // preserve fingerprint across slot-wait
         // Store retry timestamp in-memory (_slotRetryAt is not a CSV column, won't be persisted)
         const record = this._store.get(acc.accountId);
         if (record) record._slotRetryAt = Date.now() + this._slotWaitMs;
@@ -197,6 +217,7 @@ class CsvScheduler extends EventEmitter {
           workerId:      '',
           workflowState: 'SLOT_WAIT',
           failureReason: reason,
+          profileUuid:   profileUuid,
         });
         this._startSlotWaitTimer();
         this._onWorkerFinished();
@@ -215,22 +236,27 @@ class CsvScheduler extends EventEmitter {
 
       if (!fatal && retryCount <= maxRetries) {
         log.gwarn(`CsvScheduler: failed (retry ${retryCount}/${maxRetries})  accountId=${acc.accountId}  reason=${reason}`);
+        // Keep the profile alive — next launch will reuse it (same fingerprint, rotated proxy).
+        if (profileUuid) session.keepAliveProfile();
         this._store.update(acc.accountId, {
           status:        'PENDING',
           retryCount,
           failureReason: reason,
           workerId:      '',
           workflowState: '',
+          profileUuid:   profileUuid,
         });
       } else {
         if (fatal) log.gerror(`CsvScheduler: terminated (fatal)  accountId=${acc.accountId}  reason=${reason}`);
         else       log.gerror(`CsvScheduler: terminated  accountId=${acc.accountId}  reason=${reason}`);
+        // Terminal — profile will be deleted by stop() (keepAliveProfile NOT called).
         this._store.update(acc.accountId, {
           status:        'TERMINATED',
           terminated:    true,
           failureReason: reason,
           finishedAt:    new Date().toISOString(),
           retryCount,
+          profileUuid:   '',
         });
       }
       this._onWorkerFinished();

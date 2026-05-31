@@ -51,6 +51,14 @@ const WARMUP_SITES = [
 ];
 const WARMUP_DWELL_MS = 100_000;
 
+// Applicant nationality/country — ISO 3166-1 alpha-3. Used for registration
+// nationality field, questionnaire answers, and visa form country defaults.
+const APPLICANT_NATIONALITY  = "FRA";  // Cape Verde
+
+// Target consular post — used as the fallback when visa-consular-post storage key
+// is not set. Must match config.defaultConsulPost in the manager.
+const TARGET_CONSULAR_POST   = "3059";
+
 // ---------------------------------------------------------------------------
 // Selectors
 // ---------------------------------------------------------------------------
@@ -525,11 +533,10 @@ async function _clearWorkflowFailed(reason, code = 0) {
 }
 
 async function _selectNationality(natEl, person) {
-  // Nationality is always CPV (Cape Verde) — select directly by option value.
-  person.nationality = "CPV";
+  person.nationality = APPLICANT_NATIONALITY;
   await storageSet({"register-person": Object.assign({}, person)});
-  await humanSelect(natEl, "CPV");
-  console.log("[OctoProbe] Nationality selected: CPV (Cape Verde)");
+  await humanSelect(natEl, APPLICANT_NATIONALITY);
+  console.log(`[OctoProbe] Nationality selected: ${APPLICANT_NATIONALITY}`);
 }
 
 // Returns selectors of fields that are visibly present but have an empty value.
@@ -927,6 +934,7 @@ async function dismissCookieConsent() {
   // Cookie banners are injected asynchronously — poll for up to 4 s so we don't
   // miss a banner that appears after document_end fires.
   const COOKIE_SELECTORS = [
+    "#allowAllCookiesBtn",                                        // E-VISA site (PT)
     "#onetrust-accept-btn-handler",
     "#accept-all-cookies",
     "#acceptAllCookies",
@@ -937,7 +945,7 @@ async function dismissCookieConsent() {
     "[class*='cookie'][class*='accept' i]",
     "[class*='consent'][class*='accept' i]",
   ];
-  const COOKIE_TEXTS = ["accept all", "accept cookies", "aceitar todos", "aceitar tudo", "allow all", "aceitar"];
+  const COOKIE_TEXTS = ["aceitar todas", "accept all", "accept cookies", "aceitar todos", "aceitar tudo", "allow all", "aceitar"];
 
   const btn = await waitFor(() =>
     findBySelectors(COOKIE_SELECTORS) ||
@@ -1074,7 +1082,7 @@ async function visaStepGoToQuestionnaire() {
 const _QUESTIONNAIRE_STEPS = [
   // [selectId, qNum, value, label]
   // qNum matches the id_pergunta argument to goNext() — same as the trailing number in selectId.
-  ["cb_question_21",  21,  "CPV",    "Country of residence"],
+  ["cb_question_21",  21,  APPLICANT_NATIONALITY, "Country of residence"],
   ["cb_question_2",    2,  "01",     "Passport type (ordinary)"],
   ["cb_question_3",    3,  "SCH",    "Stay duration (up to 90 days)"],
   ["cb_question_5",    5,  "O",      "Seasonal work? (no)"],
@@ -1122,28 +1130,28 @@ async function visaStepQuestionnaire() {
       const q1Ready = await waitFor(() => q1El.options.length > 1 ? q1El : null, 8000, 300);
       if (q1Ready) {
         const cur = q1El.value;
-        const isCpv = cur === "CPV";
+        const isCpv = cur === APPLICANT_NATIONALITY;
         if (!isCpv) {
-          console.log(`[OctoProbe] Q1 current value="${cur}" — selecting CPV`);
+          console.log(`[OctoProbe] Q1 current value="${cur}" — selecting ${APPLICANT_NATIONALITY}`);
           await sleep(400 + Math.random() * 400);
           const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")?.set;
-          if (setter) setter.call(q1El, "CPV"); else q1El.value = "CPV";
+          if (setter) setter.call(q1El, APPLICANT_NATIONALITY); else q1El.value = APPLICANT_NATIONALITY;
         } else {
-          console.log("[OctoProbe] Q1 already set to CPV");
+          console.log(`[OctoProbe] Q1 already set to ${APPLICANT_NATIONALITY}`);
         }
       } else {
         console.warn("[OctoProbe] Q1 select options did not load");
       }
     } else {
-      console.warn("[OctoProbe] cb_question_1 not found — attempting goNext(1,'CPV') anyway");
+      console.warn(`[OctoProbe] cb_question_1 not found — attempting goNext(1,'${APPLICANT_NATIONALITY}') anyway`);
     }
 
     await sleep(300 + Math.random() * 200);
-    console.log("[OctoProbe] Calling goNext(1,'CPV')");
-    await _callPageFn(`if(typeof goNext==='function') goNext(1,'CPV');`);
+    console.log(`[OctoProbe] Calling goNext(1,'${APPLICANT_NATIONALITY}')`);
+    await _callPageFn(`if(typeof goNext==='function') goNext(1,'${APPLICANT_NATIONALITY}');`);
 
     firstQ = await _waitForQSelect("cb_question_21", 15000);
-    if (!firstQ) { await _clearWorkflowFailed("Visa: Q21 not appeared after goNext(1,'CPV')", E.VISA_FAILED); return; }
+    if (!firstQ) { await _clearWorkflowFailed(`Visa: Q21 not appeared after goNext(1,'${APPLICANT_NATIONALITY}')`, E.VISA_FAILED); return; }
   } else {
     console.log("[OctoProbe] Q1 auto-fired — Q21 already present");
   }
@@ -1350,9 +1358,9 @@ async function visaStepForm({submitAfter = true} = {}) {
     // prefill (readonly, skip): f1 surname, f3 first name, f4 dob, f9 gender
     ["f2",    "+"],      // surname at birth — default:+
     ["f6",    "+"],      // place of birth — default:+  (was f6sf2, corrected)
-    ["f6sf1", "CPV"],   // country of birth — default:CPV
-    ["f7sf1", "CPV"],   // current nationality — default:CPV
-    ["f8",    "CPV"],   // original nationality — default:CPV
+    ["f6sf1", APPLICANT_NATIONALITY],   // country of birth
+    ["f7sf1", APPLICANT_NATIONALITY],   // current nationality
+    ["f8",    APPLICANT_NATIONALITY],   // original nationality
     ["f10",   "1"],     // marital status — default:single (1)
   ];
   for (const [name, val] of tab1Fields) {
@@ -1369,7 +1377,7 @@ async function visaStepForm({submitAfter = true} = {}) {
     // Visual reading order: f16 → f17 → f15 (matches form layout)
     ["f16", passportIssueDate],   // date of issue — inject (person > config > auto)
     ["f17", passportExpiryDate],  // valid until — inject (person > config > auto)
-    ["f15", "CPV"],               // issued by — default:CPV
+    ["f15", APPLICANT_NATIONALITY],   // issued by
     // f5 (ID number) — optional, no mark, skip
   ];
   for (const [name, val] of tab2Fields) {
@@ -1511,7 +1519,7 @@ async function visaStepSchedule() {
 
   const {"visa-consular-post": postoId, "direct-slots-fetch": directFetch = false} =
     await storageGet(["visa-consular-post", "direct-slots-fetch"]);
-  const POSTO = postoId ?? "5088";
+  const POSTO = postoId ?? TARGET_CONSULAR_POST;
 
   // ── 1. Wait for captchaDiv ────────────────────────────────────────────────
   const captchaDiv = await waitFor(
@@ -1964,8 +1972,8 @@ async function _loginSubmit() {
 }
 
 async function _registerOpenForm() {
-  const net = await checkNetworkQuality();
-  if (!net.good) return {ok: false, status: "network_poor", avg: net.avg};
+  // Network was already tested by cmd-log-ip before F2 starts — no need to re-probe here.
+  // Re-probing adds ~3 s overhead and can transiently fail even when the page loaded fine.
 
   // If #formReg is already on the page (e.g. after a full-navigation redirect back to
   // the registration URL), skip the link-click and go straight to waiting for fields.
@@ -1980,7 +1988,7 @@ async function _registerOpenForm() {
     await humanClick(regEl);
     await sleep(300 + Math.random() * 300);
     setBadge("Register: waiting for form…", "#f0c040");
-    const form = await waitFor(() => document.querySelector("#formReg"), 12000);
+    const form = await waitFor(() => document.querySelector("#formReg"), 30000);
     if (!form) return {ok: false, status: "form_blocked"};
   }
 
@@ -1991,7 +1999,9 @@ async function _registerOpenForm() {
   const nameField = await waitFor(() => document.querySelector("#name"), 90000);
   if (!nameField) return {ok: false, status: "form_fields_timeout"};
 
-  await sleep(2500 + Math.random() * 2000);
+  // Return immediately — the auth page's JS can clear #mainContent after a few seconds,
+  // so any dwell here risks losing the form before fillRegisterForm runs.
+  // Human dwell is provided by the inter-field pauses inside fillRegisterForm itself.
   return {ok: true, status: "form_ready"};
 }
 
