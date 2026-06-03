@@ -957,7 +957,7 @@ async function step4_regFormSubmit(tabId, person, emailAcct) {
 
   await skSet({[SK.WORKFLOW_STEP]: WF_STEPS.REG_FORM_SUBMITTED});
   const result = await sendTabCmd(tabId, "cmd-register-submit").catch(() => ({ok: true, status: "navigated"}));
-  _runLog.entry(`step4: submit → ${result.status}`);
+  _runLog.entry(`step4: submit → ${result.status ?? ("error: " + (result?.error ?? "?"))}`);
 
   if (result.status === "ip_blocked") {
     const e = new Error("step4: IP blocked by captcha rate-limit");
@@ -1024,7 +1024,7 @@ async function step6_regFormSubmit2(tabId, emailAcct) {
 
   await skSet({[SK.WORKFLOW_STEP]: WF_STEPS.REG_FORM_SUBMITTED2});
   const result = await sendTabCmd(tabId, "cmd-register-submit").catch(() => ({ok: true, status: "navigated"}));
-  _runLog.entry(`step6: submit → ${result.status}`);
+  _runLog.entry(`step6: submit → ${result.status ?? ("error: " + (result?.error ?? "?"))}`);
 
   if (result.status === "ip_blocked") {
     const e = new Error("step6: IP blocked — rotate proxy");
@@ -1132,7 +1132,15 @@ async function step10_regVerify(tabId, person, emailAcct) {
 // Fill login credentials, solve reCAPTCHA, and submit. cmd-login-submit handles RGPD consent
 // and waits for the redirect internally. Returns {ok:true} on logged-in/navigated.
 async function step11_loginSubmit(tabId, creds) {
-  await sendTabCmd(tabId, "cmd-login-fill", creds);
+  const fillResult = await sendTabCmd(tabId, "cmd-login-fill", creds)
+      .catch(() => ({ok: true, status: "navigated"}));
+  // If the page navigated mid-fill (SSO race), skip straight to step15 — it will
+  // verify whether the session is already established without attempting a submit.
+  if (fillResult.status === "navigated") return {ok: true, status: "navigated"};
+  if (!fillResult?.ok) {
+    await skSet({[SK.WORKFLOW_STEP]: WF_STEPS.LOGIN_FAILED});
+    return {ok: false, status: fillResult?.status ?? "fill_failed"};
+  }
   await skSet({[SK.WORKFLOW_STEP]: WF_STEPS.LOGIN_SUBMITTED});
 
   const result = await sendTabCmd(tabId, "cmd-login-submit").catch(async () => {
@@ -1784,6 +1792,7 @@ async function wf_register(realPerson = null) {
     await _runLog.finish(`ok status=${r.status}`);
   } catch(e) {
     await _runLog.finish(`error: ${e.message ?? String(e)}`);
+    throw e;
   } finally {
     _releaseWf();
     if (tabId) chrome.tabs.remove(tabId).catch(() => {});

@@ -261,8 +261,8 @@ async function humanMoveTo(el) {
     }));
     window._mX = Math.round(tx); window._mY = Math.round(ty);
     await sleep(10 + Math.random() * 20);
-    const _t  = i / Math.max(steps, 1);
-    const _spd = 0.3 + 1.4 * (_t < 0.5 ? 2*_t*_t : 1 - Math.pow(-2*_t+2, 2)/2);
+    // correction move is at t=1 (end of curve) — full speed
+    const _spd = 0.3 + 1.4 * (1 - Math.pow(-2*1+2, 2)/2);
     await sleep(Math.max(3, Math.round((5 + Math.random() * 8) / _spd)));
   }
   await sleep(30 + Math.random() * 50);
