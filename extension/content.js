@@ -19,7 +19,7 @@
 // tracks active *event handler* execution.  A chrome.runtime.connect port opened
 // from a content script IS tracked: as long as any tab has this script running,
 // the SW is kept alive indefinitely.  Content.js matches <all_urls> so it runs
-// on the worker-init tab and every workflow tab the extension opens.
+// on every workflow tab the extension opens.
 (function _swKeepalivePort() {
   try {
     const port = chrome.runtime.connect({name: "sw-keepalive"});
@@ -39,16 +39,6 @@ setInterval(() => {
 }, 20_000);
 
 // TARGET_HOST, TARGET_URL, MAILTM — defined in constants.js
-
-const WARMUP_SITES = [
-  "https://www.google.com/search?q=apply+for+visa+portugal",
-  "https://en.wikipedia.org/wiki/Portugal",
-  "https://news.google.com/",
-  "https://www.youtube.com/",
-  "https://www.google.com/maps/place/Lisbon,+Portugal",
-  "https://www.google.com/search?q=schengen+visa+europe+requirements",
-];
-const WARMUP_DWELL_MS = 100_000;
 
 // Applicant nationality/country — ISO 3166-1 alpha-3 fallback when storage has no value.
 const APPLICANT_NATIONALITY  = "CPV";
@@ -455,52 +445,6 @@ const LOGIN_SUBMIT_SELECTORS = [
   ".btn-login",
 ];
 
-// ---------------------------------------------------------------------------
-// Warmup (legacy — kept only for WARMUP_SITES / WARMUP_DWELL_MS constants)
-// ---------------------------------------------------------------------------
-
-async function warmupStep() {
-  const {
-    [SK.WARMUP_END_TIME]:   endTime,
-    [SK.WARMUP_SITE_INDEX]: siteIdx = 0,
-  } = await skGet(SK.WARMUP_END_TIME, SK.WARMUP_SITE_INDEX);
-
-  const now      = Date.now();
-  const timeLeft = Math.max(0, Math.round((endTime - now) / 1000));
-
-  if (now >= endTime) {
-    console.log("[OctoProbe] Warmup complete — transitioning to registration");
-    await skSet({[SK.WORKFLOW_TYPE]: "register", [SK.WORKFLOW_STEP]: "home", [SK.WARMUP_SITE_INDEX]: 0});
-    location.href = `https://${TARGET_HOST}/VistosOnline/`;
-    return;
-  }
-
-  setBadge(`Warming up… ${timeLeft}s`, "#888888");
-  console.log(`[OctoProbe] Warmup site ${siteIdx}: ${location.href} — ${timeLeft}s left`);
-
-  let scrollPos = 0;
-  let _scrollTimer = null;
-  const _doScroll = () => {
-    scrollPos += 70 + Math.round(_lognormalMs(90, 0.5));
-    window.scrollTo({top: scrollPos, behavior: "smooth"});
-    _scrollTimer = setTimeout(_doScroll, _lognormalMs(5200, 0.4));
-  };
-  _scrollTimer = setTimeout(_doScroll, _lognormalMs(3000, 0.5));
-
-  setTimeout(async () => {
-    clearTimeout(_scrollTimer);
-    const nextIdx = siteIdx + 1;
-
-    if (Date.now() >= endTime || nextIdx >= WARMUP_SITES.length * 2) {
-      await skSet({[SK.WORKFLOW_TYPE]: "register", [SK.WORKFLOW_STEP]: "home", [SK.WARMUP_SITE_INDEX]: 0});
-      location.href = `https://${TARGET_HOST}/VistosOnline/`;
-    } else {
-      await skSet({[SK.WARMUP_SITE_INDEX]: nextIdx});
-      location.href = WARMUP_SITES[nextIdx % WARMUP_SITES.length];
-    }
-  }, WARMUP_DWELL_MS);
-}
-
 async function _clearWorkflowFailed(reason, code = 0) {
   setBadge(reason, "#ff6b6b");
   throw Object.assign(new Error(reason), {errorCode: code, isWorkflowError: true});
@@ -842,63 +786,6 @@ function extractTokenFromMsg(msg) {
 
   console.log(`[OctoProbe] Email tokens — link: ${linkToken ?? "?"}, code: ${codeToken ?? "?"}`);
   return {linkToken, codeToken};
-}
-
-// ---------------------------------------------------------------------------
-// Network quality probe
-// ---------------------------------------------------------------------------
-
-// Ping Google's dedicated connectivity endpoint twice and return the average RTT.
-// Returns {avg, good} — "good" means both probes completed within threshold.
-const _NET_BAD_MS  = 2000;  // avg RTT above this = poor proxy, stop workflow
-const _NET_TIMEOUT = 2500;  // per-probe abort timeout — exceeding this already proves bad proxy
-const _NET_PROBE   = "https://www.google.com/generate_204";
-
-async function checkNetworkQuality() {
-  setBadge("Checking network…", "#f0c040");
-  const times = [];
-  let timedOut = false;
-  for (let i = 0; i < 2; i++) {
-    const t0 = performance.now();
-    try {
-      const ctrl = new AbortController();
-      const tid  = setTimeout(() => ctrl.abort(), _NET_TIMEOUT);
-      await fetch(_NET_PROBE, {method:"HEAD", mode:"no-cors", cache:"no-store", signal: ctrl.signal});
-      clearTimeout(tid);
-      times.push(performance.now() - t0);
-    } catch(_) {
-      timedOut = true;
-      times.push(_NET_TIMEOUT);
-      break; // first probe timed out — proxy is dead, no need for second probe
-    }
-    if (i === 0) await sleep(300); // small gap between probes
-  }
-  const avg = Math.round(times.reduce((a,b) => a+b,0) / times.length);
-  const good = !timedOut && avg < _NET_BAD_MS;
-  console.log(`[OctoProbe] Network RTT: ${times.map(t=>Math.round(t)).join(", ")}ms — avg ${avg}ms — ${good ? "OK" : "POOR"}`);
-  setBadge(`Network: ${avg}ms ${good ? "OK" : "POOR"}`, good ? "#00d4aa" : "#ff6b6b");
-  await sleep(600); // brief pause so the badge is readable
-  return {avg, good};
-}
-
-async function _checkProxyQuality() {
-  const net = await checkNetworkQuality();
-  let proxy = {queryOk: false};
-  try {
-    const r = await fetch(
-      "http://ip-api.com/json?fields=status,query,countryCode,isp,org,proxy,hosting,mobile",
-      {cache: "no-store"}
-    );
-    if (r.ok) {
-      const d = await r.json();
-      if (d.status === "success") {
-        proxy = {queryOk: true, ip: d.query, country: d.countryCode,
-                 isp: d.isp, org: d.org, isProxy: d.proxy,
-                 isHosting: d.hosting, isMobile: d.mobile};
-      }
-    }
-  } catch (_) {}
-  return {network: {avgRtt: net.avg, good: net.good}, proxy};
 }
 
 // ---------------------------------------------------------------------------
@@ -1582,7 +1469,6 @@ async function visaStepSchedule() {
 
   let chosenDateISO = null; // "YYYY-MM-DD" — calendar key format
   let chosenDate    = null; // "YYYY/MM/DD" — field value format
-  let _chosenSlotKey = null; // for slot reporting to manager
   if (slotsRaw) {
     try {
       const slots = JSON.parse(slotsRaw);
@@ -1593,46 +1479,9 @@ async function visaStepSchedule() {
         .filter(d => { const dt = new Date(d); dt.setHours(0,0,0,0); return dt > today; })
         .sort();
       console.log("[OctoProbe] Available dates:", valid);
-
       if (valid.length) {
-        // ── Slot intelligence: observe + request assignment ───────────────────
-        // Build flat {date, time} list from all visible slots for the pool.
-        const visibleSlots = [];
-        for (const s of slots) {
-          if (!s.date || !s.periods?.length) continue;
-          for (const p of s.periods) {
-            const time = typeof p === "string" ? p : (p.time ?? p.hour ?? "");
-            if (time) visibleSlots.push({ date: s.date, time });
-          }
-        }
-
-        // Fire-and-forget observation — non-blocking
-        chrome.runtime.sendMessage({ type: "slot-observation", postId: Number(POSTO), slots: visibleSlots }).catch(() => {});
-
-        // Soft-blocking assignment request (3s timeout — falls back to local logic)
-        const assignment = await chrome.runtime.sendMessage({
-          type: "slot-assignment-request",
-          postId: Number(POSTO),
-          visibleSlots,
-        }).catch(() => null);
-
-        if (assignment?.ok && assignment.primary?.date) {
-          chosenDateISO  = assignment.primary.date;
-          chosenDate     = assignment.primary.date.replace(/-/g, "/");
-          _chosenSlotKey = assignment.primary.slotKey;
-          console.log("[OctoProbe] Slot assignment: primary=", _chosenSlotKey,
-            "fallbacks=", assignment.fallbacks?.length ?? 0);
-          // Store fallbacks on window for use in submit retry (if needed)
-          window._octoSlotFallbacks = assignment.fallbacks ?? [];
-        } else {
-          // No manager assignment — pick earliest available locally
-          chosenDateISO = valid[0];
-          chosenDate    = valid[0].replace(/-/g, "/");
-          if (visibleSlots.length) {
-            const fb = visibleSlots.find(s => s.date === chosenDateISO);
-            _chosenSlotKey = fb ? `${POSTO}-${fb.date}-${fb.time}` : null;
-          }
-        }
+        chosenDateISO = valid[0];
+        chosenDate    = valid[0].replace(/-/g, "/");
       }
     } catch(_) {}
   }
@@ -1841,10 +1690,6 @@ async function visaStepSchedule() {
   setBadge("Visa: waiting for booking confirmation…", "#9060cc");
   const result = await _waitPageMessage(_schedMsgType, 45000);
   if (!result || result.error) {
-    // Report failure to slot pool before exiting
-    if (_chosenSlotKey) {
-      chrome.runtime.sendMessage({ type: "slot-failure", slotKey: _chosenSlotKey, reason: result?.error ?? "timeout" }).catch(() => {});
-    }
     await _clearWorkflowFailed(`Visa: booking failed — ${result?.error ?? "timeout"}`, E.VISA_FAILED);
     return;
   }
@@ -1883,11 +1728,6 @@ async function visaStepSchedule() {
       console.log("[OctoProbe] No PDF URL in response HTML — confirmation page received");
       setBadge("Visa: appointment confirmed!", "#00d4aa");
     }
-  }
-
-  // Report slot success to pool
-  if (_chosenSlotKey) {
-    chrome.runtime.sendMessage({ type: "slot-success", slotKey: _chosenSlotKey }).catch(() => {});
   }
 
   console.log("[OctoProbe] Visa: schedule complete  date=" + chosenDate + "  period=" + firstPeriod.text);
@@ -2185,18 +2025,7 @@ async function _tokenFill(codeToken) {
   }
   tokenInput.scrollIntoView({behavior: "smooth", block: "center"});
   await sleep(900 + Math.random() * 800);
-  const fillResult = await sendBgMessage({type: "fill-token", token: codeToken}).catch(() => null);
-  console.log("[OctoProbe] Type-token result:", fillResult);
-  await sleep(300 + Math.random() * 300);
-  if (!tokenInput.value) {
-    console.warn("[OctoProbe] Scripting API fill failed — isolated-world humanType fallback");
-    const target = findTokenInput() ?? tokenInput;
-    target.focus();
-    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
-    if (setter) setter.call(target, ""); else target.value = "";
-    target.dispatchEvent(new Event("input", {bubbles: true}));
-    await humanType(target, codeToken);
-  }
+  await humanType(tokenInput, codeToken);
   return {ok: true};
 }
 
@@ -2351,10 +2180,6 @@ const _CMD_HANDLERS = {
     return {ok: true};
   },
 
-  "cmd-run-proxy-check": async () => {
-    const q = await _checkProxyQuality();
-    return {ok: true, ...q};
-  },
 };
 
 // ---------------------------------------------------------------------------
@@ -2444,65 +2269,6 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   console.log(`[OctoProbe] page-ready: state=${state} url=${location.href}`);
   chrome.runtime.sendMessage({type: "page-ready", state, url: location.href}).catch(() => {});
 
-  // On schedule pages, install a passive XHR intercept to report slot observations.
-  // This runs in the background during warmup idle — workers on the schedule page
-  // continuously see slot data as the page polls /VistosOnline/slots.
-  if (state === "schedule") _installSlotsXhrHook();
-
   setBadge(`Octo Probe v${chrome.runtime.getManifest().version}`, "#00d4aa");
 })();
 
-// ---------------------------------------------------------------------------
-// Passive XHR intercept — reports /VistosOnline/slots responses to manager
-// ---------------------------------------------------------------------------
-
-function _installSlotsXhrHook() {
-  // Use session-key-derived names so no static "octo-*" or "__octo*" string appears in MAIN world.
-  const _hookFlag   = '_h' + _sessionSk;
-  const _slotsType  = '_s' + _sessionSk;
-
-  // Run in MAIN world via executeScript so it can intercept page's own XHR instances.
-  chrome.runtime.sendMessage({
-    type: "exec-page-script",
-    code: `(function(hookFlag, msgType){
-      if (window[hookFlag]) return;
-      window[hookFlag] = true;
-      var _open = XMLHttpRequest.prototype.open;
-      XMLHttpRequest.prototype.open = function(method, url) {
-        if (typeof url === "string" && url.includes("/VistosOnline/slots")) {
-          this.addEventListener("load", function() {
-            try {
-              var data = JSON.parse(this.responseText);
-              if (Array.isArray(data)) {
-                var m = url.match(/posto_id=(\\d+)/);
-                var postId = m ? Number(m[1]) : 0;
-                var slots = [];
-                for (var i = 0; i < data.length; i++) {
-                  var s = data[i];
-                  if (!s.date || !s.periods) continue;
-                  for (var j = 0; j < s.periods.length; j++) {
-                    var p = s.periods[j];
-                    var t = typeof p === "string" ? p : (p.time || p.hour || "");
-                    if (t) slots.push({date: s.date, time: t});
-                  }
-                }
-                if (slots.length) window.postMessage({type:msgType, postId, slots}, "*");
-              }
-            } catch(_) {}
-          });
-        }
-        return _open.apply(this, arguments);
-      };
-    })(${JSON.stringify(_hookFlag)}, ${JSON.stringify(_slotsType)});`,
-  }).catch(() => {});
-
-  // Forward postMessage observations to background
-  window.addEventListener("message", (ev) => {
-    if (ev.source !== window || ev.data?.type !== _slotsType) return;
-    chrome.runtime.sendMessage({
-      type: "slot-observation",
-      postId: ev.data.postId,
-      slots:  ev.data.slots,
-    }).catch(() => {});
-  });
-}

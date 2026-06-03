@@ -13,16 +13,6 @@
 
   "content_scripts": [
     {
-      "matches": [
-        "http://localhost/*/worker-init*",
-        "http://127.0.0.1/*/worker-init*",
-        "http://*/*worker-init*",
-        "https://*/*worker-init*"
-      ],
-      "js": ["constants.js", "hub-init.js"],
-      "run_at": "document_end"
-    },
-    {
       "matches": ["*://pedidodevistos.mne.gov.pt/*"],
       "js": ["antidetect.js"],
       "run_at": "document_start",

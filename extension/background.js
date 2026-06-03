@@ -1,7 +1,6 @@
 // Service worker — credential storage, workflow dispatch, mail.tm email polling.
 
 importScripts('constants.js');
-importScripts('communication.js');
 
 // Load static config into storage so CF email settings are available without popup interaction.
 async function _loadExtensionConfig() {
@@ -32,8 +31,6 @@ async function _ensureCfEmailConfig() {
   await _loadExtensionConfig();
   return skGet(SK.CF_MAIL_DOMAIN, SK.CF_WORKER_URL, SK.CF_WORKER_SECRET);
 }
-
-self._ensureCfEmailConfig = _ensureCfEmailConfig;
 
 (async () => { await _loadExtensionConfig(); })();
 
@@ -90,17 +87,12 @@ const _runLog = (() => {
     _lines = [];
     _label = null;
     try {
-      const d   = await skGet(SK.BOT_ID);
-      const sid = d[SK.BOT_ID] ? `_${d[SK.BOT_ID].slice(0, 8)}` : "";
-      const filename = `${label}${sid}_${ts}.log`;
+      const filename = `${label}_${ts}.log`;
       const url = "data:text/plain;charset=utf-8," + encodeURIComponent(content);
       const downloadId = await chrome.downloads.download({ url, filename, saveAs: false });
       // Wait for the file to be fully written before resolving.
       // chrome.downloads.download() resolves when Chrome *accepts* the request, not when
-      // the file is on disk.  For Octo profiles each profile is its own Chrome process —
-      // the process exits when the manager calls stopProfile(), cancelling any download
-      // that hasn't finished writing yet.  Waiting for onChanged state=complete ensures
-      // the file is on disk before we send the done/error WS message that triggers teardown.
+      // the file is on disk. Waiting for onChanged state=complete ensures the file is on disk.
       await new Promise((resolve) => {
         const timer = setTimeout(resolve, TIMER_MS.misc.DOWNLOAD_CAP); // safety cap — never hang
         function onChanged(delta) {
@@ -119,7 +111,6 @@ const _runLog = (() => {
 
   return { start, entry, finish };
 })();
-self._runLog = _runLog; // expose to communication.js (same SW scope, but const isn't on self)
 
 function _pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
 function _rand(n)   { return Math.floor(Math.random() * n); }
@@ -165,13 +156,6 @@ function _genPassword() {
   for (let i=0;i<13;i++) c.push(all[_rand(all.length)]);
   for (let i=c.length-1;i>0;i--) { const j=_rand(i+1); [c[i],c[j]]=[c[j],c[i]]; }
   return c.join("");
-}
-
-function _genUsername(firstName, lastName) {
-  // Normalize accents (é→e, ã→a, ç→c) before extracting chars to avoid "srg" instead of "ser".
-  const norm = s => s.normalize("NFD").replace(_COMB,"").split(" ")[0].toLowerCase().replace(/[^a-z]/g,"");
-  const f = norm(firstName), l = norm(lastName);
-  return f.slice(0,3) + l.slice(0,3) + String(_rand(90000000)+10000000); // e.g. "serlim56027114"
 }
 
 function _genCredentials(firstName, lastName) {
@@ -469,14 +453,6 @@ function _extractToken(msg) {
 // reCAPTCHA API solvers
 // ---------------------------------------------------------------------------
 
-const _SOLVER_URLS = {
-  "anti-captcha": "https://api.anti-captcha.com",
-  "2captcha":     "https://api.2captcha.com",
-  "capmonster":   "https://api.capmonster.cloud",
-  "capsolver":    "https://api.capsolver.com",
-};
-
-
 // Shared polling solver for Anti-Captcha / CapMonster / 2Captcha (identical JSON API).
 async function _solveACFormat(baseUrl, apiKey, pageUrl, siteKey, action) {
   const task = {type:"RecaptchaV2EnterpriseTaskProxyless", websiteURL:pageUrl, websiteKey:siteKey, isEnterprise:true};
@@ -602,11 +578,6 @@ function _recaptchaInjectFunc(token, evtRcp) {
   document.dispatchEvent(new CustomEvent(evtRcp, {detail:{token}}));
 }
 
-// Unified solver dispatch — races all solvers in parallel; first token wins.
-async function _doSolveRecaptcha(pageUrl, siteKey, action) {
-  return _raceSolvers(pageUrl, siteKey, action);
-}
-
 // ---------------------------------------------------------------------------
 // Tab helper + page-ready signaling
 // ---------------------------------------------------------------------------
@@ -618,6 +589,20 @@ async function _resetWorkflow() {
   p6_stop();
   clearInterval(_pollInterval);
   _pollInterval = null;
+
+  // Clear stale in-memory signal state so a new session's step21 doesn't resolve
+  // spuriously, and TARGET_POST_AVAILABLE is not silently dropped by a stale lock.
+  _postAvailableResolver = null;
+  _applyTriggerLock      = false;
+
+  // Close previous session's tabs before clearing their IDs — prevents orphaned tabs
+  // when wf_register/wf_login is called while a previous session is still mid-flight.
+  const prev = await skGet(SK.ACTIVE_TAB_ID, SK.WARMUP_TAB_ID);
+  const _toClose = [...new Set(
+    [prev[SK.ACTIVE_TAB_ID], prev[SK.WARMUP_TAB_ID]].filter(Boolean)
+  )];
+  for (const tid of _toClose) chrome.tabs.remove(tid).catch(() => {});
+
   _activeTabId = null;
 
   await skRemove(
@@ -629,6 +614,7 @@ async function _resetWorkflow() {
     SK.WARMUP_IDLE_STATE, SK.WARMUP_TAB_ID,
     SK.CHALLENGE_COUNT,
     SK.RUN_STATUS, SK.RUN_ERROR,
+    SK.VISA_ARRIVAL_DATE, SK.VISA_DEPARTURE_DATE,
   );
 }
 
@@ -648,11 +634,9 @@ async function _getActiveTab() {
   return _activeTabId;
 }
 
-// Creates a dedicated background tab for one concurrent session.
-// visibilityState is patched by antidetect.js to always return "visible",
-// and CDP mouse events (reCAPTCHA click) work on background tabs.
+// Creates a dedicated tab for one concurrent session and brings it to the front.
 async function _createSessionTab() {
-  const tab = await chrome.tabs.create({url: TARGET_URL, active: false});
+  const tab = await chrome.tabs.create({url: TARGET_URL, active: true});
   const tabId = tab.id;
   _activeTabId = tabId; // keep for abort/proxy-check only
   await skSet({[SK.ACTIVE_TAB_ID]: tabId});
@@ -661,8 +645,20 @@ async function _createSessionTab() {
 
 // tabId is now an explicit first parameter — no global lookup.
 // This makes concurrent sessions safe: each session carries its own tabId.
+// Activates the tab before every command so DOM interactions run in a foreground tab.
 async function sendTabCmd(tabId, type, params = {}) {
+  await chrome.tabs.update(tabId, {active: true}).catch(() => {});
   return chrome.tabs.sendMessage(tabId, {type, ...params});
+}
+
+// Live status helpers — write to storage keys that popup.js watches via storage.onChanged.
+function _sendStatusUpdate(state) {
+  skSet({[SK.RUN_STATUS]: state}).catch(() => {});
+}
+function _writeRunError(e) {
+  const msg = e?.message ?? String(e);
+  skSet({[SK.RUN_STATUS]: "error", [SK.RUN_ERROR]: msg}).catch(() => {});
+  console.error("[OctoProbe BG] workflow error:", msg);
 }
 
 // ---------------------------------------------------------------------------
@@ -752,11 +748,8 @@ async function _waitForEmailCodeToken(maxMs = TIMER_MS.email.CODE_TIMEOUT) {
 //
 // The reliable fix: content.js opens a chrome.runtime.connect port ("sw-keepalive")
 // on every tab it injects into (<all_urls>).  As long as any such port is open
-// the SW is kept alive by Chrome's port-tracking infrastructure.  The worker-init
-// tab stays open throughout the entire workflow, guaranteeing coverage.
+// the SW is kept alive by Chrome's port-tracking infrastructure.
 //
-// _startSwKeepalive / _stopSwKeepalive are kept as no-ops so call sites are clean.
-
 const _keepalivePorts = new Set();
 chrome.runtime.onConnect.addListener(port => {
   if (port.name !== "sw-keepalive") return;
@@ -764,24 +757,7 @@ chrome.runtime.onConnect.addListener(port => {
   port.onDisconnect.addListener(() => _keepalivePorts.delete(port));
 });
 
-function _startSwKeepalive() {}
-function _stopSwKeepalive()  {}
-
 //#region Content Interactions
-
-// Low-level bridge between the service worker and content scripts.
-// Every function here either SENDS a command to content (sendTabCmd) or WAITS
-// for a signal FROM content (_waitForPageReady / page-ready message).
-//
-// Functions in this region:
-//   sendTabCmd(tabId, type, params)   — defined above (before polling setup)
-//   _waitForPageReady(tabId, ms)      — defined below in Shared Utilities (pre-migration)
-//   _domStateToStep(domState)         — defined below in Shared Utilities (pre-migration)
-//   _currentWfStep(tabId)             — defined below in Shared Utilities (pre-migration)
-//   ctEnsureLangChangeToEN(tabId)     — stub below (TODO: implement)
-//
-// TODO: physically move sendTabCmd, _waitForPageReady, _domStateToStep, _currentWfStep
-//       here once the region refactor is complete.
 
 // Ensure the page language is set to English before proceeding.
 // Sends cmd-switch-lang, then waits for page-ready to confirm the reload.
@@ -1110,7 +1086,6 @@ async function step10_regVerify(tabId, person, emailAcct) {
   if (!codeToken) return await step9_regVerifyFailed(tabId, "email code token timeout");
   _runLog.entry(`step10: email code received: ${codeToken}`);
 
-  const {[SK.BOT_ID]: _sessionId} = await skGet(SK.BOT_ID);
   await skSet({
     [SK.PENDING_ACCOUNT]: {
       username:      person.username,  password:   person.password,
@@ -1118,7 +1093,6 @@ async function step10_regVerify(tabId, person, emailAcct) {
       email:         emailAcct.email,  birth_date: person.birth_date,
       gender:        person.gender,    nationality: person.nationality ?? "CPV",
       traveldoc:     person.traveldoc, registered_at: new Date().toISOString(),
-      sessionId:     _sessionId ?? null,
     }
   });
 
@@ -1300,21 +1274,14 @@ async function step20_reqFormFill(tabId) {
   return {ok: true};
 }
 
-// Wait for the consular post to become available and signal submission can proceed.
-// AUTO_TRIGGER: start post monitor, then wait via _postAvailableResolver until content.js
-//   fires target-post-available (post in dropdown) — up to 15 min.
-// EXTERNAL_SIGNAL: wf_apply is only called after the external signal arrives, so the post
-//   is already available; just start the monitor for the MutationObserver refresh and return.
+// Wait for the consular post to become available in the #f0sf1 dropdown — up to 15 min.
+// The post monitor (cmd-start-post-monitor) watches for the option via MutationObserver,
+// then fires target-post-available → TARGET_POST_AVAILABLE handler → wf_apply().
 async function step21_reqFormSignal(tabId) {
-  const {[SK.TRIGGER_MODE]: triggerMode = "AUTO_TRIGGER"} = await skGet(SK.TRIGGER_MODE);
   await skSet({[SK.WORKFLOW_STEP]: WF_STEPS.REQ_FORM_SIGNAL});
   await sendTabCmd(tabId, "cmd-start-post-monitor").catch(() => {});
 
-  if (triggerMode === "EXTERNAL_SIGNAL") {
-    return {ok: true}; // signal already received — wf_apply was the trigger
-  }
-
-  // AUTO_TRIGGER: park on a promise that the target-post-available handler resolves.
+  // Park on a promise that the target-post-available handler resolves.
   return new Promise(resolve => {
     const tid = setTimeout(() => {
       _postAvailableResolver = null;
@@ -1485,7 +1452,6 @@ async function step33_completed(tabId) {
 //
 // Phase map:
 //   p0_openAuthPage   → [step0_warmup] → step1_homeReady → step2_authReady
-//   w1_atAuth         → keep-alive at auth page (rare manual-step scenario)
 //   p1_registerAccount→ F2: reg form open → captcha submit → email token verify
 //   p2_loginAccount   → F3: login form fill → submit → logged-in
 //   w2_atIndex        → F6 keep-alive at index; parks until wf_apply is signalled
@@ -1504,14 +1470,6 @@ async function p0_openAuthPage(tabId, opts = {}) {
   if (state !== "not-logged-in") return {ok: true, status: state};
   await step2_authReady(tabId);
   return {ok: true, status: "auth"};
-}
-
-// Idle at auth page with keep-alives. Rarely used (manual step pending before login/register).
-// Sets WARMUP_IDLE_STATE="auth" so wf_apply can detect and re-login if triggered.
-async function w1_atAuth(tabId) {
-  await skSet({[SK.WARMUP_IDLE_STATE]: "auth"});
-  p6_keepSession(tabId);
-  _sendStatusUpdate("WAITING_AT_AUTH");
 }
 
 // Fill and submit registration form, verify email token.
@@ -1655,10 +1613,8 @@ async function p3_fillForm(tabId, opts = {}) {
 }
 
 // Arm the post-availability monitor and park with keep-alives.
-// When content.js detects the target post, it fires target-post-available → MSG handler →
-// AUTO_TRIGGER: wf_apply() | EXTERNAL_SIGNAL: notify manager, which sends signal-apply.
-// Session recovery: F6 keep-ticks keep the session alive. If session expires between
-// w3 and the incoming wf_apply trigger, _recoverSession() in wf_apply re-logs in.
+// When content.js detects the target post, it fires target-post-available → wf_apply().
+// Session recovery: F6 keep-ticks keep the session alive; _recoverSession() in wf_apply re-logs in.
 async function w3_atForm(tabId, opts = {}) {
   await skSet({
     [SK.TRIGGER_MODE]:    opts.triggerMode ?? "AUTO_TRIGGER",
@@ -1666,7 +1622,6 @@ async function w3_atForm(tabId, opts = {}) {
     [SK.WARMUP_IDLE_STATE]: "form-monitor",
   });
   _applyTriggerLock = false;
-  _waitingForSignal  = false;
   await sendTabCmd(tabId, "cmd-start-post-monitor").catch(() => {});
   p6_keepSession(tabId);
   _sendStatusUpdate("READY_FOR_APPLY_IDLE");
@@ -1755,6 +1710,16 @@ function p6_stop() {
 
 //#endregion
 
+// Single-session run lock — prevents concurrent workflow invocations from overwriting
+// each other's state. _acquireWf throws synchronously if a workflow is already running.
+// Call BEFORE the try block; release with _releaseWf() always in the finally block.
+let _wfRunning = false;
+function _acquireWf(label) {
+  if (_wfRunning) throw new Error(`wf_lock: "${label}" blocked — workflow already running`);
+  _wfRunning = true;
+}
+function _releaseWf() { _wfRunning = false; }
+
 //#region WorkflowHandlers
 // Each workflow handler maps one user-facing operation to a sequence of phase handlers.
 //
@@ -1771,9 +1736,9 @@ function p6_stop() {
 //   MSG.REGISTER_APPLY→ wf_register(realPerson) → wf_login(null, null, false) → wf_apply()
 
 async function wf_register(realPerson = null) {
+  _acquireWf("register");
   let tabId;
   try {
-    _startSwKeepalive();
     p6_stop();
     await _resetWorkflow();
     let person;
@@ -1817,12 +1782,10 @@ async function wf_register(realPerson = null) {
     const r = await p1_registerAccount(tabId, person, emailAcct);
 
     await _runLog.finish(`ok status=${r.status}`);
-    self.Comm?.send({type: "register-done", ...r, email: emailAcct.email, username: person.username, password: person.password});
   } catch(e) {
     await _runLog.finish(`error: ${e.message ?? String(e)}`);
-    self.Comm?.send({type: "error", reason: e.message ?? String(e), proxyStatus: e.proxyStatus ?? null, nextAction: e.nextAction ?? null});
   } finally {
-    _stopSwKeepalive();
+    _releaseWf();
     if (tabId) chrome.tabs.remove(tabId).catch(() => {});
   }
 }
@@ -1830,32 +1793,33 @@ async function wf_register(realPerson = null) {
 // idleOnLoggedIn=true  → park at logged-in index (w2) waiting for external wf_apply signal.
 // idleOnLoggedIn=false → fill form in monitor mode (p3+w3) waiting for post-available signal.
 async function wf_login(username, password, idleOnLoggedIn = false) {
-  if (!username || !password) {
-    const stored = await skGet(SK.USERNAME, SK.PASSWORD);
-    username = stored[SK.USERNAME];
-    password = stored[SK.PASSWORD];
-    if (!username || !password) throw new Error("wf_login: credentials not found in storage");
-  }
-
-  _runLog.start(`login_${idleOnLoggedIn ? "idle" : "monitor"}`);
-  _runLog.entry(`username=${username}`);
-  _startSwKeepalive();
-  p6_stop();
-  await _resetWorkflow();
-  const tabId = await _createSessionTab();
-  await skSet({
-    [SK.USERNAME]:          username,
-    [SK.PASSWORD]:          password,
-    [SK.WARMUP_TAB_ID]:     tabId,
-    [SK.WARMUP_IDLE_STATE]: idleOnLoggedIn ? "login" : "form-monitor",
-  });
-
+  _acquireWf("login");
+  let tabId;
   try {
+    if (!username || !password) {
+      const stored = await skGet(SK.USERNAME, SK.PASSWORD);
+      username = stored[SK.USERNAME];
+      password = stored[SK.PASSWORD];
+      if (!username || !password) throw new Error("wf_login: credentials not found in storage");
+    }
+
+    _runLog.start(`login_${idleOnLoggedIn ? "idle" : "monitor"}`);
+    _runLog.entry(`username=${username}`);
+    p6_stop();
+    await _resetWorkflow();
+    tabId = await _createSessionTab();
+    await skSet({
+      [SK.USERNAME]:          username,
+      [SK.PASSWORD]:          password,
+      [SK.WARMUP_TAB_ID]:     tabId,
+      [SK.WARMUP_IDLE_STATE]: idleOnLoggedIn ? "login" : "form-monitor",
+    });
+
     await p0_openAuthPage(tabId);
     await p2_loginAccount(tabId, {username, password});
 
     if (idleOnLoggedIn) {
-      await w2_atIndex(tabId);    // logs finish + sets keepalive; parks until wf_apply
+      await w2_atIndex(tabId);
     } else {
       const {
         [SK.TRIGGER_MODE]:       triggerMode,
@@ -1869,9 +1833,10 @@ async function wf_login(username, password, idleOnLoggedIn = false) {
     }
   } catch(e) {
     await _runLog.finish(`error: ${e.message ?? String(e)}`);
-    _stopSwKeepalive();
-    chrome.tabs.remove(tabId).catch(() => {});
+    if (tabId) chrome.tabs.remove(tabId).catch(() => {});
     throw e;
+  } finally {
+    _releaseWf();
   }
 }
 
@@ -1927,17 +1892,18 @@ async function _recoverSession(tabId, idleState) {
 //   "form"/"form-monitor"→ session check → step22 (form submit) + p4 + p5
 //   "schedule"           → session check → p4 + p5
 async function wf_apply() {
-  _runLog.start("apply");
-  _startSwKeepalive();
-  p6_stop();
-  const {
-    [SK.WARMUP_IDLE_STATE]: idleState = "login",
-    [SK.WARMUP_TAB_ID]:     tabId,
-  } = await skGet(SK.WARMUP_IDLE_STATE, SK.WARMUP_TAB_ID);
-  const _tabId = tabId ?? await _getActiveTab();
-  _runLog.entry(`wf_apply: idleState=${idleState}`);
-
+  _acquireWf("apply");
+  let _tabId;
   try {
+    _runLog.start("apply");
+    p6_stop();
+    const {
+      [SK.WARMUP_IDLE_STATE]: idleState = "login",
+      [SK.WARMUP_TAB_ID]:     tabId,
+    } = await skGet(SK.WARMUP_IDLE_STATE, SK.WARMUP_TAB_ID);
+    _tabId = tabId ?? await _getActiveTab();
+    _runLog.entry(`wf_apply: idleState=${idleState}`);
+
     // Session recovery: verify tab is alive and session is valid before running any phase.
     if (tabId) await _recoverSession(_tabId, idleState);
 
@@ -1971,12 +1937,14 @@ async function wf_apply() {
     await _runLog.finish(`error: ${e.message ?? String(e)}`);
     throw e;
   } finally {
-    _stopSwKeepalive();
+    _releaseWf();
     // Don't remove tab / idle state when w4 is active (w4 already called _runLog.finish above).
-    const {[SK.WARMUP_IDLE_STATE]: postState} = await skGet(SK.WARMUP_IDLE_STATE);
-    if (postState !== "schedule") {
-      chrome.tabs.remove(_tabId).catch(() => {});
-      await skRemove(SK.WARMUP_IDLE_STATE, SK.WARMUP_TAB_ID);
+    if (_tabId) {
+      const {[SK.WARMUP_IDLE_STATE]: postState} = await skGet(SK.WARMUP_IDLE_STATE);
+      if (postState !== "schedule") {
+        chrome.tabs.remove(_tabId).catch(() => {});
+        await skRemove(SK.WARMUP_IDLE_STATE, SK.WARMUP_TAB_ID);
+      }
     }
   }
 }
@@ -2040,37 +2008,28 @@ function _domStateToStep(domState) {
 }
 
 // Returns {step: WF_STEPS integer, tabId}.
-// Guarantees tabId is always a non-hub-init tab (never a worker-init URL).
 // Resolution order: passed tabId → _activeTabId → query TARGET_HOST tabs → create new tab.
 // Hot path (active workflow): stored step is valid for the bucket → return immediately, no IPC.
 // Cold path (crash recovery / first call): stored step is stale/missing → query content.js DOM
 // state for a finer starting point than the coarse bucket default.
 // Always resolves — never throws.
 async function _currentWfStep(tabId = null) {
-  // ── Resolve a valid non-hub-init tab ───────────────────────────────────────
-  const _isHubTab = url => (url ?? "").includes("worker-init");
   let resolvedId = null;
 
   // 1. Validate caller-supplied tabId.
   if (tabId != null) {
-    try {
-      const t = await chrome.tabs.get(tabId);
-      if (!_isHubTab(t.url)) resolvedId = tabId;
-    } catch (_) {}
+    try { await chrome.tabs.get(tabId); resolvedId = tabId; } catch (_) {}
   }
 
   // 2. Fall back to the cached active tab id.
   if (resolvedId == null && _activeTabId != null) {
-    try {
-      const t = await chrome.tabs.get(_activeTabId);
-      if (!_isHubTab(t.url)) resolvedId = _activeTabId;
-    } catch (_) {}
+    try { await chrome.tabs.get(_activeTabId); resolvedId = _activeTabId; } catch (_) {}
   }
 
   // 3. Scan open tabs for any target-host tab (SW restart, no in-memory state).
   if (resolvedId == null) {
     const [found] = await chrome.tabs.query({url: `*://${TARGET_HOST}/*`});
-    if (found && !_isHubTab(found.url)) resolvedId = found.id;
+    if (found) resolvedId = found.id;
   }
 
   // 4. Nothing found — create a new target tab and track it.
@@ -2136,694 +2095,6 @@ function _pickWarmupUrls() {
 }
 
 //#endregion
-
-async function F0_warmupBrowse(tabId) {
-  await step0_warmup(tabId);
-  _runLog.entry("F0: warmup browse done");
-}
-
-async function F1_openAuthPage(tabId) {
-  let state;
-  try { ({state} = await sendTabCmd(tabId, "cmd-get-state")); } catch (_) { state = "unknown"; }
-
-  // Already on auth page — login form or AJAX-opened reg form.
-  if (state === "auth" || state === "reg-form") return {ok: true, status: "ready"};
-
-  // Already past auth — logged in or deeper into the workflow.
-  // Callers (F3, F4) have their own entry-point checks for these states.
-  if (state === "logged-in" || state === "token" ||
-      state === "questionnaire" || state === "form" ||
-      state === "schedule" || state === "schedule-captcha" ||
-      state === "schedule-calendar" || state === "schedule-submitted") {
-    return {ok: true, status: "past-auth"};
-  }
-
-  if (state !== "not-logged-in") {
-    // Set up listener BEFORE navigation so page-ready can't arrive before we're listening.
-    // 120s: each bd.js challenge dwell is 20s; 2 challenges + redirects + page loads ≈ 60–90s.
-    // The old 35s was too tight — bd1623aa showed 2 challenges consuming ~34s on a fast session.
-    const pageReady = _waitForPageReady(tabId, TIMER_MS.pageReady.SSO);
-    await chrome.tabs.update(tabId, {url: TARGET_URL});
-    ({state} = await pageReady);
-  }
-
-  if (state === "waf-challenge") {
-    // content.js already waited 20s for bd.js to auto-redirect — it didn't.
-    const e = new Error("F1: WAF bot-challenge not resolved — IP or fingerprint flagged");
-    e.proxyStatus = ERR_STATUS.BLOCKED; e.nextAction = NEXT_ACTION.ROTATE_PROXY; throw e;
-  }
-
-  // waf-challenge-active = challenge is in progress; auto-redirect may still happen.
-  // Re-arm a fresh long wait so we don't miss the redirect completing.
-  if (state === "waf-challenge-active") {
-    const pr2 = _waitForPageReady(tabId, TIMER_MS.pageReady.SSO);
-    state = (await pr2.catch(() => ({state: "timeout"}))).state ?? "timeout";
-    if (state === "waf-challenge") {
-      const e = new Error("F1: WAF bot-challenge not resolved after extended wait");
-      e.proxyStatus = ERR_STATUS.BLOCKED; e.nextAction = NEXT_ACTION.ROTATE_PROXY; throw e;
-    }
-  }
-
-  if (state === "auth") return {ok: true, status: "ready"};
-
-  // Retry loop: lang switch + login link click.
-  // The lang switch can reload the page (if not already English), and the reload fires
-  // a page-ready at almost exactly the 6 s timeout boundary — a tight race where the
-  // lang-reload page-ready can bleed into authReady and resolve it with "not-logged-in".
-  // Using a 15 s timeout for langReady eliminates the race, and the retry loop catches
-  // any remaining edge cases.
-  for (let attempt = 0; attempt < 3; attempt++) {
-    if (attempt > 0) {
-      await new Promise(r => setTimeout(r, TIMER_MS.auth.RETRY_BASE + attempt * TIMER_MS.auth.RETRY_STEP));
-      try { ({state} = await sendTabCmd(tabId, "cmd-get-state")); } catch (_) { state = "unknown"; }
-      if (state === "auth") return {ok: true, status: "ready"};
-      // Don't re-navigate if we're off-site (SSO in progress) — just re-check state.
-      if (state !== "not-logged-in" && state !== "off-site") {
-        const pr = _waitForPageReady(tabId, TIMER_MS.pageReady.SSO);
-        await chrome.tabs.update(tabId, {url: TARGET_URL});
-        ({state} = await pr);
-        if (state === "auth") return {ok: true, status: "ready"};
-        if (state === "waf-challenge") {
-          const e = new Error("F1: WAF bot-challenge — IP or fingerprint flagged");
-          e.proxyStatus = ERR_STATUS.BLOCKED; e.nextAction = NEXT_ACTION.ROTATE_PROXY; throw e;
-        }
-        if (state === "waf-challenge-active") {
-          // bd.js is running — wait for its auto-redirect
-          const prWaf = _waitForPageReady(tabId, TIMER_MS.pageReady.SSO);
-          state = (await prWaf.catch(() => ({state: "timeout"}))).state ?? "timeout";
-          if (state === "auth") return {ok: true, status: "ready"};
-          if (state === "waf-challenge") {
-            const e = new Error("F1: WAF bot-challenge — IP or fingerprint flagged");
-            e.proxyStatus = ERR_STATUS.BLOCKED; e.nextAction = NEXT_ACTION.ROTATE_PROXY; throw e;
-          }
-        }
-      }
-    }
-
-    // Language switch may reload the page — 15 s gives ample room past the reload time.
-    // Skipped entirely when lang-switch-enabled is false (default) to avoid the 15 s wait.
-    const {[SK.LANG_SWITCH_ENABLED]: _langEnabled = false} =
-      await skGet(SK.LANG_SWITCH_ENABLED);
-    if (_langEnabled) {
-      const langCmd = sendTabCmd(tabId, "cmd-switch-lang").catch(() => {});
-      const langReady = _waitForPageReady(tabId, TIMER_MS.pageReady.LANG_SWITCH);
-      await langCmd;
-      await langReady.catch(() => {}); // ignore timeout (already English) or navigation
-    }
-
-    // Confirm still on not-logged-in before arming the login listener.
-    try { ({state} = await sendTabCmd(tabId, "cmd-get-state")); } catch (_) { state = "unknown"; }
-    if (state === "auth") return {ok: true, status: "ready"};
-
-    // Login-link click always navigates — arm listener first.
-    // If the site uses SSO (off-site auth), the click navigates to another domain and
-    // page-ready never fires.  In that case wait longer for the SSO to redirect back.
-    const authReady = _waitForPageReady(tabId, TIMER_MS.pageReady.AUTH_CLICK);
-    await sendTabCmd(tabId, "cmd-click-login-link").catch(() => {});
-    let authState;
-    try {
-      ({state: authState} = await authReady);
-    } catch (_) {
-      authState = "timeout";
-    }
-    if (authState === "auth") return {ok: true, status: "ready"};
-
-    if (authState === "off-site" || authState === "timeout" || authState === "waf-challenge-active") {
-      // Login navigated off-site (SSO), timed out, or hit a bd.js challenge on the auth page.
-      // Wait for the redirect to complete (SSO back or bd.js auto-resolve).
-      const label = authState === "waf-challenge-active" ? "WAF challenge on auth page" : authState;
-      _runLog.entry(`F1: login led to ${label} — waiting for redirect (120s)`);
-      try {
-        const ssoReady = _waitForPageReady(tabId, TIMER_MS.pageReady.SSO);
-        ({state: authState} = await ssoReady);
-        if (authState === "auth") return {ok: true, status: "ready"};
-        if (authState === "not-logged-in") {
-          state = authState; // let the retry loop click login again
-          continue;
-        }
-        if (authState === "waf-challenge") {
-          const _e = new Error("F1: WAF bot-challenge — IP or fingerprint flagged");
-          _e.proxyStatus = ERR_STATUS.BLOCKED; _e.nextAction = NEXT_ACTION.ROTATE_PROXY; throw _e;
-        }
-      } catch (_) {
-        authState = "sso-timeout";
-      }
-    }
-
-    state = authState;
-    _runLog.entry(`F1: attempt ${attempt + 1} got state=${state} — retrying`);
-  }
-  const _f1e = new Error(`F1: expected auth, got ${state}`);
-  _f1e.proxyStatus = ERR_STATUS.UNKNOWN; _f1e.nextAction = NEXT_ACTION.ROTATE_PROXY; throw _f1e;
-}
-
-async function F2_register(tabId, person, emailAcct) {
-  _runLog.entry(`F2: person=${person.name} ${person.surname} email=${emailAcct.email}`);
-
-  const { step: _f2Step } = await _currentWfStep(tabId);
-  const _skipToTokenPage = STEP_BUCKETS.auth_token.has(_f2Step);
-
-  if (!_skipToTokenPage) {
-    // ── Form open + fill ──────────────────────────────────────────────────────
-    // Retry loop: on fill failure navigate back to home for a fresh form.
-    // Does NOT burn retryCount — fill errors are transient, not proxy burns.
-    const MAX_FORM_ATTEMPTS = 3;
-    for (let _fa = 1; _fa <= MAX_FORM_ATTEMPTS; _fa++) {
-      if (_fa > 1) {
-        _runLog.entry(`F2: form retry ${_fa} — navigating home for a fresh form`);
-        const _homeReady = _waitForPageReady(tabId, TIMER_MS.pageReady.DEFAULT);
-        _homeReady.catch(() => {});
-        await chrome.tabs.update(tabId, {url: TARGET_URL});
-        await _homeReady.catch(() => {});
-      }
-
-      // Pre-arm page-ready BEFORE the link click. If the click causes a full navigation
-      // the old context dies (channel close) and this listener catches the new page signal
-      // without a gap.
-      const regPageReady = _waitForPageReady(tabId, TIMER_MS.pageReady.REG_FORM);
-      regPageReady.catch(() => {});
-
-      let openResult;
-      try {
-        openResult = await sendTabCmd(tabId, "cmd-register-open-form");
-      } catch (e) {
-        if (!String(e).includes("message channel closed")) throw e;
-        // Full-page navigation: wait for new content.js to fire page-ready, then re-send.
-        // _registerOpenForm sees #formReg already present and skips the link-click, going
-        // straight to waiting for #name.
-        const {state} = await regPageReady.catch(() => ({state: "timeout"}));
-        _runLog.entry(`F2: form page navigated — new page state=${state}`);
-        openResult = await sendTabCmd(tabId, "cmd-register-open-form");
-      }
-      if (!openResult?.ok) {
-        const _os = openResult?.status ?? openResult?.error ?? "form_open_failed";
-        _runLog.entry(`F2: open failed — ${_os} (attempt ${_fa}/${MAX_FORM_ATTEMPTS})`);
-        if (_fa < MAX_FORM_ATTEMPTS) continue; // navigate home and retry
-        const _oe = new Error(`F2: ${_os} after ${MAX_FORM_ATTEMPTS} attempts`);
-        _oe.proxyStatus = ERR_STATUS.PROXY_SLOW; _oe.nextAction = NEXT_ACTION.ROTATE_PROXY; throw _oe;
-      }
-      _runLog.entry(`F2: form opened (attempt ${_fa})`);
-
-      const fillResult = await sendTabCmd(tabId, "cmd-register-fill", {person, email: emailAcct.email});
-      if (fillResult?.ok) break;
-
-      const _fs = fillResult?.status ?? "form_incomplete";
-      _runLog.entry(`F2: fill ${_fs} (attempt ${_fa}/${MAX_FORM_ATTEMPTS})`);
-      if (_fa === MAX_FORM_ATTEMPTS) {
-        const _fe = new Error(`F2: ${_fs} after ${MAX_FORM_ATTEMPTS} attempts`);
-        _fe.proxyStatus = ERR_STATUS.PROXY_SLOW; _fe.nextAction = NEXT_ACTION.ROTATE_PROXY; throw _fe;
-      }
-    }
-    _runLog.entry("F2: form filled");
-
-    // ── IP check ──────────────────────────────────────────────────────────────
-    // Check whether this proxy IP is already burned before spending captcha quota.
-    // Entries older than 24h are pruned (server block is incremental, not permanent).
-    let _proxyIp = null;
-    try {
-      const _ipRes = await sendTabCmd(tabId, "cmd-log-ip");
-      _proxyIp = _ipRes?.ip ?? null;
-    } catch (_) {}
-    if (_proxyIp) {
-      const {[SK.BURNED_PROXIES]: _burned = []} = await skGet(SK.BURNED_PROXIES);
-      const _now = Date.now();
-      const _active = _burned.filter(e => (_now - e.burnedAt) < TIMER_MS.proxy.BURN_TTL);
-      if (_active.length !== _burned.length) await skSet({[SK.BURNED_PROXIES]: _active});
-      if (_active.some(e => e.ip === _proxyIp)) {
-        const _be = new Error(`F2: proxy ${_proxyIp} already burned — rotate`);
-        _be.proxyStatus = ERR_STATUS.BURNED; _be.nextAction = NEXT_ACTION.ROTATE_PROXY; throw _be;
-      }
-      _runLog.entry(`F2: proxy ${_proxyIp} — not burned, proceeding`);
-    }
-
-    // ── Submit ────────────────────────────────────────────────────────────────
-    // Arm BEFORE the submit loop — the server redirect to the token page can arrive
-    // within milliseconds of the RGPD submit, before the loop exits and we could call
-    // waitForPageReady.  If we armed it after, the page-ready signal would be lost.
-    // 600s budget: timer starts here (before submit) to avoid the race where the server
-    // redirects before we arm the listener.  Pre-captcha dwell (≤40s) + two captcha
-    // attempts (≤140s) consume up to ~180s before submit, leaving ≥420s for the redirect.
-    const tokenPageReady = _waitForPageReady(tabId, TIMER_MS.pageReady.TOKEN_PAGE);
-    // Suppress unhandled rejection if we throw before reaching `await tokenPageReady`
-    // (e.g. ip_blocked, captcha_fail, username_taken).  The 600s timer will fire and
-    // reject the promise; without this, that becomes an unhandled SW rejection.
-    tokenPageReady.catch(() => {});
-
-    // 2-attempt retry is handled inside cmd-register-submit (_registerSubmit).
-    _runLog.entry("F2: captcha submit (up to 2 attempts internally)");
-    const result = await sendTabCmd(tabId, "cmd-register-submit").catch(() => ({ok: true, status: "navigated"}));
-    _runLog.entry(`F2: submit result → ${result.status}`);
-    if (result.status === "ip_blocked") {
-      const e = new Error("F2: IP blocked by captcha rate-limit");
-      e.proxyStatus = ERR_STATUS.BLOCKED; e.nextAction = NEXT_ACTION.ROTATE_PROXY; throw e;
-    }
-    if (result.status === "username_taken") {
-      // Account already exists — safety net for the username randomization in F_allInOne.
-      // nextAction: NEXT_ACTION.ROTATE_PROXY lets the manager retry; F_allInOne will re-randomize
-      // the suffix on the next call so the new attempt uses a fresh username.
-      const e = new Error("F2: username already taken (collision on retry)");
-      e.proxyStatus = ERR_STATUS.USERNAME_COLLISION; e.nextAction = NEXT_ACTION.ROTATE_PROXY; throw e;
-    }
-    if (result.status === "email_taken") {
-      // Email already registered — happens when retry reuses an email from a prior attempt.
-      const e = new Error("F2: email already registered");
-      e.proxyStatus = ERR_STATUS.EMAIL_TAKEN; e.nextAction = NEXT_ACTION.ROTATE_PROXY; throw e;
-    }
-    if (result.status === "captcha_fail") {
-      if (_proxyIp) {
-        const {[SK.BURNED_PROXIES]: _bl = []} = await skGet(SK.BURNED_PROXIES);
-        const _now = Date.now();
-        const _al = _bl.filter(e => (_now - e.burnedAt) < TIMER_MS.proxy.BURN_TTL);
-        if (!_al.some(e => e.ip === _proxyIp)) {
-          _al.push({ip: _proxyIp, burnedAt: _now});
-          await skSet({[SK.BURNED_PROXIES]: _al});
-          _runLog.entry(`F2: proxy ${_proxyIp} marked as burned`);
-        }
-      }
-      const e = new Error("F2: register failed: captcha_fail");
-      e.proxyStatus = ERR_STATUS.BURNED; e.nextAction = NEXT_ACTION.ROTATE_PROXY; throw e;
-    }
-    if (result.status !== "navigated" && result.status !== "submitted") {
-      const e = new Error(`F2: register failed: ${result.status}`);
-      e.proxyStatus = ERR_STATUS.UNKNOWN; e.nextAction = NEXT_ACTION.ROTATE_PROXY; throw e;
-    }
-
-    _runLog.entry("F2: waiting for token page redirect + email code");
-    _startEmailPoll(emailAcct.jwt, tabId);
-    await tokenPageReady; // wait for token page navigation
-    _runLog.entry("F2: token page reached — polling email");
-  } else {
-    // ── Recovery: already on token page ──────────────────────────────────────
-    // Form was submitted and the page navigated before the SW restarted.
-    // Skip form-open/fill/submit — resume directly at email-code wait.
-    _runLog.entry("F2: resuming at token page — skipping form stages");
-    const {[SK.EMAIL_CODE_TOKEN]: _existingCode} = await skGet(SK.EMAIL_CODE_TOKEN);
-    if (!_existingCode) _startEmailPoll(emailAcct.jwt, tabId);
-  }
-
-  const codeToken = await _waitForEmailCodeToken(TIMER_MS.email.CODE_TIMEOUT);
-  if (!codeToken) {
-    const e = new Error("F2: email code token timeout");
-    e.proxyStatus = ERR_STATUS.PROXY_SLOW; e.nextAction = NEXT_ACTION.ROTATE_PROXY; throw e;
-  }
-  _runLog.entry(`F2: email code token received: ${codeToken}`);
-
-  // Write pending-account BEFORE submit click — page navigates on success,
-  // killing the content script; main() on the next page picks this up and saves the CSV.
-  const {[SK.BOT_ID]: _sessionId} = await skGet(SK.BOT_ID);
-  await skSet({
-    [SK.PENDING_ACCOUNT]: {
-      username:      person.username,
-      password:      person.password,
-      name:          person.name,
-      surname:       person.surname,
-      email:         emailAcct.email,
-      birth_date:    person.birth_date,
-      gender:        person.gender,
-      nationality:   person.nationality ?? "CPV",
-      traveldoc:     person.traveldoc,
-      registered_at: new Date().toISOString(),
-      sessionId:     _sessionId ?? null,
-    }
-  });
-
-  await sendTabCmd(tabId, "cmd-token-fill", {token: codeToken});
-  _runLog.entry("F2: submitting email verification token");
-  const verifyReady = _waitForPageReady(tabId, TIMER_MS.pageReady.DEFAULT); // arm before submit navigates
-  // port-closed error = page navigated = success; {ok:false} = error alert = failure
-  const tokenResult = await sendTabCmd(tabId, "cmd-token-submit")
-    .catch(() => ({ok: true, status: "navigated"}));
-  const {state: finalState} = await verifyReady;
-  _runLog.entry(`F2: verification done → result=${tokenResult.ok ? "success" : `failed(${tokenResult.status})`} state=${finalState}`);
-
-  if (!tokenResult.ok) {
-    await skRemove(SK.PENDING_ACCOUNT);
-    const _f2e = new Error(`F2: email verification failed: ${tokenResult.status}${tokenResult.alert ? ` — ${tokenResult.alert}` : ""}`);
-    _f2e.proxyStatus = ERR_STATUS.UNKNOWN; _f2e.nextAction = NEXT_ACTION.ROTATE_PROXY; throw _f2e;
-  }
-
-  // Belt-and-suspenders: save directly from background in case the content.js
-  // save-account round-trip failed (navigation timing, WS disconnect, etc).
-  // Deduplication by username prevents double entries when content.js also saved.
-  try {
-    const {[SK.ACCOUNTS]: _accs} = await skGet(SK.ACCOUNTS);
-    const _list = Array.isArray(_accs) ? _accs : [];
-    if (!_list.some(a => a.username === person.username)) {
-      _list.push({
-        username:      person.username,
-        password:      person.password,
-        name:          person.name,
-        surname:       person.surname,
-        email:         emailAcct.email,
-        birth_date:    person.birth_date,
-        gender:        person.gender,
-        nationality:   person.nationality ?? "CPV",
-        traveldoc:     person.traveldoc,
-        registered_at: new Date().toISOString(),
-      });
-      await skSet({[SK.ACCOUNTS]: _list});
-      _runLog.entry(`F2: credentials saved to accounts list (username=${person.username})`);
-    } else {
-      _runLog.entry(`F2: credentials already in accounts list (username=${person.username})`);
-    }
-  } catch(e) {
-    _runLog.entry(`F2: accounts save error: ${e.message}`);
-  }
-
-  return {ok: true, status: finalState === "auth" ? "verified" : finalState};
-}
-
-async function F3_login(tabId, creds) {
-  let state;
-  try { ({state} = await sendTabCmd(tabId, "cmd-get-state")); } catch (_) { state = "unknown"; }
-  if (state === "logged-in") return {ok: true, status: "already-logged-in"};
-
-  await sendTabCmd(tabId, "cmd-login-fill", creds);
-
-  for (let attempt = 0; attempt < 3; attempt++) {
-    // Port-closed error = tab navigated mid-command; wait briefly for new page-ready.
-    // Normal "navigated" return = _loginSubmit already waited 5s + session probe,
-    // new page is fully loaded — no additional wait needed.
-    const result = await sendTabCmd(tabId, "cmd-login-submit").catch(async () => {
-      await _waitForPageReady(tabId, TIMER_MS.pageReady.LOGIN_SUBMIT).catch(() => {});
-      return {ok: true, status: "navigated"};
-    });
-    if (result.status === "logged-in" || result.status === "navigated") {
-      return {ok: true, status: "logged-in"};
-    }
-    if (result.status === "rejected") return {ok: false, status: "rejected"};
-    if (attempt < 2) await new Promise(r => setTimeout(r, TIMER_MS.auth.LOGIN_RETRY));
-  }
-  return {ok: false, status: "login_failed"};
-}
-
-async function F4_formFilling(tabId) {
-  const { step: _f4Step } = await _currentWfStep(tabId);
-
-  // Already on schedule page — F4's pipeline is complete.
-  if (STEP_BUCKETS.schedule.has(_f4Step)) {
-    _runLog.entry("F4: already on schedule page — skipping");
-    return {ok: true, status: "form-ready"};
-  }
-
-  // Skip questionnaire navigation if already on questionnaire or form page.
-  const _skipQNav  = STEP_BUCKETS.query.has(_f4Step) || STEP_BUCKETS.form.has(_f4Step);
-  // Skip questionnaire fill if already on form page.
-  const _skipQFill = STEP_BUCKETS.form.has(_f4Step);
-
-  if (_skipQNav)  _runLog.entry(`F4: resuming — already on ${_skipQFill ? "form" : "questionnaire"} page`);
-
-  if (!_skipQNav) {
-    // Arm listener BEFORE the command that triggers navigation.
-    const _qNavReady = _waitForPageReady(tabId, TIMER_MS.pageReady.DEFAULT);
-    await sendTabCmd(tabId, "cmd-go-questionnaire").catch(() => {});
-    const {state: qState} = await _qNavReady;
-    if (qState !== "questionnaire") {
-      const e = new Error(`F4: expected questionnaire, got ${qState}`);
-      e.proxyStatus = ERR_STATUS.UNKNOWN; e.nextAction = NEXT_ACTION.ROTATE_PROXY; throw e;
-    }
-  }
-
-  if (!_skipQFill) {
-    let fState;
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const _qFillReady = _waitForPageReady(tabId, TIMER_MS.pageReady.QUESTIONNAIRE);
-      await sendTabCmd(tabId, "cmd-fill-questionnaire").catch(() => {});
-      ({state: fState} = await _qFillReady);
-      if (fState === "form") break;
-      if (fState === "auth") break;  // server-side session expiry — handle below
-      if (fState !== "questionnaire") {
-        const e = new Error(`F4: expected form, got ${fState}`);
-        e.proxyStatus = ERR_STATUS.UNKNOWN; e.nextAction = NEXT_ACTION.ROTATE_PROXY; throw e;
-      }
-      // questionnaire page reloaded — retry
-    }
-
-    if (fState === "auth") {
-      // Server redirected to auth mid-questionnaire (session expired within ~24s).
-      // Re-login once using stored credentials and retry questionnaire.
-      const {[SK.REGISTER_PERSON]: creds} = await skGet(SK.REGISTER_PERSON);
-      if (!creds?.username || !creds?.password) {
-        const e = new Error("F4: session expired, no stored credentials for re-login");
-        e.proxyStatus = ERR_STATUS.UNKNOWN; e.nextAction = NEXT_ACTION.CHANGE_DEVICE; throw e;
-      }
-      const _reloginRes = await F3_login(tabId, {username: creds.username, password: creds.password});
-      if (!_reloginRes.ok) {
-        const e = new Error(`F4: re-login failed — status=${_reloginRes.status}`);
-        e.proxyStatus = ERR_STATUS.LOGIN_REJECTED; e.nextAction = NEXT_ACTION.ROTATE_PROXY; throw e;
-      }
-      const _reQNavReady = _waitForPageReady(tabId, TIMER_MS.pageReady.DEFAULT);
-      await sendTabCmd(tabId, "cmd-go-questionnaire").catch(() => {});
-      const {state: qState2} = await _reQNavReady;
-      if (qState2 !== "questionnaire") {
-        const e = new Error(`F4: after re-login, expected questionnaire, got ${qState2}`);
-        e.proxyStatus = ERR_STATUS.UNKNOWN; e.nextAction = NEXT_ACTION.ROTATE_PROXY; throw e;
-      }
-      const _reQFillReady = _waitForPageReady(tabId, TIMER_MS.pageReady.QUESTIONNAIRE);
-      await sendTabCmd(tabId, "cmd-fill-questionnaire").catch(() => {});
-      ({state: fState} = await _reQFillReady);
-    }
-
-    if (fState !== "form") {
-      const e = new Error(`F4: questionnaire never reached form after retries`);
-      e.proxyStatus = ERR_STATUS.UNKNOWN; e.nextAction = NEXT_ACTION.ROTATE_PROXY; throw e;
-    }
-  }
-
-  // Fill visa application form → navigates to schedule page.
-  const _formFillReady = _waitForPageReady(tabId, TIMER_MS.pageReady.FORM_FILL);
-  await sendTabCmd(tabId, "cmd-fill-form").catch(() => {});
-  const {state: sState} = await _formFillReady;
-  if (sState !== "schedule") {
-    const e = new Error(`F4: expected schedule, got ${sState}`);
-    e.proxyStatus = ERR_STATUS.UNKNOWN; e.nextAction = NEXT_ACTION.ROTATE_PROXY; throw e;
-  }
-
-  return {ok: true, status: "form-ready"};
-}
-
-async function F5_scheduling(tabId, config) {
-  return sendTabCmd(tabId, "cmd-schedule", config).catch(e => ({ok: false, error: e.message}));
-}
-
-let _applyTriggerLock      = false; // debounce: prevent duplicate apply starts
-let _waitingForSignal      = false; // EXTERNAL_SIGNAL mode: waiting for signal-apply
-let _postAvailableResolver = null;  // set by step21 (AUTO_TRIGGER inline wait); called by TARGET_POST_AVAILABLE handler
-
-function _sendStatusUpdate(state) {
-  self.Comm?.send({ type: "status-update", state });
-  skSet({[SK.RUN_STATUS]: state, [SK.RUN_ERROR]: null}).catch(() => {});
-}
-
-function _writeRunError(e) {
-  const msg = e?.message ?? String(e);
-  skSet({[SK.RUN_STATUS]: "error", [SK.RUN_ERROR]: msg}).catch(() => {});
-}
-
-async function F_warmup(config) {
-  const idleStep = config.idleStep ?? "login";
-  _runLog.start(`warmup_${idleStep}`);
-  _runLog.entry(`username=${config.username} idleStep=${idleStep}`);
-  _startSwKeepalive();
-  p6_stop();
-  await _resetWorkflow();
-  const tabId = await _createSessionTab();
-  await skSet({[SK.WARMUP_IDLE_STATE]: idleStep, [SK.WARMUP_TAB_ID]: tabId});
-
-  try {
-    _runLog.entry("F_warmup: opening auth page");
-    await F1_openAuthPage(tabId);
-    _runLog.entry("F_warmup: logging in");
-    const _warmupLoginRes = await F3_login(tabId, {username: config.username, password: config.password});
-    if (!_warmupLoginRes.ok) {
-      await _runLog.finish(`error: F_warmup: login failed — status=${_warmupLoginRes.status}`);
-      // Include nextAction so the manager can retry with a different proxy.
-      return {ok: false, status: _warmupLoginRes.status, nextAction: NEXT_ACTION.ROTATE_PROXY};
-    }
-    _runLog.entry("F_warmup: logged in");
-
-    if (idleStep === "login") {
-      p6_keepSession(tabId, "login");
-      await _runLog.finish("ok idleStep=login");
-      return {ok: true, idleStep: "login"};
-    }
-
-    _runLog.entry("F_warmup: navigating to questionnaire");
-    let pageReady = _waitForPageReady(tabId, TIMER_MS.pageReady.DEFAULT);
-    await sendTabCmd(tabId, "cmd-go-questionnaire").catch(() => {});
-    const {state: qState} = await pageReady;
-    if (qState !== "questionnaire") {
-      const e = new Error(`F_warmup: expected questionnaire, got ${qState}`);
-      e.proxyStatus = ERR_STATUS.UNKNOWN; e.nextAction = NEXT_ACTION.ROTATE_PROXY; throw e;
-    }
-    _runLog.entry("F_warmup: filling questionnaire");
-
-    pageReady = _waitForPageReady(tabId, TIMER_MS.pageReady.WARMUP_Q);
-    await sendTabCmd(tabId, "cmd-fill-questionnaire").catch(() => {});
-    const {state: fState} = await pageReady;
-    if (fState !== "form") {
-      const e = new Error(`F_warmup: expected form, got ${fState}`);
-      e.proxyStatus = ERR_STATUS.UNKNOWN; e.nextAction = NEXT_ACTION.ROTATE_PROXY; throw e;
-    }
-    _runLog.entry("F_warmup: on form page");
-
-    if (idleStep === "form") {
-      await sendTabCmd(tabId, "cmd-fill-form-tabs").catch(() => {});
-      p6_keepSession(tabId, "form");
-      await _runLog.finish("ok idleStep=form");
-      return {ok: true, idleStep: "form"};
-    }
-
-    if (idleStep === "form-monitor") {
-      await sendTabCmd(tabId, "cmd-fill-form-tabs").catch(() => {});
-      await skSet({
-        [SK.TRIGGER_MODE]:   config.triggerMode  ?? "AUTO_TRIGGER",
-        [SK.TARGET_POST_ID]: String(config.targetPostId ?? config.consulPost ?? ""),
-      });
-      _applyTriggerLock = false;
-      _waitingForSignal = false;
-      await sendTabCmd(tabId, "cmd-start-post-monitor").catch(() => {});
-      p6_keepSession(tabId, "form");
-      _sendStatusUpdate("READY_FOR_APPLY_IDLE");
-      await _runLog.finish("ok idleStep=form-monitor");
-      return {ok: true, idleStep: "form-monitor"};
-    }
-
-    if (idleStep === "schedule") {
-      _runLog.entry("F_warmup: submitting form → schedule");
-      pageReady = _waitForPageReady(tabId, TIMER_MS.pageReady.WARMUP_FORM);
-      await sendTabCmd(tabId, "cmd-fill-form").catch(() => {});
-      const {state: sState} = await pageReady;
-      if (sState !== "schedule") {
-        const e = new Error(`F_warmup: expected schedule, got ${sState}`);
-        e.proxyStatus = ERR_STATUS.UNKNOWN; e.nextAction = NEXT_ACTION.ROTATE_PROXY; throw e;
-      }
-      p6_keepSession(tabId, "schedule");
-      await _runLog.finish("ok idleStep=schedule");
-      return {ok: true, idleStep: "schedule"};
-    }
-
-    throw new Error(`F_warmup: unknown idleStep "${idleStep}"`);
-  } catch(e) {
-    _stopSwKeepalive();
-    chrome.tabs.remove(tabId).catch(() => {});
-    throw e;
-  }
-}
-
-async function F_allInOne(config) {
-  _runLog.start("all_in_one");
-  _startSwKeepalive();
-  p6_stop();
-  await _resetWorkflow();
-
-  // Build person data. Use manager-supplied realPerson if provided; fall back to local generator.
-  const rp = config.realPerson;
-  let person;
-  if (rp && (rp.firstName || rp.name)) {
-    const gRaw = String(rp.gender ?? "").trim().toUpperCase();
-    const firstName = String(rp.firstName ?? rp.name ?? "").trim();
-    const lastName  = String(rp.lastName  ?? rp.surname ?? "").trim();
-    const {username, password, emailLocal} = _genCredentials(firstName, lastName);
-    person = {
-      name:        firstName,
-      surname:     lastName,
-      username,
-      password,
-      email:       emailLocal,
-      birth_date:  _parseDOB(rp.dob ?? rp.birth_date),
-      gender:      gRaw === "F" || gRaw === "FEMALE" || gRaw === "FEMININO" ? "F" : "M",
-      nationality: String(rp.nationality ?? "CPV").trim(),
-      traveldoc:   String(rp.traveldoc  ?? "").trim(),
-    };
-  } else {
-    person = generatePerson();
-  }
-  const emailAcct = await createTempEmail(person.email).catch(err => {
-    err.proxyStatus = err.proxyStatus ?? ERR_STATUS.EMAIL_PROVIDER;
-    err.nextAction  = err.nextAction  ?? NEXT_ACTION.ROTATE_PROXY;
-    throw err;
-  });
-  await skSet({
-    [SK.REGISTER_PERSON]:  person,
-    [SK.REGISTER_EMAIL]:   emailAcct,
-    [SK.EMAIL_TOKEN]:      null,
-    [SK.EMAIL_CODE_TOKEN]: null,
-  });
-
-  // ── Phase 1: Registration (dedicated tab, warmup → register) ────────────
-  _runLog.entry(`all_in_one: person=${person.name} ${person.surname} email=${emailAcct.email}`);
-  const regTabId = await _createSessionTab();
-  try {
-    await F0_warmupBrowse(regTabId);
-    await F1_openAuthPage(regTabId);
-    await sendTabCmd(regTabId, "cmd-log-ip").catch(() => {});
-    await F2_register(regTabId, person, emailAcct);
-    _runLog.entry("all_in_one: registration done");
-  } finally {
-    // Always close registration tab — its session context is spent.
-    chrome.tabs.remove(regTabId).catch(() => {});
-  }
-
-  // ── Phase 2: Login + F4 + F5 (fresh tab, fresh warmup → fresh session) ──
-  // Brief gap lets the server-side account settle before login attempt.
-  _runLog.entry("all_in_one: opening fresh session for login");
-  await new Promise(r => setTimeout(r, TIMER_MS.auth.SETTLE_MIN + Math.random() * TIMER_MS.auth.SETTLE_MARGIN));
-
-  const loginTabId = await _createSessionTab();
-  try {
-    await F0_warmupBrowse(loginTabId);
-    await F1_openAuthPage(loginTabId);
-
-    // Retry login up to 3 times on "rejected" — the server may not have activated
-    // the account yet (activation lag is typically 5–30s after registration completes).
-    // Non-retriable failures (login_failed = wrong credentials) exit immediately.
-    let _loginRes;
-    for (let _attempt = 0; _attempt < 3; _attempt++) {
-      if (_attempt > 0) {
-        const waitMs = TIMER_MS.auth.REJECTION_BASE + (_attempt - 1) * TIMER_MS.auth.REJECTION_STEP; // 30 s, 60 s
-        _runLog.entry(`all_in_one: login rejected — waiting ${waitMs / 1000}s then hard-reloading (attempt ${_attempt + 1}/3)`);
-        await new Promise(r => setTimeout(r, waitMs));
-        // Hard reload (Ctrl+F5 equivalent) — clears server-side captcha failure session
-        // state and issues a fresh reCAPTCHA widget with a new challenge ID.
-        const _freshPage = _waitForPageReady(loginTabId, TIMER_MS.pageReady.DEFAULT);
-        await chrome.tabs.reload(loginTabId, {bypassCache: true});
-        await _freshPage.catch(() => {});
-      }
-      _loginRes = await F3_login(loginTabId, {username: person.username, password: person.password});
-      if (_loginRes.ok || _loginRes.status !== "rejected") break;
-    }
-    if (!_loginRes.ok) {
-      const e = new Error(`F3: login failed — status=${_loginRes.status}`);
-      e.proxyStatus = ERR_STATUS.LOGIN_REJECTED;
-      e.nextAction  = NEXT_ACTION.ROTATE_PROXY;
-      throw e;
-    }
-    _runLog.entry("all_in_one: logged in — running F4+F5");
-
-    await F4_formFilling(loginTabId);
-    const r = await F5_scheduling(loginTabId, {});
-    await _runLog.finish(r.ok !== false
-      ? `ok status=${r.status ?? "ok"}`
-      : `error: F5 failed — ${r.error ?? r.status ?? "unknown"}`);
-    return r;
-  } finally {
-    _stopSwKeepalive();
-    chrome.tabs.remove(loginTabId).catch(() => {});
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Direct-call helpers — used by communication.js to avoid service-worker
-// self-messaging (chrome.runtime.sendMessage does not loop back to the same SW).
-// ---------------------------------------------------------------------------
-
-async function _runCheckProxy() {
-  if (!_activeTabId) return;
-  const result = await sendTabCmd(_activeTabId, "cmd-run-proxy-check").catch(() => ({}));
-  self.Comm?.send({ type: "proxy-check", ...result, timestamp: new Date().toISOString() });
-}
-
 function _runDispatchAbort() {
   p6_stop();
   if (_activeTabId) chrome.tabs.sendMessage(_activeTabId, {type: "abort"}).catch(() => {});
@@ -2838,29 +2109,9 @@ function _runDispatchAbort() {
 //     or return true for async response.
 //   • All workflow errors are logged via console.error — not surfaced back to the popup.
 //
-// Popup → Background commands (MSG.LOGIN_IDLE … MSG.REGISTER_APPLY) delegate to
-// WorkflowHandlers (wf_login, wf_register, etc.) defined in the region above.
-// Manager WS commands arrive via Comm.dispatch → communication.js, not here.
-
 chrome.runtime.onInstalled.addListener(() => {
   skSet({[SK.INSTALLED_AT]: new Date().toISOString()});
   console.log("[OctoProbe] Extension installed.");
-});
-
-// WS keepalive alarm — wakes the SW periodically so reconnectIfNeeded() can fire
-// if the WS dropped while the SW was suspended.
-// Hub sends protocol-level WS pings every 5 s (server-side) which already keeps
-// the connection alive; this alarm handles the rare case where the SW is killed
-// and needs to reconnect from stored credentials.
-chrome.alarms.create("ws-ping", {periodInMinutes: TIMER_MS.ws.PING_MINUTES});
-chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name !== "ws-ping") return;
-  if (self.Comm?.isConnected()) {
-    self.Comm.send({type: "ping"});
-  } else {
-    // SW may have been suspended — WS dropped silently without onclose firing.
-    self.Comm?.reconnectIfNeeded();
-  }
 });
 
 // _withDebugger removed: chrome.debugger.attach creates a measurable timing spike
@@ -2927,48 +2178,6 @@ const _MSG_HANDLERS = {
     respond({ok: true});
   },
 
-  //   This is the handler that bootstraps the WebSocket connection to the hub manager.
-  // What calls it: The content script injected into the worker-init page sends this message. The manifest registers a content script that matches *://*/*worker-init* — when Octo Browser opens a profile and navigates to the hub-init URL, that content script runs and immediately sends {type: "WORKER_INIT", botId: ..., hubUrl: ...} to the service worker. The bot ID and hub URL are embedded in the page (either in the URL query string or the page DOM) and extracted by the content script before sending.
-  // What it does:
-  // Initiates the WebSocket connection — calls Comm.connectHub(botId, hubUrl) which opens the WS connection to the manager server, identifies this browser profile as a specific bot slot, and starts listening for commands (register, all-in-one, etc.).
-  // Responds immediately — {ok: true} just closes the message channel; the content script doesn't wait for the WS to actually connect, only for the background to acknowledge it received the init signal.
-  // The self.Comm?.connectHub guard means if communication.js failed to load (e.g., extension update mid-session), the message is silently dropped rather than throwing.
-  [MSG.WORKER_INIT]: (msg, _sender, respond) => {
-    if (self.Comm?.connectHub) self.Comm.connectHub(msg.botId, msg.hubUrl);
-    respond({ok: true});
-  },
-
-  // ── Slot intelligence relay ───────────────────────────────────────────────
-  // content.js → background → manager (fire-and-forget)
-  //   What calls it: content.js — the post monitor (cmd-start-post-monitor) runs a polling loop on the visa form page watching for available appointment slots. When it detects slots, it sends {type: "slot-observation", postId, slots} up to the service worker.
-  // What it does:
-  // Relays the slot observation straight out to the manager over WebSocket via Comm.send(). The service worker has no direct WS access from content scripts — content can only use chrome.runtime.sendMessage — so this handler acts as a passthrough: content detects slots → background relays to manager → manager decides whether to signal back with target-post-available.
-  // Same fire-and-forget pattern: respond({ok: true}) immediately, the WS send is best-effort (no error surfaced to content).
-  [MSG.SLOT_OBSERVATION]: (msg, _sender, respond) => {
-    if (self.Comm) self.Comm.send({ type: "slot-observation", postId: msg.postId, slots: msg.slots, timestamp: Date.now() });
-    respond({ok: true});
-  },
-
-  // content.js → background → manager → background → content.js (3s timeout)
-  [MSG.SLOT_ASSIGNMENT_REQUEST]: (msg, _sender, respond) => {
-    if (!self.Comm) { respond({ok: false}); return; }
-    self.Comm.requestSlotAssignment({ postId: msg.postId, visibleSlots: msg.visibleSlots }, TIMER_MS.ws.SLOT_ASSIGN)
-      .then(assignment => respond({ ok: true, ...assignment }))
-      .catch(() => respond({ ok: false }));
-    return true; // async response
-  },
-
-  // content.js → background → manager (fire-and-forget)
-  [MSG.SLOT_FAILURE]: (msg, _sender, respond) => {
-    if (self.Comm) self.Comm.send({ type: "slot-failure", slotKey: msg.slotKey, reason: msg.reason });
-    respond({ok: true});
-  },
-
-  [MSG.SLOT_SUCCESS]: (msg, _sender, respond) => {
-    if (self.Comm) self.Comm.send({ type: "slot-success", slotKey: msg.slotKey });
-    respond({ok: true});
-  },
-
   // ── Dual trigger ─────────────────────────────────────────────────────────
   // Fired by content.js when target post appears in #f0sf1 options.
   [MSG.TARGET_POST_AVAILABLE]: (msg, _sender, respond) => {
@@ -2986,18 +2195,11 @@ const _MSG_HANDLERS = {
     skGet(SK.TRIGGER_MODE).then(d => {
       const triggerMode = d[SK.TRIGGER_MODE] ?? "AUTO_TRIGGER";
       _runLog.entry(`target-post-available: postId=${msg.postId} triggerMode=${triggerMode}`);
-      if (triggerMode === "AUTO_TRIGGER") {
-        _sendStatusUpdate("AUTO_TRIGGER_PENDING");
-        wf_apply()
-          .then(() => { _sendStatusUpdate("DONE"); })
-          .catch(_writeRunError);
-      } else {
-        // EXTERNAL_SIGNAL — notify manager and wait for signal-apply
-        _waitingForSignal = true;
-        _applyTriggerLock = false;
-        self.Comm?.send({ type: "target-post-available", postId: msg.postId });
-        _sendStatusUpdate("WAITING_SIGNAL");
-      }
+      _runLog.entry(`target-post-available: postId=${msg.postId} triggerMode=${triggerMode}`);
+      _sendStatusUpdate("AUTO_TRIGGER_PENDING");
+      wf_apply()
+        .then(() => { _sendStatusUpdate("DONE"); })
+        .catch(_writeRunError);
     });
     respond({ok: true});
     return true;
@@ -3038,11 +2240,6 @@ const _MSG_HANDLERS = {
     respond({ok: true});
   },
 
-  [MSG.DISPATCH_PROXY_CHECK]: (_msg, _sender, respond) => {
-    _runCheckProxy();
-    respond({ok: !!_activeTabId});
-  },
-
   [MSG.DISPATCH_ABORT]: (_msg, _sender, respond) => {
     _runDispatchAbort();
     respond({ok: true});
@@ -3051,9 +2248,7 @@ const _MSG_HANDLERS = {
   [MSG.SAVE_ACCOUNT]: (msg, _sender, respond) => {
     const account = msg.account;
     const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    // Include sessionId prefix for traceability when multiple sessions run concurrently
-    const _sid = msg.sessionId ?? account.sessionId ?? null;
-    const filename = _sid ? `account_${_sid.slice(0, 8)}_${ts}.csv` : `account_${ts}.csv`;
+    const filename = `account_${ts}.csv`;
     (async () => {
       try {
         const {[SK.ACCOUNTS]: accounts} = await skGet(SK.ACCOUNTS);
@@ -3161,53 +2356,9 @@ const _MSG_HANDLERS = {
     return true;
   },
 
-  [MSG.FILL_TOKEN]: (msg, sender, respond) => {
-    const tabId = sender.tab?.id;
-    const {token} = msg;
-    if (!tabId) { respond({ok: false, error: "no sender tab"}); return; }
-    chrome.scripting.executeScript({
-      target: {tabId}, world: "MAIN", args: [token],
-      func: async (token) => {
-        const sels = [
-          "input[name='tokenInput']",
-          "input[id='tokenInput']",
-          "input[id*='oken']",
-          "#mainContent input[type='text']",
-          "form input[type='text']",
-        ];
-        let el = null;
-        for (const sel of sels) {
-          const found = document.querySelector(sel);
-          if (found && found.offsetParent !== null) { el = found; break; }
-        }
-        if (!el) return {ok: false, error: "input not found"};
-        el.focus();
-        const sleep = ms => new Promise(r => setTimeout(r, ms));
-        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
-        function _gr() { let u,v; do{u=Math.random();}while(!u); do{v=Math.random();}while(!v); return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v); }
-        for (const ch of token) {
-          const delay = Math.max(25, Math.round(Math.exp(Math.log(95) + 0.45 * _gr())));
-          await sleep(delay);
-          el.dispatchEvent(new KeyboardEvent("keydown",  {key: ch, bubbles: true, cancelable: true}));
-          el.dispatchEvent(new KeyboardEvent("keypress", {key: ch, bubbles: true, cancelable: true}));
-          const cur = el.value;
-          if (setter) setter.call(el, cur + ch); else el.value = cur + ch;
-          el.dispatchEvent(new InputEvent("input", {data: ch, inputType: "insertText", bubbles: true}));
-          el.dispatchEvent(new KeyboardEvent("keyup", {key: ch, bubbles: true}));
-        }
-        await sleep(80 + Math.random() * 100);
-        el.dispatchEvent(new Event("change", {bubbles: true}));
-        return {ok: true, value: el.value};
-      },
-    })
-    .then(([r]) => respond(r?.result ?? {ok: false}))
-    .catch(e => respond({ok: false, error: String(e)}));
-    return true;
-  },
-
   [MSG.SOLVE_RECAPTCHA_API]: (msg, _sender, respond) => {
     const {pageUrl, siteKey, action = null} = msg;
-    _doSolveRecaptcha(pageUrl, siteKey, action)
+    _raceSolvers(pageUrl, siteKey, action)
       .then(token => respond({ok: true, token}))
       .catch(e   => respond({ok: false, error: String(e)}));
     return true;
@@ -3223,7 +2374,7 @@ const _MSG_HANDLERS = {
     (async () => {
       try {
         const solveStart = Date.now();
-        const token = await _doSolveRecaptcha(pageUrl, siteKey, action);
+        const token = await _raceSolvers(pageUrl, siteKey, action);
         const elapsed = Date.now() - solveStart;
         if (elapsed < minSolveMs) await new Promise(r => setTimeout(r, minSolveMs - elapsed));
         const totalMs = Date.now() - solveStart;
@@ -3302,11 +2453,6 @@ const _MSG_HANDLERS = {
     .then(([r]) => respond({ok: true, result: r?.result ?? null}))
     .catch(e => respond({ok: false, error: String(e)}));
     return true;
-  },
-
-  [MSG.WS_SEND]: (msg, _sender, respond) => {
-    if (self.Comm) self.Comm.send(msg.data);
-    respond({ok: true});
   },
 
 };

@@ -8,11 +8,6 @@
 // ---------------------------------------------------------------------------
 
 const SK = Object.freeze({
-  // Identity / hub
-  BOT_ID:               "botId",
-  HUB_URL:              "hubUrl",
-  HUB_WS_URL:           "hubWsUrl",
-
   // Credentials
   USERNAME:             "username",
   PASSWORD:             "password",
@@ -86,8 +81,8 @@ const SK = Object.freeze({
 });
 
 // ---------------------------------------------------------------------------
-// Storage helpers — shared by service worker (background, communication) and
-// content scripts. Use SK.X keys so typos are caught at reference time.
+// Storage helpers — shared by service worker and content scripts.
+// Use SK.X keys so typos are caught at reference time.
 //
 //   skGet(SK.FOO)           → { "foo": value }
 //   skGet(SK.FOO, SK.BAR)   → { "foo": v1, "bar": v2 }
@@ -282,7 +277,7 @@ const TIMER_MS = Object.freeze({
     QUESTIONNAIRE: 150_000,   // full questionnaire fill + submit (F4)
     WARMUP_Q:       60_000,   // warmup questionnaire fill (shorter path)
     FORM_FILL:     150_000,   // visa form fill → schedule page (F4)
-    WARMUP_FORM:    90_000,   // warmup form fill → schedule (F_warmup)
+    WARMUP_FORM:    90_000,   // warmup form fill → schedule (F_warmup idleStep)
   }),
 
   // Email polling
@@ -322,12 +317,6 @@ const TIMER_MS = Object.freeze({
   // Proxy / burn list
   proxy: Object.freeze({
     BURN_TTL: 86_400_000,     // 24 h — how long a burned proxy stays blacklisted
-  }),
-
-  // WebSocket / hub
-  ws: Object.freeze({
-    PING_MINUTES:     0.4,    // chrome.alarms periodInMinutes for ws-ping keepalive
-    SLOT_ASSIGN:    3_000,    // Comm.requestSlotAssignment timeout
   }),
 
   // Miscellaneous
@@ -379,30 +368,13 @@ const MSG = Object.freeze({
   REGISTER_LOGIN:              "register-login",
   REGISTER_APPLY:              "register-login-apply",
 
-  // ── Hub-init content → Background ─────────────────────────────────────────
-  WORKER_INIT:                 "WORKER_INIT",
-
-  // ── Manager WS → Background (inbound commands with no popup equivalent) ───
-  WS_WARMUP:                   "warmup",
-  WS_APPLY:                    "apply",
-  WS_SIGNAL_APPLY:             "signal-apply",
-  WS_ABORT:                    "abort",
-  WS_STATUS:                   "status",
-  WS_CHECK_PROXY:              "check-proxy",
-  WS_SLOT_ASSIGN:              "slot-assignment",
-
   // ── Content ↑ Background (state signals) ──────────────────────────────────
   PAGE_READY:                  "page-ready",
-  SLOT_OBSERVATION:            "slot-observation",
-  SLOT_ASSIGNMENT_REQUEST:     "slot-assignment-request",
-  SLOT_FAILURE:                "slot-failure",
-  SLOT_SUCCESS:                "slot-success",
   TARGET_POST_AVAILABLE:       "target-post-available",
 
   // ── Background ↓ Content (MAIN-world scripting bridge) ────────────────────
   INJECT_ALERT_CAPTURE:        "inject-alert-capture",
   RESET_RECAPTCHA:             "reset-recaptcha",
-  FILL_TOKEN:                  "fill-token",
   SOLVE_RECAPTCHA_API:         "solve-recaptcha-api",
   SOLVE_AND_INJECT_RECAPTCHA:  "solve-and-inject-recaptcha",
   INJECT_RECAPTCHA_TOKEN:      "inject-recaptcha-token",
@@ -416,12 +388,10 @@ const MSG = Object.freeze({
   LOG_ENTRY:                   "log-entry",
   START_EMAIL_POLL:            "start-email-poll",
   STOP_EMAIL_POLL:             "stop-email-poll",
-  DISPATCH_PROXY_CHECK:        "dispatch-proxy-check",
   DISPATCH_ABORT:              "dispatch-abort",
   SAVE_ACCOUNT:                "save-account",
   CLOSE_TAB:                   "close-tab",
   CLEAR_WORKFLOW:              "clear-workflow",
-  WS_SEND:                     "ws-send",
   EMAIL_TOKEN:                 "email-token",   // BG → content (email poll delivers code)
   GENERATE_PERSON:             "generate-person", // popup → BG: generate fake person data
 });
