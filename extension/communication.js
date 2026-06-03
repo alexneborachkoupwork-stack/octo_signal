@@ -45,13 +45,14 @@ self.Comm = (() => {
 
     const payload = msg.payload && typeof msg.payload === "object" ? msg.payload : {};
 
-    if (type === "CMD_REGISTER") {
-      return { type: "register", ...payload };
+    // CMD_REGISTER and flat "register" both normalize to the same constant popup uses
+    if (type === "CMD_REGISTER" || type === MSG.REGISTER_ONLY) {
+      return { type: MSG.REGISTER_ONLY, ...payload };
     }
     if (type === "CMD_READY") {
       const creds = payload.candidate ?? payload;
       return {
-        type: "warmup",
+        type: MSG.WS_WARMUP,
         username: payload.username ?? creds.username ?? creds.email ?? "",
         password: payload.password ?? creds.password ?? "",
         idleStep: payload.idleStep ?? "login",
@@ -63,13 +64,14 @@ self.Comm = (() => {
       };
     }
     if (type === "CMD_APPLY" || type === "CMD_BOOKING") {
-      return { type: "apply", ...payload };
+      return { type: MSG.WS_APPLY, ...payload };
     }
-    if (type === "CMD_ALL_IN_ONE") {
-      return { type: "all-in-one", ...payload };
+    // CMD_ALL_IN_ONE and flat "all-in-one" both normalize to the same constant popup uses
+    if (type === "CMD_ALL_IN_ONE" || type === MSG.REGISTER_APPLY) {
+      return { type: MSG.REGISTER_APPLY, ...payload };
     }
     if (type === "CMD_STOP") {
-      return { type: "abort" };
+      return { type: MSG.WS_ABORT };
     }
 
     if (msg.payload != null && typeof msg.payload === "object") {
@@ -84,13 +86,13 @@ self.Comm = (() => {
 
     const type = normalized.type;
 
-    if (type === "ping") {
+    if (type === MSG.PING) {
       send({ type: "pong" });
       return;
     }
 
     // Manager reply to a slot-assignment-request forwarded from background.js
-    if (type === "slot-assignment") {
+    if (type === MSG.WS_SLOT_ASSIGN) {
       if (_pendingSlotAssignment) {
         clearTimeout(_pendingSlotAssignment.timer);
         _pendingSlotAssignment.resolve(normalized);
@@ -99,67 +101,63 @@ self.Comm = (() => {
       return;
     }
 
-    if (type === "status") {
-      const d = await chrome.storage.local.get(["workflow-type", "workflow-step", "last-error-no"]);
+    if (type === MSG.WS_STATUS) {
+      const d = await skGet(SK.WORKFLOW_TYPE, SK.WORKFLOW_STEP, SK.LAST_ERROR_NO);
       send({
-        type: "status",
-        workflow: d["workflow-type"] ?? null,
-        step: d["workflow-step"] ?? null,
-        errorNo: d["last-error-no"] ?? 0,
+        type: MSG.WS_STATUS,
+        workflow: d[SK.WORKFLOW_TYPE] ?? null,
+        step: d[SK.WORKFLOW_STEP] ?? null,
+        errorNo: d[SK.LAST_ERROR_NO] ?? 0,
       });
       return;
     }
 
-    if (type === "check-proxy") {
+    if (type === MSG.WS_CHECK_PROXY) {
       _runCheckProxy();
       return;
     }
 
-    if (type === "abort") {
-      await chrome.storage.local.remove([
-        "workflow-type", "workflow-step", "register-person", "register-email",
-        "email-token", "email-code-token", "emailPoll", "login-pending", "pending-account",
-        "active-tab-id", "register-retried", "register-post-submitted",
-        "register-token-retry", "challenge-count", "warmup-idle-state",
-      ]);
+    if (type === MSG.WS_ABORT) {
+      await skRemove(
+        SK.WORKFLOW_TYPE, SK.WORKFLOW_STEP, SK.REGISTER_PERSON, SK.REGISTER_EMAIL,
+        SK.EMAIL_TOKEN, SK.EMAIL_CODE_TOKEN, SK.EMAIL_POLL, SK.LOGIN_PENDING, SK.PENDING_ACCOUNT,
+        SK.ACTIVE_TAB_ID, SK.REGISTER_RETRIED, SK.REGISTER_POST_SUBMITTED,
+        SK.REGISTER_TOKEN_RETRY, SK.CHALLENGE_COUNT, SK.WARMUP_IDLE_STATE,
+      );
       _runDispatchAbort();
-      send({ type: "status", workflow: null, step: null, errorNo: 0 });
+      send({ type: MSG.WS_STATUS, workflow: null, step: null, errorNo: 0 });
       return;
     }
 
-    if (type === "register") {
+    if (type === MSG.REGISTER_ONLY) {
       const su = {};
-      if (normalized.captchaSolver    != null) su["captcha-solver"]       = normalized.captchaSolver;
-      if (normalized.captchaDirectClick != null) su["captcha-direct-click"] = !!normalized.captchaDirectClick;
-      if (normalized.emailProvider    != null) su["email-provider"]       = normalized.emailProvider;
-      if (normalized.cfDomain         != null) su["cf-mail-domain"]       = normalized.cfDomain;
-      if (normalized.cfWorkerUrl      != null) su["cf-worker-url"]        = normalized.cfWorkerUrl;
-      if (normalized.cfWorkerSecret   != null) su["cf-worker-secret"]     = normalized.cfWorkerSecret;
-      if (Object.keys(su).length) await chrome.storage.local.set(su);
+      if (normalized.captchaSolver  != null) su[SK.CAPTCHA_SOLVER]   = normalized.captchaSolver;
+      if (normalized.emailProvider  != null) su[SK.EMAIL_PROVIDER]   = normalized.emailProvider;
+      if (normalized.cfDomain       != null) su[SK.CF_MAIL_DOMAIN]   = normalized.cfDomain;
+      if (normalized.cfWorkerUrl    != null) su[SK.CF_WORKER_URL]    = normalized.cfWorkerUrl;
+      if (normalized.cfWorkerSecret != null) su[SK.CF_WORKER_SECRET] = normalized.cfWorkerSecret;
+      if (Object.keys(su).length) await skSet(su);
       if (normalized.emailProvider === "cloudflare") {
         await self._ensureCfEmailConfig?.();
       }
-      _runRegister(normalized.realPerson, normalized.emailAccount);
+      wf_register(normalized.realPerson).catch(_onCommandError);
       return;
     }
 
-    if (type === "warmup") {
+    if (type === MSG.WS_WARMUP) {
       const su = {};
-      if (normalized.username           != null) su["username"]             = normalized.username;
-      if (normalized.password           != null) su["password"]             = normalized.password;
-      if (normalized.captchaSolver      != null) su["captcha-solver"]       = normalized.captchaSolver;
-      if (normalized.captchaDirectClick != null) su["captcha-direct-click"] = !!normalized.captchaDirectClick;
-      if (normalized.arrivalDate != null) su["visa-arrival-date"] = normalized.arrivalDate;
-      if (normalized.departureDate != null) su["visa-departure-date"] = normalized.departureDate;
-      if (normalized.consulPost != null) su["visa-consular-post"] = normalized.consulPost;
-      if (normalized.realPerson != null) {
-        su["real-person-input"] = normalized.realPerson;
-      }
-      if (Object.keys(su).length) await chrome.storage.local.set(su);
-      const _creds = await chrome.storage.local.get(["username", "password"]);
+      if (normalized.username      != null) su[SK.USERNAME]           = normalized.username;
+      if (normalized.password      != null) su[SK.PASSWORD]           = normalized.password;
+      if (normalized.captchaSolver != null) su[SK.CAPTCHA_SOLVER]     = normalized.captchaSolver;
+      if (normalized.arrivalDate   != null) su[SK.VISA_ARRIVAL_DATE]  = normalized.arrivalDate;
+      if (normalized.departureDate != null) su[SK.VISA_DEPARTURE_DATE] = normalized.departureDate;
+      if (normalized.consulPost    != null) su[SK.VISA_CONSULAR_POST] = normalized.consulPost;
+      if (normalized.realPerson    != null) su[SK.REAL_PERSON_INPUT]  = normalized.realPerson;
+      if (Object.keys(su).length) await skSet(su);
+      const _creds = await skGet(SK.USERNAME, SK.PASSWORD);
       F_warmup({
-        username:     _creds.username ?? "",
-        password:     _creds.password ?? "",
+        username:     _creds[SK.USERNAME] ?? "",
+        password:     _creds[SK.PASSWORD] ?? "",
         idleStep:     normalized.idleStep     ?? "login",
         triggerMode:  normalized.triggerMode  ?? "AUTO_TRIGGER",
         targetPostId: normalized.targetPostId ?? normalized.consulPost,
@@ -170,67 +168,54 @@ self.Comm = (() => {
       return;
     }
 
-    if (type === "apply") {
+    if (type === MSG.WS_APPLY) {
       const su = {};
-      if (normalized.arrivalDate != null) su["visa-arrival-date"] = normalized.arrivalDate;
-      if (normalized.departureDate != null) su["visa-departure-date"] = normalized.departureDate;
-      if (normalized.consulPost != null) su["visa-consular-post"] = normalized.consulPost;
-      if (Object.keys(su).length) await chrome.storage.local.set(su);
-      F_apply({
-        applyParams: normalized.applyParams,
-        executeAt: normalized.executeAt,
-        consulPost: normalized.consulPost,
-        arrivalDate: normalized.arrivalDate,
-      })
+      if (normalized.arrivalDate   != null) su[SK.VISA_ARRIVAL_DATE]  = normalized.arrivalDate;
+      if (normalized.departureDate != null) su[SK.VISA_DEPARTURE_DATE] = normalized.departureDate;
+      if (normalized.consulPost    != null) su[SK.VISA_CONSULAR_POST] = normalized.consulPost;
+      if (Object.keys(su).length) await skSet(su);
+      wf_apply()
         .then((r) => send({ type: "apply-done", ...r }))
         .catch(_onCommandError);
       return;
     }
 
-    if (type === "signal-apply") {
+    if (type === MSG.WS_SIGNAL_APPLY) {
       if (!_waitingForSignal) return; // ignore stale or unexpected signals
       _waitingForSignal = false;
       const su = {};
-      if (normalized.consulPost != null) su["visa-consular-post"] = normalized.consulPost;
-      if (Object.keys(su).length) await chrome.storage.local.set(su);
+      if (normalized.consulPost != null) su[SK.VISA_CONSULAR_POST] = normalized.consulPost;
+      if (Object.keys(su).length) await skSet(su);
       _sendStatusUpdate("APPLYING");
-      F_apply({
-        consulPost:  normalized.consulPost,
-        arrivalDate: normalized.arrivalDate,
-      })
+      wf_apply()
         .then(r => { _sendStatusUpdate("DONE"); send({ type: "apply-done", ...r }); })
         .catch(_onCommandError);
       return;
     }
 
-    if (type === "all-in-one") {
+    if (type === MSG.REGISTER_APPLY) {
       const su = {};
-      if (normalized.captchaSolver      != null) su["captcha-solver"]       = normalized.captchaSolver;
-      if (normalized.captchaDirectClick != null) su["captcha-direct-click"] = !!normalized.captchaDirectClick;
-      if (normalized.emailProvider      != null) su["email-provider"]       = normalized.emailProvider;
-      if (normalized.cfDomain           != null) su["cf-mail-domain"]       = normalized.cfDomain;
-      if (normalized.cfWorkerUrl        != null) su["cf-worker-url"]        = normalized.cfWorkerUrl;
-      if (normalized.cfWorkerSecret     != null) su["cf-worker-secret"]     = normalized.cfWorkerSecret;
-      if (normalized.arrivalDate != null) su["visa-arrival-date"] = normalized.arrivalDate;
-      if (normalized.departureDate != null) su["visa-departure-date"] = normalized.departureDate;
-      if (normalized.consulPost != null) su["visa-consular-post"] = normalized.consulPost;
-      if (normalized.realPerson != null) {
-        su["real-person-input"] = normalized.realPerson;
-      }
-      if (Object.keys(su).length) await chrome.storage.local.set(su);
+      if (normalized.captchaSolver  != null) su[SK.CAPTCHA_SOLVER]    = normalized.captchaSolver;
+      if (normalized.emailProvider  != null) su[SK.EMAIL_PROVIDER]    = normalized.emailProvider;
+      if (normalized.cfDomain       != null) su[SK.CF_MAIL_DOMAIN]    = normalized.cfDomain;
+      if (normalized.cfWorkerUrl    != null) su[SK.CF_WORKER_URL]     = normalized.cfWorkerUrl;
+      if (normalized.cfWorkerSecret != null) su[SK.CF_WORKER_SECRET]  = normalized.cfWorkerSecret;
+      if (normalized.arrivalDate    != null) su[SK.VISA_ARRIVAL_DATE] = normalized.arrivalDate;
+      if (normalized.departureDate  != null) su[SK.VISA_DEPARTURE_DATE] = normalized.departureDate;
+      if (normalized.consulPost     != null) su[SK.VISA_CONSULAR_POST] = normalized.consulPost;
+      if (normalized.realPerson     != null) su[SK.REAL_PERSON_INPUT]  = normalized.realPerson;
+      if (Object.keys(su).length) await skSet(su);
       if (normalized.emailProvider === "cloudflare") {
         await self._ensureCfEmailConfig?.();
       }
       F_allInOne({
         realPerson:  normalized.realPerson,
-        emailAccount: normalized.emailAccount ?? normalized.emailAcct,
         arrivalDate: normalized.arrivalDate,
         consulPost:  normalized.consulPost,
       })
         .then((r) => {
-          // Only assert proxyStatus:"ok" on genuine success — don't misreport when F5 fails.
-          const extra = r.ok !== false ? { proxyStatus: "ok" } : {};
-          send({ type: "all-in-one-done", ...r, ...extra });
+          const extra = r.ok !== false ? { proxyStatus: ERR_STATUS.OK } : {};
+          send({ type: "register-apply-done", ...r, ...extra });
         })
         .catch(_onCommandError);
       return;
@@ -311,7 +296,7 @@ self.Comm = (() => {
     if (!botId || !hubWsBase) return;
     const base = String(hubWsBase).replace(/\?.*$/, "").replace(/\/$/, "");
     const url = `${base}?botId=${encodeURIComponent(botId)}`;
-    chrome.storage.local.set({ botId, hubUrl: base, hubWsUrl: base });
+    skSet({ [SK.BOT_ID]: botId, [SK.HUB_URL]: base, [SK.HUB_WS_URL]: base });
     // Idempotent: if a healthy socket to the same endpoint already exists, don't replace it.
     // Both the IIFE auto-reconnect and WORKER_INIT call connectHub — whichever arrives second
     // must not tear down the connection where the command was already sent.
@@ -364,9 +349,9 @@ self.Comm = (() => {
       return;
     }
     // _url is null — SW was terminated and restarted; read from storage.
-    chrome.storage.local.get(["botId", "hubWsUrl", "hubUrl"]).then(stored => {
-      const botId   = stored.botId;
-      const hubBase = stored.hubWsUrl || stored.hubUrl;
+    skGet(SK.BOT_ID, SK.HUB_WS_URL, SK.HUB_URL).then(stored => {
+      const botId   = stored[SK.BOT_ID];
+      const hubBase = stored[SK.HUB_WS_URL] || stored[SK.HUB_URL];
       if (botId && hubBase && !_url) {
         connectHub(botId, hubBase);
       }
@@ -408,10 +393,10 @@ self.Comm = (() => {
   try {
     await new Promise(r => setTimeout(r, 500));
     if (self.Comm.getBotId()) return; // WORKER_INIT beat us to it — don't double-connect
-    const stored = await chrome.storage.local.get(["botId", "hubWsUrl", "hubUrl"]);
+    const stored = await skGet(SK.BOT_ID, SK.HUB_WS_URL, SK.HUB_URL);
     if (self.Comm.getBotId()) return; // check again after async storage read
-    const botId = stored.botId;
-    const hubBase = stored.hubWsUrl || stored.hubUrl;
+    const botId = stored[SK.BOT_ID];
+    const hubBase = stored[SK.HUB_WS_URL] || stored[SK.HUB_URL];
     if (botId && hubBase) {
       self.Comm.connectHub(botId, hubBase);
       return;

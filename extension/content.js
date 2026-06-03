@@ -38,8 +38,7 @@ setInterval(() => {
   chrome.runtime.sendMessage({type: "sw-keepalive-ping"}).catch(() => {});
 }, 20_000);
 
-const TARGET_HOST = "pedidodevistos.mne.gov.pt";
-const MAILTM      = "https://api.mail.tm";
+// TARGET_HOST, TARGET_URL, MAILTM — defined in constants.js
 
 const WARMUP_SITES = [
   "https://www.google.com/search?q=apply+for+visa+portugal",
@@ -51,9 +50,8 @@ const WARMUP_SITES = [
 ];
 const WARMUP_DWELL_MS = 100_000;
 
-// Applicant nationality/country — ISO 3166-1 alpha-3. Used for registration
-// nationality field, questionnaire answers, and visa form country defaults.
-const APPLICANT_NATIONALITY  = "FRA";  // Cape Verde
+// Applicant nationality/country — ISO 3166-1 alpha-3 fallback when storage has no value.
+const APPLICANT_NATIONALITY  = "CPV";
 
 // Target consular post — used as the fallback when visa-consular-post storage key
 // is not set. Must match config.defaultConsulPost in the manager.
@@ -137,11 +135,10 @@ let _postMonitorId = null; // { mo: MutationObserver, poll: intervalId } | null
 function sleep(ms) {
   return new Promise((resolve, reject) => {
     if (_abortFlag) { reject(new DOMException("Aborted", "AbortError")); return; }
-    chrome.runtime.sendMessage({type: "sleep", ms}, () => {
+    setTimeout(() => {
       if (_abortFlag) reject(new DOMException("Aborted", "AbortError"));
-      else if (chrome.runtime.lastError) setTimeout(resolve, ms);
       else resolve();
-    });
+    }, ms);
   });
 }
 
@@ -394,14 +391,6 @@ async function humanSelect(el, value) {
   await sleep(100 + Math.random() * 100);
 }
 
-function storageGet(keys) {
-  return new Promise(resolve => chrome.storage.local.get(keys, resolve));
-}
-
-function storageSet(obj) {
-  return new Promise(resolve => chrome.storage.local.set(obj, resolve));
-}
-
 function sendBgMessage(msg) {
   return new Promise(resolve => chrome.runtime.sendMessage(msg, resolve));
 }
@@ -409,21 +398,6 @@ function sendBgMessage(msg) {
 function _logEntry(msg) {
   sendBgMessage({type: "log-entry", msg}).catch(() => {});
 }
-
-// Forward all console output to the run logger so the saved .log file mirrors
-// what appears in DevTools. Runs once at content script load.
-(function _patchConsole() {
-  const _fwd = (level, args) => {
-    try {
-      const text = args.map(a => (a instanceof Error ? a.stack : typeof a === "object" ? JSON.stringify(a) : String(a))).join(" ");
-      _logEntry(`[${level}] ${text}`);
-    } catch (_) {}
-  };
-  for (const level of ["log", "warn", "error", "info"]) {
-    const orig = console[level].bind(console);
-    console[level] = function (...args) { orig(...args); _fwd(level.toUpperCase(), args); };
-  }
-})();
 
 // ---------------------------------------------------------------------------
 // Badge
@@ -437,7 +411,7 @@ function setBadge() {}
 // ---------------------------------------------------------------------------
 
 async function switchToEnglish() {
-  const {"lang-switch-enabled": enabled = false} = await storageGet("lang-switch-enabled");
+  const {[SK.LANG_SWITCH_ENABLED]: enabled = false} = await skGet(SK.LANG_SWITCH_ENABLED);
   if (!enabled) { console.log("[OctoProbe] Lang switch disabled — skipping."); return; }
 
   await sleep(300);
@@ -487,16 +461,16 @@ const LOGIN_SUBMIT_SELECTORS = [
 
 async function warmupStep() {
   const {
-    "warmup-end-time":   endTime,
-    "warmup-site-index": siteIdx = 0,
-  } = await storageGet(["warmup-end-time", "warmup-site-index"]);
+    [SK.WARMUP_END_TIME]:   endTime,
+    [SK.WARMUP_SITE_INDEX]: siteIdx = 0,
+  } = await skGet(SK.WARMUP_END_TIME, SK.WARMUP_SITE_INDEX);
 
   const now      = Date.now();
   const timeLeft = Math.max(0, Math.round((endTime - now) / 1000));
 
   if (now >= endTime) {
     console.log("[OctoProbe] Warmup complete — transitioning to registration");
-    await storageSet({"workflow-type": "register", "workflow-step": "home", "warmup-site-index": 0});
+    await skSet({[SK.WORKFLOW_TYPE]: "register", [SK.WORKFLOW_STEP]: "home", [SK.WARMUP_SITE_INDEX]: 0});
     location.href = `https://${TARGET_HOST}/VistosOnline/`;
     return;
   }
@@ -518,10 +492,10 @@ async function warmupStep() {
     const nextIdx = siteIdx + 1;
 
     if (Date.now() >= endTime || nextIdx >= WARMUP_SITES.length * 2) {
-      await storageSet({"workflow-type": "register", "workflow-step": "home", "warmup-site-index": 0});
+      await skSet({[SK.WORKFLOW_TYPE]: "register", [SK.WORKFLOW_STEP]: "home", [SK.WARMUP_SITE_INDEX]: 0});
       location.href = `https://${TARGET_HOST}/VistosOnline/`;
     } else {
-      await storageSet({"warmup-site-index": nextIdx});
+      await skSet({[SK.WARMUP_SITE_INDEX]: nextIdx});
       location.href = WARMUP_SITES[nextIdx % WARMUP_SITES.length];
     }
   }, WARMUP_DWELL_MS);
@@ -533,10 +507,11 @@ async function _clearWorkflowFailed(reason, code = 0) {
 }
 
 async function _selectNationality(natEl, person) {
-  person.nationality = APPLICANT_NATIONALITY;
-  await storageSet({"register-person": Object.assign({}, person)});
-  await humanSelect(natEl, APPLICANT_NATIONALITY);
-  console.log(`[OctoProbe] Nationality selected: ${APPLICANT_NATIONALITY}`);
+  const nat = person.nationality || APPLICANT_NATIONALITY;
+  person.nationality = nat;
+  await skSet({[SK.REGISTER_PERSON]: Object.assign({}, person)});
+  await humanSelect(natEl, nat);
+  console.log(`[OctoProbe] Nationality selected: ${nat}`);
 }
 
 // Returns selectors of fields that are visibly present but have an empty value.
@@ -758,7 +733,7 @@ async function injectAlertCapture(confirmToo = false) {
 async function waitForEmailToken(jwt, maxMs = 120000) {
   const deadline = Date.now() + maxMs;
 
-  const {"email-provider": emailProvider = "mailtm"} = await storageGet("email-provider");
+  const {[SK.EMAIL_PROVIDER]: emailProvider = "mailtm"} = await skGet(SK.EMAIL_PROVIDER);
   const isMailTm = emailProvider === "mailtm";
 
   let bgRawToken = null;
@@ -767,7 +742,7 @@ async function waitForEmailToken(jwt, maxMs = 120000) {
 
   while (Date.now() < deadline) {
     // Check email-code-token first (CF mode stores UUID there); fall back to email-token (mail.tm).
-    const {["email-code-token"]: storedCode, ["email-token"]: storedLink} = await storageGet(["email-code-token", "email-token"]);
+    const {[SK.EMAIL_CODE_TOKEN]: storedCode, [SK.EMAIL_TOKEN]: storedLink} = await skGet(SK.EMAIL_CODE_TOKEN, SK.EMAIL_TOKEN);
     const stored = storedCode ?? storedLink;
     if (stored) {
       console.log("[OctoProbe] Email token from bg-storage:", stored);
@@ -1016,10 +991,18 @@ function _detectPageState() {
     return document.querySelector("form[name='vistoForm'], #vistoForm") ? "form" : "session-lost";
   }
   if (/Schedule|Agendamento|ScheduleController/i.test(path)) {
+    const previstoEl  = document.getElementById("previstoMsg");
+    const calendarEl  = document.getElementById("calendarDiv");
+    const captchaEl   = document.getElementById("captchaDiv");
+    if (previstoEl && isVisible(previstoEl))                  return "schedule-submitted";
+    if (calendarEl && calendarEl.style.display !== "none")    return "schedule-calendar";
+    if (captchaEl  && isVisible(captchaEl))                   return "schedule-captcha";
     return "schedule";
   }
   if (/Authentication|authentication/i.test(path + location.search)) {
-    return location.search.includes("token=") ? "token" : "auth";
+    if (location.search.includes("token=")) return "token";
+    const regForm = document.getElementById("formReg");
+    return (regForm && isVisible(regForm)) ? "reg-form" : "auth";
   }
 
   // Home/dashboard or any other page: detect login by authenticated-only nav elements.
@@ -1031,6 +1014,21 @@ function _detectPageState() {
   );
   return loggedIn ? "logged-in" : "not-logged-in";
 }
+
+//#region Utils
+
+// WF_STEPS loaded from wf-steps.js (injected before this script via manifest)
+
+// Returns a WF_STEPS integer for the current page.
+// Gathers cur_page + last_step + page_state, then delegates to resolveStep() (constants.js).
+async function detectCurrentStep() {
+  const bucket   = classifyUrlPath(location.pathname, location.search);
+  const stored   = await skGet(SK.WORKFLOW_STEP).catch(() => ({}));
+  const lastStep = stored[SK.WORKFLOW_STEP] ?? null;
+  return resolveStep(bucket, lastStep);
+}
+
+//#endregion
 
 // ---------------------------------------------------------------------------
 // Visa workflow — navigate to questionnaire (when already logged in)
@@ -1074,21 +1072,18 @@ async function visaStepGoToQuestionnaire() {
 // Visa workflow — step: questionnaire
 // ---------------------------------------------------------------------------
 
-// Known answer cascade. Each entry is [questionSelectId, value].
-// Full questionnaire cascade for CPV nationality → short-stay Schengen visa.
-// Q1 (nationality) is disabled and auto-fires goNext("1","CPV") on page load.
-// Each subsequent question arrives via AJAX — we must wait for it before filling.
-// Chain: Q1(auto) → Q21(CPV) → Q2(01) → Q3(SCH) → Q5(O) → Q6(10) → Q16(FAM_N) → result
-const _QUESTIONNAIRE_STEPS = [
-  // [selectId, qNum, value, label]
-  // qNum matches the id_pergunta argument to goNext() — same as the trailing number in selectId.
-  ["cb_question_21",  21,  APPLICANT_NATIONALITY, "Country of residence"],
-  ["cb_question_2",    2,  "01",     "Passport type (ordinary)"],
-  ["cb_question_3",    3,  "SCH",    "Stay duration (up to 90 days)"],
-  ["cb_question_5",    5,  "O",      "Seasonal work? (no)"],
-  ["cb_question_6",    6,  "10",     "Purpose of stay (tourism)"],
-  ["cb_question_16",  16,  "FAM_N",  "Traveling with EU family? (no)"],
-];
+// Known answer cascade. Each entry is [questionSelectId, qNum, value, label].
+// Chain: Q1(auto) → Q21(nationality) → Q2(01) → Q3(SCH) → Q5(O) → Q6(10) → Q16(FAM_N) → result
+function _getQuestionnaireSteps(nat) {
+  return [
+    ["cb_question_21",  21,  nat,      "Country of residence"],
+    ["cb_question_2",    2,  "01",     "Passport type (ordinary)"],
+    ["cb_question_3",    3,  "SCH",    "Stay duration (up to 90 days)"],
+    ["cb_question_5",    5,  "O",      "Seasonal work? (no)"],
+    ["cb_question_6",    6,  "10",     "Purpose of stay (tourism)"],
+    ["cb_question_16",  16,  "FAM_N",  "Traveling with EU family? (no)"],
+  ];
+}
 
 // Wait for a questionnaire select to be present in DOM AND have its option populated.
 async function _waitForQSelect(selId, maxMs = 15000) {
@@ -1102,6 +1097,9 @@ async function _waitForQSelect(selId, maxMs = 15000) {
 
 async function visaStepQuestionnaire() {
   setBadge("Visa: questionnaire loading…", "#9060cc");
+
+  const {[SK.REAL_PERSON_INPUT]: _rpQ} = await skGet(SK.REAL_PERSON_INPUT);
+  const nat = _rpQ?.nationality || APPLICANT_NATIONALITY;
 
   // Wait for #questForm (the questionnaire form) to be present.
   // The form is injected via AJAX after DOMContentLoaded — can take 15+ s.
@@ -1130,34 +1128,33 @@ async function visaStepQuestionnaire() {
       const q1Ready = await waitFor(() => q1El.options.length > 1 ? q1El : null, 8000, 300);
       if (q1Ready) {
         const cur = q1El.value;
-        const isCpv = cur === APPLICANT_NATIONALITY;
-        if (!isCpv) {
-          console.log(`[OctoProbe] Q1 current value="${cur}" — selecting ${APPLICANT_NATIONALITY}`);
+        if (cur !== nat) {
+          console.log(`[OctoProbe] Q1 current value="${cur}" — selecting ${nat}`);
           await sleep(400 + Math.random() * 400);
           const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")?.set;
-          if (setter) setter.call(q1El, APPLICANT_NATIONALITY); else q1El.value = APPLICANT_NATIONALITY;
+          if (setter) setter.call(q1El, nat); else q1El.value = nat;
         } else {
-          console.log(`[OctoProbe] Q1 already set to ${APPLICANT_NATIONALITY}`);
+          console.log(`[OctoProbe] Q1 already set to ${nat}`);
         }
       } else {
         console.warn("[OctoProbe] Q1 select options did not load");
       }
     } else {
-      console.warn(`[OctoProbe] cb_question_1 not found — attempting goNext(1,'${APPLICANT_NATIONALITY}') anyway`);
+      console.warn(`[OctoProbe] cb_question_1 not found — attempting goNext(1,'${nat}') anyway`);
     }
 
     await sleep(300 + Math.random() * 200);
-    console.log(`[OctoProbe] Calling goNext(1,'${APPLICANT_NATIONALITY}')`);
-    await _callPageFn(`if(typeof goNext==='function') goNext(1,'${APPLICANT_NATIONALITY}');`);
+    console.log(`[OctoProbe] Calling goNext(1,'${nat}')`);
+    await _callPageFn(`if(typeof goNext==='function') goNext(1,'${nat}');`);
 
     firstQ = await _waitForQSelect("cb_question_21", 15000);
-    if (!firstQ) { await _clearWorkflowFailed(`Visa: Q21 not appeared after goNext(1,'${APPLICANT_NATIONALITY}')`, E.VISA_FAILED); return; }
+    if (!firstQ) { await _clearWorkflowFailed(`Visa: Q21 not appeared after goNext(1,'${nat}')`, E.VISA_FAILED); return; }
   } else {
     console.log("[OctoProbe] Q1 auto-fired — Q21 already present");
   }
 
   // Fill each cascading question in order.
-  for (const [selId, qNum, value, label] of _QUESTIONNAIRE_STEPS) {
+  for (const [selId, qNum, value, label] of _getQuestionnaireSteps(nat)) {
     setBadge(`Visa: Q — ${label}…`, "#9060cc");
 
     // Wait for this question's select to appear and be populated with options.
@@ -1273,11 +1270,11 @@ async function visaStepForm({submitAfter = true} = {}) {
 
   // ── Storage: pull person data, visa config ───────────────────────────────
   const {
-    "real-person-input":   rp,
-    "visa-arrival-date":   arrivalDate,
-    "visa-departure-date": departureDate,
-    "visa-consular-post":  storedPostoId,
-  } = await storageGet(["real-person-input","visa-arrival-date","visa-departure-date","visa-consular-post"]);
+    [SK.REAL_PERSON_INPUT]:   rp,
+    [SK.VISA_ARRIVAL_DATE]:   arrivalDate,
+    [SK.VISA_DEPARTURE_DATE]: departureDate,
+    [SK.VISA_CONSULAR_POST]:  storedPostoId,
+  } = await skGet(SK.REAL_PERSON_INPUT, SK.VISA_ARRIVAL_DATE, SK.VISA_DEPARTURE_DATE, SK.VISA_CONSULAR_POST);
 
   const person = rp ?? {};
 
@@ -1336,9 +1333,9 @@ async function visaStepForm({submitAfter = true} = {}) {
 
   // Persist both resolved dates to storage so visaStepSchedule can use the correct
   // arrival bound when filtering available appointment slots (even when auto-generated).
-  await storageSet({
-    "visa-arrival-date":   computedArrivalDate,
-    "visa-departure-date": computedDepartureDate,
+  await skSet({
+    [SK.VISA_ARRIVAL_DATE]:   computedArrivalDate,
+    [SK.VISA_DEPARTURE_DATE]: computedDepartureDate,
   });
 
   // ── Consular post (f0sf1) — inject; triggers AJAX for appointment slots ──
@@ -1358,9 +1355,9 @@ async function visaStepForm({submitAfter = true} = {}) {
     // prefill (readonly, skip): f1 surname, f3 first name, f4 dob, f9 gender
     ["f2",    "+"],      // surname at birth — default:+
     ["f6",    "+"],      // place of birth — default:+  (was f6sf2, corrected)
-    ["f6sf1", APPLICANT_NATIONALITY],   // country of birth
-    ["f7sf1", APPLICANT_NATIONALITY],   // current nationality
-    ["f8",    APPLICANT_NATIONALITY],   // original nationality
+    ["f6sf1", person.nationality || APPLICANT_NATIONALITY],   // country of birth
+    ["f7sf1", person.nationality || APPLICANT_NATIONALITY],   // current nationality
+    ["f8",    person.nationality || APPLICANT_NATIONALITY],   // original nationality
     ["f10",   "1"],     // marital status — default:single (1)
   ];
   for (const [name, val] of tab1Fields) {
@@ -1377,7 +1374,7 @@ async function visaStepForm({submitAfter = true} = {}) {
     // Visual reading order: f16 → f17 → f15 (matches form layout)
     ["f16", passportIssueDate],   // date of issue — inject (person > config > auto)
     ["f17", passportExpiryDate],  // valid until — inject (person > config > auto)
-    ["f15", APPLICANT_NATIONALITY],   // issued by
+    ["f15", person.nationality || APPLICANT_NATIONALITY],   // issued by
     // f5 (ID number) — optional, no mark, skip
   ];
   for (const [name, val] of tab2Fields) {
@@ -1517,8 +1514,8 @@ async function _downloadBlobUrl(blobUrl, filename) {
 async function visaStepSchedule() {
   setBadge("Visa: schedule — waiting for page…", "#9060cc");
 
-  const {"visa-consular-post": postoId, "direct-slots-fetch": directFetch = false} =
-    await storageGet(["visa-consular-post", "direct-slots-fetch"]);
+  const {[SK.VISA_CONSULAR_POST]: postoId, [SK.DIRECT_SLOTS_FETCH]: directFetch = false} =
+    await skGet(SK.VISA_CONSULAR_POST, SK.DIRECT_SLOTS_FETCH);
   const POSTO = postoId ?? TARGET_CONSULAR_POST;
 
   // ── 1. Wait for captchaDiv ────────────────────────────────────────────────
@@ -2232,7 +2229,7 @@ async function _tokenSubmit() {
   console.warn("[OctoProbe] No response from token form — trying direct VerificarEmail fetch");
   try {
     const urlToken = new URLSearchParams(location.search).get("token")?.toLowerCase() ?? null;
-    const {"email-code-token": storedCode} = await storageGet("email-code-token");
+    const {[SK.EMAIL_CODE_TOKEN]: storedCode} = await skGet(SK.EMAIL_CODE_TOKEN);
     const params = new URLSearchParams({
       language: "ENG",
       token: storedCode ?? urlToken,
@@ -2311,7 +2308,7 @@ const _CMD_HANDLERS = {
   },
 
   "cmd-start-post-monitor": async () => {
-    const { "target-post-id": targetPostId } = await storageGet(["target-post-id"]);
+    const {[SK.TARGET_POST_ID]: targetPostId} = await skGet(SK.TARGET_POST_ID);
     const target = String(targetPostId ?? "");
     if (!target) return {ok: false, error: "target-post-id not set"};
 
@@ -2370,15 +2367,6 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     sendResponse({ok: true});
     return false;
   }
-  if (msg.type === "run-proxy-check") {
-    sendResponse({ok: true});
-    _checkProxyQuality().then(q => {
-      chrome.runtime.sendMessage({type: "ws-send", data: {
-        type: "proxy-check", workflow: null, timestamp: new Date().toISOString(), ...q,
-      }});
-    });
-    return false;
-  }
   const handler = _CMD_HANDLERS[msg.type];
   if (handler) {
     _abortFlag = false;
@@ -2406,9 +2394,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   // fires a normal page-ready on the destination. If bd.js fails: no redirect happens
   // and we report waf-challenge after the dwell so background.js can abort.
   if (document.querySelector('script[src*="/ch/bd.js"]')) {
-    const {"challenge-count": prev = 0} = await storageGet("challenge-count");
+    const {[SK.CHALLENGE_COUNT]: prev = 0} = await skGet(SK.CHALLENGE_COUNT);
     const count = prev + 1;
-    await storageSet({"challenge-count": count});
+    await skSet({[SK.CHALLENGE_COUNT]: count});
     console.log(`[OctoProbe] Bot challenge page #${count} — waiting 20s for bd.js auto-redirect`);
     setBadge(`WAF challenge (${count}/2) — waiting…`, "#888888");
 
@@ -2424,7 +2412,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     // Still on the challenge page — bd.js did not redirect.
     console.warn("[OctoProbe] WAF challenge not solved after 20s");
     if (count >= 2) {
-      await storageSet({"challenge-count": 0});
+      await skSet({[SK.CHALLENGE_COUNT]: 0});
       setBadge("IP BLOCKED — switch proxy", "#ff0000");
     } else {
       setBadge("WAF failed — reporting to bg", "#ff6b6b");
@@ -2433,15 +2421,15 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return;
   }
 
-  await storageSet({"challenge-count": 0});
+  await skSet({[SK.CHALLENGE_COUNT]: 0});
 
   // Persist any pending account set just before token submit (survives navigation).
-  const {"pending-account": pendingAccount} = await storageGet("pending-account");
+  const {[SK.PENDING_ACCOUNT]: pendingAccount} = await skGet(SK.PENDING_ACCOUNT);
   if (pendingAccount) {
     console.log("[OctoProbe] Found pending account — saving:", pendingAccount.username);
     const saveResult = await sendBgMessage({type: "save-account", account: pendingAccount}).catch(() => null);
     if (saveResult?.ok) {
-      await new Promise(res => chrome.storage.local.remove("pending-account", res));
+      await skRemove(SK.PENDING_ACCOUNT);
       chrome.runtime.sendMessage({type: "stop-email-poll"});
       console.log("[OctoProbe] Account saved:", saveResult.filename);
     } else {

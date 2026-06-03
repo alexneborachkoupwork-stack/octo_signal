@@ -1,7 +1,7 @@
 /**
  * Runs on hub /worker-init?botId=… — stores hub URL + botId and connects Octo Probe to hub.
  */
-(function () {
+(async function () {
   const params = new URLSearchParams(window.location.search);
   const botId = params.get('botId') ?? params.get('profileId');
 
@@ -36,13 +36,12 @@
 
   setStatus(`Connecting bot ${botId}…`, '#f0c040');
 
-  chrome.storage.local.set({ botId, hubUrl, hubWsUrl: hubUrl }, async () => {
-    const errMsg = await sendWorkerInit(hubUrl, 1);
-    if (errMsg) {
-      console.error('[OctoProbe] WORKER_INIT failed:', errMsg);
-      setStatus(`Extension error: ${errMsg}`, '#f87171');
-      return;
-    }
-    setStatus(`Octo Probe connected (bot ${botId})`, '#34d399');
-  });
+  await skSet({ [SK.BOT_ID]: botId, [SK.HUB_URL]: hubUrl, [SK.HUB_WS_URL]: hubUrl });
+  const errMsg = await sendWorkerInit(hubUrl, 1);
+  if (errMsg) {
+    console.error('[OctoProbe] WORKER_INIT failed:', errMsg);
+    setStatus(`Extension error: ${errMsg}`, '#f87171');
+    return;
+  }
+  setStatus(`Octo Probe connected (bot ${botId})`, '#34d399');
 })();
