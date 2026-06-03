@@ -148,21 +148,21 @@ function saveCredentials(callback) {
 }
 
 btnLoginIdle.addEventListener("click", () => {
-  saveCredentials((username, password) => {
+  _saveProxy().then(() => saveCredentials((username, password) => {
     chrome.runtime.sendMessage({type: MSG.LOGIN_IDLE, payload: {username, password}, proxy: _readProxy()}, (resp) => {
       if (resp?.ok) { setStatus("Login started."); window.close(); }
       else setStatus(resp?.error ?? "Login failed.", true);
     });
-  });
+  }));
 });
 
 btnLoginApply.addEventListener("click", () => {
-  saveCredentials((username, password) => {
+  _saveProxy().then(() => saveCredentials((username, password) => {
     chrome.runtime.sendMessage({type: MSG.LOGIN_APPLY, payload: {username, password}, proxy: _readProxy()}, (resp) => {
       if (resp?.ok) { setStatus("Login + Apply started."); window.close(); }
       else setStatus(resp?.error ?? "Login failed.", true);
     });
-  });
+  }));
 });
 
 // ── Real person section ───────────────────────────────────────────────────────
@@ -233,6 +233,7 @@ btnTriggerAuto.addEventListener("click",   () => setTriggerMode("AUTO_TRIGGER"))
 btnTriggerSignal.addEventListener("click", () => setTriggerMode("EXTERNAL_SIGNAL"));
 
 btnRegisterIdle.addEventListener("click", async () => {
+  await _saveProxy();
   const {ok, rp} = await _resolvePersonPayload();
   if (!ok) return;
   chrome.runtime.sendMessage({type: MSG.REGISTER_ONLY, realPerson: rp, proxy: _readProxy()}, (resp) => {
@@ -242,6 +243,7 @@ btnRegisterIdle.addEventListener("click", async () => {
 });
 
 btnRegisterLogin.addEventListener("click", async () => {
+  await _saveProxy();
   const {ok, rp} = await _resolvePersonPayload();
   if (!ok) return;
   chrome.runtime.sendMessage({type: MSG.REGISTER_LOGIN, realPerson: rp, proxy: _readProxy()}, (resp) => {
@@ -253,6 +255,7 @@ btnRegisterLogin.addEventListener("click", async () => {
 btnRegisterApply.addEventListener("click", async () => {
   const postoId = visaPostoEl.value.trim();
   if (!postoId) { setStatus("Consular Post ID is required.", true); return; }
+  await _saveProxy();
   const {ok, rp} = await _resolvePersonPayload();
   if (!ok) return;
   await skSet({[SK.VISA_CONSULAR_POST]: postoId});
@@ -285,6 +288,21 @@ function _readProxy() {
     login:    proxyLoginEl.value.trim(),
     password: proxyPassEl.value,
   };
+}
+
+// Flush all proxy fields to storage at button-click time — mirrors how saveCredentials()
+// works for login credentials so storage always reflects the current field values.
+async function _saveProxy() {
+  const host  = proxyHostEl.value.trim();
+  const port  = proxyPortEl.value.trim();
+  const type  = btnProxySocks5.classList.contains("active") ? "socks5" : "http";
+  await skSet({
+    [SK.PROXY_HOST]:  host,
+    [SK.PROXY_PORT]:  Number(port) || 0,
+    [SK.PROXY_TYPE]:  type,
+    [SK.PROXY_LOGIN]: proxyLoginEl.value.trim(),
+    [SK.PROXY_PASS]:  proxyPassEl.value,
+  });
 }
 
 proxyHostEl.addEventListener("input",    () => skSet({[SK.PROXY_HOST]:  proxyHostEl.value.trim()}));

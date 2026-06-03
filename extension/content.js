@@ -667,13 +667,16 @@ async function _waitForRecaptchaApi() {
     setTimeout(() => { _drifting = false; _logEntry("captcha: content-side timeout (165s)"); resolve(false); }, 165000);
 
     // Drift mouse while solve+inject is in progress — zero movement is a bot signal.
+    // Dispatch on the element under the cursor (not document) and use ±20px steps
+    // so the movement looks like a real user hovering near the captcha widget.
     (async () => {
       while (_drifting) {
-        await sleep(200 + Math.random() * 400);
+        await sleep(120 + Math.random() * 280);
         if (!_drifting) break;
-        const nx = Math.max(0, Math.min(innerWidth,  (window._mX ?? innerWidth  * 0.5) + (Math.random() - 0.5) * 8));
-        const ny = Math.max(0, Math.min(innerHeight, (window._mY ?? innerHeight * 0.5) + (Math.random() - 0.5) * 8));
-        document.dispatchEvent(new MouseEvent("mousemove", {
+        const nx = Math.max(0, Math.min(innerWidth,  (window._mX ?? innerWidth  * 0.5) + (Math.random() - 0.5) * 40));
+        const ny = Math.max(0, Math.min(innerHeight, (window._mY ?? innerHeight * 0.5) + (Math.random() - 0.5) * 40));
+        const _dEl = document.elementFromPoint(nx, ny) ?? document;
+        _dEl.dispatchEvent(new MouseEvent("mousemove", {
           bubbles: true, clientX: nx, clientY: ny,
           screenX: nx + (window.screenX ?? 0), screenY: ny + (window.screenY ?? 0),
         }));
@@ -1848,7 +1851,15 @@ async function _registerOpenForm() {
       8000
     );
     if (!regEl) return {ok: false, status: "link_not_found"};
-    await sleep(900 + Math.random() * 1000);
+    // Brief page interaction before clicking register — scroll down to read options,
+    // then scroll back. Builds page-session behavioral history before captcha loads.
+    const _authScrollMax = Math.min(document.body.scrollHeight * 0.35, 350);
+    window.scrollTo({top: _authScrollMax, behavior: "smooth"});
+    await sleep(900 + Math.random() * 800);
+    window.scrollTo({top: 0, behavior: "smooth"});
+    await sleep(500 + Math.random() * 600);
+    await humanMoveTo(regEl);
+    await sleep(300 + Math.random() * 400);
     await humanClick(regEl);
     await sleep(300 + Math.random() * 300);
     setBadge("Register: waiting for form…", "#f0c040");
@@ -1879,13 +1890,6 @@ async function _registerSubmit() {
   setBadge("Register: reviewing form…", "#f0c040");
 
   const rcEl = document.querySelector("iframe[src*='recaptcha'], .g-recaptcha, #recaptcha, [class*='recaptcha']");
-  if (rcEl) {
-    rcEl.scrollIntoView({behavior: "smooth", block: "center"});
-    await sleep(800 + Math.random() * 600);
-    const r = rcEl.getBoundingClientRect();
-    window._mX = Math.round(r.left + r.width * 0.5);
-    window._mY = Math.round(r.top + r.height * 0.5);
-  }
 
   // Pre-captcha behavioral dwell — reCAPTCHA Enterprise scores the entire page session.
   // A real user spends minutes reviewing the filled form before submitting.
@@ -1899,14 +1903,33 @@ async function _registerSubmit() {
     if (_reviewFields.length) {
       const f = _reviewFields[Math.floor(Math.random() * _reviewFields.length)];
       await humanMoveTo(f);
+      // Occasionally click a field to re-read it (human reviews form by re-clicking fields)
+      if (Math.random() < 0.25) {
+        await sleep(200 + Math.random() * 300);
+        f.focus();
+      }
     }
-    if (Math.random() < 0.3) {
-      const scrollTarget = Math.random() * (document.body.scrollHeight * 0.6);
+    if (Math.random() < 0.35) {
+      const scrollTarget = Math.random() * (document.body.scrollHeight * 0.7);
       window.scrollTo({top: scrollTarget, behavior: "smooth"});
     }
-    await sleep(2500 + Math.random() * 3000);
+    await sleep(2000 + Math.random() * 3000);
   }
   _logEntry("register: pre-captcha dwell done");
+
+  // After the form review, approach the reCAPTCHA widget — user moves to verify themselves.
+  // This ensures the mouse is near the captcha when the external solver runs, so the
+  // concurrent mouse drift is anchored to the correct page region.
+  if (rcEl && isVisible(rcEl)) {
+    rcEl.scrollIntoView({behavior: "smooth", block: "center"});
+    await sleep(600 + Math.random() * 700);
+    await humanMoveTo(rcEl);
+    await sleep(400 + Math.random() * 600);
+  } else if (rcEl) {
+    const _r = rcEl.getBoundingClientRect();
+    window._mX = Math.round(_r.left + _r.width  * 0.5);
+    window._mY = Math.round(_r.top  + _r.height * 0.5);
+  }
 
   const formSubmitBtn = document.querySelector(
     "#formReg button[type='submit'], #formReg input[type='submit'], #formReg button[type='button']"
@@ -1959,7 +1982,8 @@ async function _registerSubmit() {
       return {ok: false, status: "captcha_fail"};
     }
     _logEntry(`register: captcha solved — submitting (attempt ${rgpdAttempt})`);
-
+    // Human reaction: notice captcha checkmark → move to submit button (0.7-1.7s)
+    await sleep(700 + Math.random() * 1000);
     setBadge("Register: opening privacy popup…", "#f0c040");
     await humanClick(formSubmitBtn);
 
@@ -1976,8 +2000,25 @@ async function _registerSubmit() {
 
     setBadge("Register: accepting privacy…", "#f0c040");
     await sleep(600 + Math.random() * 500);
-    const rgpdSubmit = document.querySelector("#registroSubmit");
-    if (!rgpdSubmit) return {ok: false, status: "rgpd_not_found"};
+
+    // Tick consent checkboxes — mirrors the login RGPD flow (#loginCheckbox1/2/3).
+    // The submit button starts disabled and only enables once required boxes are checked.
+    const rcb1 = document.querySelector("#registroCheckbox1");
+    const rcb2 = document.querySelector("#registroCheckbox2");
+    const rcb3 = document.querySelector("#registroCheckbox3");
+    if (rcb3?.checked) { await humanClick(rcb3); await sleep(200 + Math.random() * 200); }
+    if (rcb1 && !rcb1.checked) { await humanClick(rcb1); await sleep(300 + Math.random() * 300); }
+    if (rcb2 && !rcb2.checked) { await humanClick(rcb2); await sleep(400 + Math.random() * 300); }
+
+    // Wait for submit button to become enabled (requires checkboxes to be ticked first).
+    const rgpdSubmit = await waitFor(() => {
+      const btn = document.querySelector("#registroSubmit");
+      return btn && !btn.disabled ? btn : null;
+    }, 8000);
+    if (!rgpdSubmit) {
+      _logEntry("register: RGPD submit still disabled after checkbox checks");
+      return {ok: false, status: "captcha_fail"};
+    }
 
     setBadge("Register: submitting…", "#f0c040");
     _registerAlert = null; // clear stale alert from previous attempt before submit

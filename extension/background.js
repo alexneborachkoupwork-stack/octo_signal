@@ -609,6 +609,7 @@ async function _raceSolvers(pageUrl, siteKey, action) {
 
   console.log(`[OctoProbe BG] _raceSolvers siteKey=${siteKey} action=${action} solver=${selected} parallel=${parallel} proxy=${proxy ? proxy.host : "none"}`);
   console.log(`[OctoProbe BG] keys: AC=${acKeys.length} TC=${tcKeys.length} CM=${cmKeys.length} CS=${csKey ? 1 : 0}`);
+  _runLog.entry(`captcha: ${proxy ? `proxy-mode host=${proxy.host} type=${proxy.type}` : "proxyless"} solver=${selected}`);
 
   function _buildAllSolvers() {
     const s = [];
