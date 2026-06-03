@@ -652,6 +652,7 @@ async function _resetWorkflow() {
   // spuriously, and TARGET_POST_AVAILABLE is not silently dropped by a stale lock.
   _postAvailableResolver = null;
   _applyTriggerLock      = false;
+  _sessionProxyIp        = null;
 
   // Close previous session's tabs before clearing their IDs — prevents orphaned tabs
   // when wf_register/wf_login is called while a previous session is still mid-flight.
@@ -723,7 +724,8 @@ function _writeRunError(e) {
 // Polling state (in-memory; service worker may be restarted, but alarms persist)
 // ---------------------------------------------------------------------------
 
-let _pollInterval = null;
+let _pollInterval    = null;
+let _sessionProxyIp  = null; // set once in p0_openAuthPage; reused by step4 burn check
 
 async function _doPollTick() {
   const {[SK.EMAIL_POLL]: emailPoll} = await skGet(SK.EMAIL_POLL);
@@ -996,8 +998,7 @@ async function step4_regFormSubmit(tabId, person, emailAcct) {
     return {ok: false, status: fillResult?.status ?? "fill_failed"};
   }
 
-  let _proxyIp = null;
-  try { const r = await sendTabCmd(tabId, "cmd-log-ip"); _proxyIp = r?.ip ?? null; } catch (_) {}
+  const _proxyIp = _sessionProxyIp;
   if (_proxyIp) {
     const {[SK.BURNED_PROXIES]: _burned = []} = await skGet(SK.BURNED_PROXIES);
     const _now = Date.now();
@@ -1017,6 +1018,10 @@ async function step4_regFormSubmit(tabId, person, emailAcct) {
   const result = await sendTabCmd(tabId, "cmd-register-submit").catch(() => ({ok: true, status: "navigated"}));
   _runLog.entry(`step4: submit → ${result.status ?? ("error: " + (result?.error ?? "?"))}`);
 
+  if (result.status === "submit_disabled") {
+    const e = new Error("step4: RGPD submit stayed disabled — server silently dropped request, rotate proxy");
+    e.proxyStatus = ERR_STATUS.BLOCKED; e.nextAction = NEXT_ACTION.ROTATE_PROXY; throw e;
+  }
   if (result.status === "ip_blocked") {
     const e = new Error("step4: IP blocked by captcha rate-limit");
     e.proxyStatus = ERR_STATUS.BLOCKED; e.nextAction = NEXT_ACTION.ROTATE_PROXY; throw e;
@@ -1084,6 +1089,10 @@ async function step6_regFormSubmit2(tabId, emailAcct) {
   const result = await sendTabCmd(tabId, "cmd-register-submit").catch(() => ({ok: true, status: "navigated"}));
   _runLog.entry(`step6: submit → ${result.status ?? ("error: " + (result?.error ?? "?"))}`);
 
+  if (result.status === "submit_disabled") {
+    const e = new Error("step6: RGPD submit stayed disabled — server silently dropped request, rotate proxy");
+    e.proxyStatus = ERR_STATUS.BLOCKED; e.nextAction = NEXT_ACTION.ROTATE_PROXY; throw e;
+  }
   if (result.status === "ip_blocked") {
     const e = new Error("step6: IP blocked — rotate proxy");
     e.proxyStatus = ERR_STATUS.BLOCKED; e.nextAction = NEXT_ACTION.ROTATE_PROXY; throw e;
@@ -1532,6 +1541,12 @@ async function p0_openAuthPage(tabId, opts = {}) {
   const {[SK.PRE_VISIT_WARMUP]: preWarmup = false} = await skGet(SK.PRE_VISIT_WARMUP);
   if (preWarmup && !opts.skipWarmup) await step0_warmup(tabId);
   const state = await step1_homeReady(tabId);
+
+  // Fetch proxy IP exactly once per workflow run; cached for step4 burn-list check.
+  if (!_sessionProxyIp) {
+    try { const r = await sendTabCmd(tabId, "cmd-log-ip"); _sessionProxyIp = r?.ip ?? null; } catch (_) {}
+  }
+
   // Already logged in or deeper — caller decides whether to continue or skip p2.
   if (state !== "not-logged-in") return {ok: true, status: state};
   await step2_authReady(tabId);
@@ -1844,7 +1859,6 @@ async function wf_register(realPerson = null) {
 
     tabId = await _createSessionTab();
     await p0_openAuthPage(tabId);
-    await sendTabCmd(tabId, "cmd-log-ip").catch(() => {});
     const r = await p1_registerAccount(tabId, person, emailAcct);
 
     await _runLog.finish(`ok status=${r.status}`);

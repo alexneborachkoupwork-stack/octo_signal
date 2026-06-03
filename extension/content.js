@@ -1979,6 +1979,11 @@ async function _registerSubmit() {
 
     if (outcome === "navigated") return {ok: true, status: "navigated"};
 
+    // Timeout means the RGPD submit button stayed disabled — server silently dropped the
+    // request (null/no response). The button will not re-enable; retrying is pointless.
+    // Signal background to rotate proxy instead of burning a second captcha solve.
+    if (outcome === "timeout") return {ok: false, status: "submit_disabled"};
+
     const _al = (_registerAlert ?? "").toLowerCase();
     // "1 more attempts" = first rejection, quota still available → let attempt 2 run.
     // True block = "blocked"/"bloqueado" + "incremental"/"incremento" WITHOUT a remaining-attempt hint.
