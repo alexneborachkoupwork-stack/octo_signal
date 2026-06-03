@@ -511,24 +511,54 @@ async function _solveCapSolver(apiKey, pageUrl, siteKey, action) {
   throw new Error(`CapSolver timed out after ${40 * TIMER_MS.captcha.POLL_INTERVAL / 1000}s`);
 }
 
-// Race all solvers — loads API keys from storage (set by _loadExtensionConfig from config.json).
-// Only starts solvers that have a configured key. Resolves on first successful token,
-// rejects with a per-solver error summary only if ALL configured solvers fail.
+// Race all solvers (or single selected solver) — reads API keys from storage.
+// Calls _loadExtensionConfig() first to self-heal if storage was cleared since last SW start.
+// When CAPTCHA_SOLVER_PARALLEL=false (default), uses only the solver chosen in the popup.
+// When CAPTCHA_SOLVER_PARALLEL=true, races all configured solvers in parallel.
 async function _raceSolvers(pageUrl, siteKey, action) {
-  const stored = await skGet(SK.ANTICAPTCHA_KEYS, SK.TWOCAPTCHA_KEYS, SK.CAPMONSTER_KEYS, SK.CAPSOLVER_KEY);
-  const acKeys  = stored[SK.ANTICAPTCHA_KEYS] ?? [];
-  const tcKeys  = stored[SK.TWOCAPTCHA_KEYS]  ?? [];
-  const cmKeys  = stored[SK.CAPMONSTER_KEYS]  ?? [];
-  const csKey   = String(stored[SK.CAPSOLVER_KEY] ?? "").trim();
+  // Self-heal: ensure config.json keys are in storage regardless of SW start timing.
+  await _loadExtensionConfig();
 
-  console.log(`[OctoProbe BG] _raceSolvers siteKey=${siteKey} action=${action}`);
+  const stored = await skGet(
+    SK.ANTICAPTCHA_KEYS, SK.TWOCAPTCHA_KEYS, SK.CAPMONSTER_KEYS, SK.CAPSOLVER_KEY,
+    SK.CAPTCHA_SOLVER, SK.CAPTCHA_SOLVER_PARALLEL,
+  );
+  const acKeys   = stored[SK.ANTICAPTCHA_KEYS] ?? [];
+  const tcKeys   = stored[SK.TWOCAPTCHA_KEYS]  ?? [];
+  const cmKeys   = stored[SK.CAPMONSTER_KEYS]  ?? [];
+  const csKey    = String(stored[SK.CAPSOLVER_KEY] ?? "").trim();
+  const parallel = stored[SK.CAPTCHA_SOLVER_PARALLEL] ?? false;
+  const selected = stored[SK.CAPTCHA_SOLVER] ?? "capsolver";
+
+  console.log(`[OctoProbe BG] _raceSolvers siteKey=${siteKey} action=${action} solver=${selected} parallel=${parallel}`);
   console.log(`[OctoProbe BG] keys: AC=${acKeys.length} TC=${tcKeys.length} CM=${cmKeys.length} CS=${csKey ? 1 : 0}`);
 
-  const solvers = [];
-  if (acKeys.length)  solvers.push(_solveACFormat("AntiCaptcha", "https://api.anti-captcha.com", _pick(acKeys), pageUrl, siteKey, action));
-  if (tcKeys.length)  solvers.push(_solveACFormat("2Captcha",    "https://api.2captcha.com",     _pick(tcKeys), pageUrl, siteKey, action));
-  if (cmKeys.length)  solvers.push(_solveACFormat("CapMonster",  "https://api.capmonster.cloud", _pick(cmKeys), pageUrl, siteKey, action));
-  if (csKey)          solvers.push(_solveCapSolver(csKey, pageUrl, siteKey, action));
+  function _buildAllSolvers() {
+    const s = [];
+    if (acKeys.length) s.push(_solveACFormat("AntiCaptcha", "https://api.anti-captcha.com", _pick(acKeys), pageUrl, siteKey, action));
+    if (tcKeys.length) s.push(_solveACFormat("2Captcha",    "https://api.2captcha.com",     _pick(tcKeys), pageUrl, siteKey, action));
+    if (cmKeys.length) s.push(_solveACFormat("CapMonster",  "https://api.capmonster.cloud", _pick(cmKeys), pageUrl, siteKey, action));
+    if (csKey)         s.push(_solveCapSolver(csKey, pageUrl, siteKey, action));
+    return s;
+  }
+
+  let solvers;
+  if (parallel) {
+    solvers = _buildAllSolvers();
+  } else {
+    // Use only the solver selected in the popup; fall back to any available if its key is missing.
+    switch (selected) {
+      case "anti-captcha": solvers = acKeys.length ? [_solveACFormat("AntiCaptcha", "https://api.anti-captcha.com", _pick(acKeys), pageUrl, siteKey, action)] : []; break;
+      case "2captcha":     solvers = tcKeys.length ? [_solveACFormat("2Captcha",    "https://api.2captcha.com",     _pick(tcKeys), pageUrl, siteKey, action)] : []; break;
+      case "capmonster":   solvers = cmKeys.length ? [_solveACFormat("CapMonster",  "https://api.capmonster.cloud", _pick(cmKeys), pageUrl, siteKey, action)] : []; break;
+      case "capsolver":    solvers = csKey          ? [_solveCapSolver(csKey, pageUrl, siteKey, action)]                                                          : []; break;
+      default:             solvers = [];
+    }
+    if (!solvers.length) {
+      console.warn(`[OctoProbe BG] selected solver "${selected}" has no key — falling back to all configured solvers`);
+      solvers = _buildAllSolvers();
+    }
+  }
 
   if (!solvers.length) throw new Error("_raceSolvers: no solver keys configured");
 
