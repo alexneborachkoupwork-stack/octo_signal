@@ -48,6 +48,15 @@ const SK = Object.freeze({
   CAPMONSTER_KEYS:         "capmonster-keys",
   CAPSOLVER_KEY:           "capsolver-key",
 
+  // Session proxy — written by the manager workflow command, read by solver functions.
+  // When present, solvers use proxy-based task types so the reCAPTCHA token is scored
+  // on the same IP the browser is using, matching the Enterprise API's IP-consistency check.
+  PROXY_TYPE:  "proxy-type",   // "socks5" | "http"
+  PROXY_HOST:  "proxy-host",
+  PROXY_PORT:  "proxy-port",   // number
+  PROXY_LOGIN: "proxy-login",
+  PROXY_PASS:  "proxy-pass",
+
   // Visa application
   REAL_PERSON_INPUT:    "real-person-input",
   VISA_CONSULAR_POST:   "visa-consular-post",
@@ -385,6 +394,7 @@ const MSG = Object.freeze({
   GET_SESSION_KEYS:            "get-session-keys",
   PING:                        "ping",
   SW_KEEPALIVE_PING:           "sw-keepalive-ping",
+  SLEEP:                       "sleep",
   LOG_ENTRY:                   "log-entry",
   START_EMAIL_POLL:            "start-email-poll",
   STOP_EMAIL_POLL:             "stop-email-poll",

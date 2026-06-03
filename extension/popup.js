@@ -22,6 +22,12 @@ const btnRegisterLogin = document.getElementById("btn-register-login");
 const btnRegisterApply = document.getElementById("btn-register-apply");
 
 const selSolver          = document.getElementById("sel-solver");
+const proxyHostEl        = document.getElementById("inp-proxy-host");
+const proxyPortEl        = document.getElementById("inp-proxy-port");
+const btnProxySocks5     = document.getElementById("btn-proxy-socks5");
+const btnProxyHttp       = document.getElementById("btn-proxy-http");
+const proxyLoginEl       = document.getElementById("inp-proxy-login");
+const proxyPassEl        = document.getElementById("inp-proxy-pass");
 const btnEmailMailtm     = document.getElementById("btn-email-mailtm");
 const btnEmailCf         = document.getElementById("btn-email-cf");
 const chkSolverParallel  = document.getElementById("chk-solver-parallel");
@@ -75,9 +81,16 @@ skGet(
   SK.REAL_PERSON_INPUT, SK.WORKFLOW_TYPE, SK.WORKFLOW_STEP,
   SK.CAPTCHA_SOLVER_PARALLEL, SK.PRE_VISIT_WARMUP, SK.LANG_SWITCH_ENABLED,
   SK.RUN_STATUS, SK.RUN_ERROR,
+  SK.PROXY_HOST, SK.PROXY_PORT, SK.PROXY_TYPE, SK.PROXY_LOGIN, SK.PROXY_PASS,
 ).then(data => {
   if (data[SK.USERNAME]) userEl.value = data[SK.USERNAME];
   if (data[SK.PASSWORD]) passEl.value = data[SK.PASSWORD];
+
+  if (data[SK.PROXY_HOST])  proxyHostEl.value  = data[SK.PROXY_HOST];
+  if (data[SK.PROXY_PORT])  proxyPortEl.value  = String(data[SK.PROXY_PORT]);
+  if (data[SK.PROXY_LOGIN]) proxyLoginEl.value = data[SK.PROXY_LOGIN];
+  if (data[SK.PROXY_PASS])  proxyPassEl.value  = data[SK.PROXY_PASS];
+  _setProxyType(data[SK.PROXY_TYPE] ?? "socks5");
 
   if (data[SK.VISA_CONSULAR_POST]) {
     visaPostoEl.value = data[SK.VISA_CONSULAR_POST];
@@ -136,7 +149,7 @@ function saveCredentials(callback) {
 
 btnLoginIdle.addEventListener("click", () => {
   saveCredentials((username, password) => {
-    chrome.runtime.sendMessage({type: MSG.LOGIN_IDLE, payload: {username, password}}, (resp) => {
+    chrome.runtime.sendMessage({type: MSG.LOGIN_IDLE, payload: {username, password}, proxy: _readProxy()}, (resp) => {
       if (resp?.ok) { setStatus("Login started."); window.close(); }
       else setStatus(resp?.error ?? "Login failed.", true);
     });
@@ -145,7 +158,7 @@ btnLoginIdle.addEventListener("click", () => {
 
 btnLoginApply.addEventListener("click", () => {
   saveCredentials((username, password) => {
-    chrome.runtime.sendMessage({type: MSG.LOGIN_APPLY, payload: {username, password}}, (resp) => {
+    chrome.runtime.sendMessage({type: MSG.LOGIN_APPLY, payload: {username, password}, proxy: _readProxy()}, (resp) => {
       if (resp?.ok) { setStatus("Login + Apply started."); window.close(); }
       else setStatus(resp?.error ?? "Login failed.", true);
     });
@@ -222,7 +235,7 @@ btnTriggerSignal.addEventListener("click", () => setTriggerMode("EXTERNAL_SIGNAL
 btnRegisterIdle.addEventListener("click", async () => {
   const {ok, rp} = await _resolvePersonPayload();
   if (!ok) return;
-  chrome.runtime.sendMessage({type: MSG.REGISTER_ONLY, realPerson: rp}, (resp) => {
+  chrome.runtime.sendMessage({type: MSG.REGISTER_ONLY, realPerson: rp, proxy: _readProxy()}, (resp) => {
     if (resp?.ok) { setStatus("Register started."); window.close(); }
     else setStatus(resp?.error ?? "Register failed.", true);
   });
@@ -231,7 +244,7 @@ btnRegisterIdle.addEventListener("click", async () => {
 btnRegisterLogin.addEventListener("click", async () => {
   const {ok, rp} = await _resolvePersonPayload();
   if (!ok) return;
-  chrome.runtime.sendMessage({type: MSG.REGISTER_LOGIN, realPerson: rp}, (resp) => {
+  chrome.runtime.sendMessage({type: MSG.REGISTER_LOGIN, realPerson: rp, proxy: _readProxy()}, (resp) => {
     if (resp?.ok) { setStatus("Register + Login started."); window.close(); }
     else setStatus(resp?.error ?? "Register failed.", true);
   });
@@ -243,7 +256,7 @@ btnRegisterApply.addEventListener("click", async () => {
   const {ok, rp} = await _resolvePersonPayload();
   if (!ok) return;
   await skSet({[SK.VISA_CONSULAR_POST]: postoId});
-  chrome.runtime.sendMessage({type: MSG.REGISTER_APPLY, realPerson: rp}, (resp) => {
+  chrome.runtime.sendMessage({type: MSG.REGISTER_APPLY, realPerson: rp, proxy: _readProxy()}, (resp) => {
     if (resp?.ok) { setStatus("Register + Apply started."); window.close(); }
     else setStatus(resp?.error ?? "Register failed.", true);
   });
@@ -254,6 +267,32 @@ btnRegisterApply.addEventListener("click", async () => {
 selSolver.addEventListener("change", () => {
   skSet({[SK.CAPTCHA_SOLVER]: selSolver.value});
 });
+
+function _setProxyType(type) {
+  const isSocks5 = type !== "http";
+  btnProxySocks5.classList.toggle("active",  isSocks5);
+  btnProxyHttp.classList.toggle("active",   !isSocks5);
+}
+
+function _readProxy() {
+  const host = proxyHostEl.value.trim();
+  const port = proxyPortEl.value.trim();
+  if (!host || !port) return null;
+  return {
+    type:     btnProxySocks5.classList.contains("active") ? "socks5" : "http",
+    host,
+    port:     Number(port),
+    login:    proxyLoginEl.value.trim(),
+    password: proxyPassEl.value,
+  };
+}
+
+proxyHostEl.addEventListener("input",    () => skSet({[SK.PROXY_HOST]:  proxyHostEl.value.trim()}));
+proxyPortEl.addEventListener("input",    () => skSet({[SK.PROXY_PORT]:  Number(proxyPortEl.value.trim()) || 0}));
+proxyLoginEl.addEventListener("input",   () => skSet({[SK.PROXY_LOGIN]: proxyLoginEl.value.trim()}));
+proxyPassEl.addEventListener("input",    () => skSet({[SK.PROXY_PASS]:  proxyPassEl.value}));
+btnProxySocks5.addEventListener("click", () => { _setProxyType("socks5"); skSet({[SK.PROXY_TYPE]: "socks5"}); });
+btnProxyHttp.addEventListener("click",   () => { _setProxyType("http");   skSet({[SK.PROXY_TYPE]: "http"});   });
 
 btnEmailMailtm.addEventListener("click", () => setEmailProvider("mailtm"));
 btnEmailCf.addEventListener("click",     () => setEmailProvider("cloudflare"));

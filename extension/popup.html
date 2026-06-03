@@ -165,6 +165,24 @@
 		<option value="2captcha">2Captcha</option>
 	</select>
 
+	<label for="inp-proxy-host">Proxy Host</label>
+	<input id="inp-proxy-host" type="text" placeholder="host or IP" autocomplete="off" />
+
+	<label for="inp-proxy-port">Proxy Port</label>
+	<input id="inp-proxy-port" type="text" placeholder="1080" autocomplete="off" />
+
+	<label>Proxy Type</label>
+	<div class="toggle-pair">
+		<button id="btn-proxy-socks5" class="active">SOCKS5</button>
+		<button id="btn-proxy-http">HTTP</button>
+	</div>
+
+	<label for="inp-proxy-login">Proxy Login</label>
+	<input id="inp-proxy-login" type="text" placeholder="username (optional)" autocomplete="off" />
+
+	<label for="inp-proxy-pass">Proxy Password</label>
+	<input id="inp-proxy-pass" type="password" placeholder="•••• (optional)" />
+
 	<label>Email Provider</label>
 	<div class="toggle-pair">
 		<button id="btn-email-mailtm" class="active">mail.tm</button>

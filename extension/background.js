@@ -34,6 +34,40 @@ async function _ensureCfEmailConfig() {
 
 (async () => { await _loadExtensionConfig(); })();
 
+// Override Accept-Language for all requests to the target site so the HTTP
+// header matches the Portuguese context expected by the server's WAF.
+// The Octo profile's OS-level language (e.g. Estonian) would otherwise produce
+// Accept-Language: et which is a strong bot signal on a Portuguese e-visa portal.
+// Rule ID 1001 is reserved for this purpose and replaced on every SW start.
+(async () => {
+  try {
+    await chrome.declarativeNetRequest.updateDynamicRules({
+      removeRuleIds: [1001],
+      addRules: [{
+        id: 1001,
+        priority: 10,
+        action: {
+          type: "modifyHeaders",
+          requestHeaders: [{
+            header: "accept-language",
+            operation: "set",
+            value: "pt-PT,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+          }],
+        },
+        condition: {
+          urlFilter: "*pedidodevistos.mne.gov.pt*",
+          resourceTypes: [
+            "main_frame","sub_frame","xmlhttprequest",
+            "script","stylesheet","image","font","other"
+          ],
+        },
+      }],
+    });
+  } catch (e) {
+    console.warn("[OctoProbe] Accept-Language override failed:", e);
+  }
+})();
+
 // TARGET_URL, TARGET_HOST, MAILTM — defined in constants.js
 
 // Session-unique key for MAIN-world property names and custom event names.
@@ -454,8 +488,24 @@ function _extractToken(msg) {
 // ---------------------------------------------------------------------------
 
 // Shared polling solver for Anti-Captcha / CapMonster / 2Captcha (identical JSON API).
-async function _solveACFormat(label, baseUrl, apiKey, pageUrl, siteKey, action) {
-  const task = {type:"RecaptchaV2EnterpriseTaskProxyless", websiteURL:pageUrl, websiteKey:siteKey, isEnterprise:true};
+// proxy: { type, host, port, login, pass } — when provided, uses RecaptchaV2EnterpriseTask
+// (proxy-based) so the token is scored on the same IP the browser uses.  Without proxy
+// credentials the proxyless variant is used as fallback.
+async function _solveACFormat(label, baseUrl, apiKey, pageUrl, siteKey, action, proxy) {
+  let task;
+  if (proxy?.host && proxy?.port) {
+    task = {
+      type: "RecaptchaV2EnterpriseTask",
+      websiteURL: pageUrl, websiteKey: siteKey, isEnterprise: true,
+      proxyType:     proxy.type  ?? "socks5",
+      proxyAddress:  proxy.host,
+      proxyPort:     Number(proxy.port),
+      proxyLogin:    proxy.login ?? "",
+      proxyPassword: proxy.pass  ?? "",
+    };
+  } else {
+    task = {type:"RecaptchaV2EnterpriseTaskProxyless", websiteURL:pageUrl, websiteKey:siteKey, isEnterprise:true};
+  }
   if (action) task.enterprisePayload = {action};
   const cr = await fetch(`${baseUrl}/createTask`, {
     method: "POST", headers: {"Content-Type":"application/json"},
@@ -482,9 +532,22 @@ async function _solveACFormat(label, baseUrl, apiKey, pageUrl, siteKey, action) 
   throw new Error(`${label} timed out after ${40 * TIMER_MS.captcha.POLL_INTERVAL / 1000}s`);
 }
 
-async function _solveCapSolver(apiKey, pageUrl, siteKey, action) {
-  // CapSolver v2 Enterprise: action goes in enterprisePayload (same field, different internal handling).
-  const task = {type:"ReCaptchaV2EnterpriseTaskProxyless", websiteURL:pageUrl, websiteKey:siteKey};
+async function _solveCapSolver(apiKey, pageUrl, siteKey, action, proxy) {
+  // CapSolver v2 Enterprise: proxy-based task when credentials available, proxyless otherwise.
+  let task;
+  if (proxy?.host && proxy?.port) {
+    task = {
+      type: "ReCaptchaV2EnterpriseTask",
+      websiteURL: pageUrl, websiteKey: siteKey,
+      proxyType:     proxy.type  ?? "socks5",
+      proxyAddress:  proxy.host,
+      proxyPort:     Number(proxy.port),
+      proxyLogin:    proxy.login ?? "",
+      proxyPassword: proxy.pass  ?? "",
+    };
+  } else {
+    task = {type:"ReCaptchaV2EnterpriseTaskProxyless", websiteURL:pageUrl, websiteKey:siteKey};
+  }
   if (action) task.enterprisePayload = {action};
   const cr = await fetch("https://api.capsolver.com/createTask", {
     method: "POST", headers: {"Content-Type":"application/json"},
@@ -522,6 +585,7 @@ async function _raceSolvers(pageUrl, siteKey, action) {
   const stored = await skGet(
     SK.ANTICAPTCHA_KEYS, SK.TWOCAPTCHA_KEYS, SK.CAPMONSTER_KEYS, SK.CAPSOLVER_KEY,
     SK.CAPTCHA_SOLVER, SK.CAPTCHA_SOLVER_PARALLEL,
+    SK.PROXY_TYPE, SK.PROXY_HOST, SK.PROXY_PORT, SK.PROXY_LOGIN, SK.PROXY_PASS,
   );
   const acKeys   = stored[SK.ANTICAPTCHA_KEYS] ?? [];
   const tcKeys   = stored[SK.TWOCAPTCHA_KEYS]  ?? [];
@@ -530,15 +594,28 @@ async function _raceSolvers(pageUrl, siteKey, action) {
   const parallel = stored[SK.CAPTCHA_SOLVER_PARALLEL] ?? false;
   const selected = stored[SK.CAPTCHA_SOLVER] ?? "capsolver";
 
-  console.log(`[OctoProbe BG] _raceSolvers siteKey=${siteKey} action=${action} solver=${selected} parallel=${parallel}`);
+  // Build proxy object from storage — set by manager workflow command.
+  // When present, solver uses the proxy-based task type so the Enterprise token is scored
+  // on the same IP the browser is routing through.
+  const _proxyHost = String(stored[SK.PROXY_HOST] ?? "").trim();
+  const _proxyPort = stored[SK.PROXY_PORT];
+  const proxy = _proxyHost && _proxyPort ? {
+    type:  String(stored[SK.PROXY_TYPE]  ?? "socks5").trim(),
+    host:  _proxyHost,
+    port:  Number(_proxyPort),
+    login: String(stored[SK.PROXY_LOGIN] ?? "").trim(),
+    pass:  String(stored[SK.PROXY_PASS]  ?? "").trim(),
+  } : null;
+
+  console.log(`[OctoProbe BG] _raceSolvers siteKey=${siteKey} action=${action} solver=${selected} parallel=${parallel} proxy=${proxy ? proxy.host : "none"}`);
   console.log(`[OctoProbe BG] keys: AC=${acKeys.length} TC=${tcKeys.length} CM=${cmKeys.length} CS=${csKey ? 1 : 0}`);
 
   function _buildAllSolvers() {
     const s = [];
-    if (acKeys.length) s.push(_solveACFormat("AntiCaptcha", "https://api.anti-captcha.com", _pick(acKeys), pageUrl, siteKey, action));
-    if (tcKeys.length) s.push(_solveACFormat("2Captcha",    "https://api.2captcha.com",     _pick(tcKeys), pageUrl, siteKey, action));
-    if (cmKeys.length) s.push(_solveACFormat("CapMonster",  "https://api.capmonster.cloud", _pick(cmKeys), pageUrl, siteKey, action));
-    if (csKey)         s.push(_solveCapSolver(csKey, pageUrl, siteKey, action));
+    if (acKeys.length) s.push(_solveACFormat("AntiCaptcha", "https://api.anti-captcha.com", _pick(acKeys), pageUrl, siteKey, action, proxy));
+    if (tcKeys.length) s.push(_solveACFormat("2Captcha",    "https://api.2captcha.com",     _pick(tcKeys), pageUrl, siteKey, action, proxy));
+    if (cmKeys.length) s.push(_solveACFormat("CapMonster",  "https://api.capmonster.cloud", _pick(cmKeys), pageUrl, siteKey, action, proxy));
+    if (csKey)         s.push(_solveCapSolver(csKey, pageUrl, siteKey, action, proxy));
     return s;
   }
 
@@ -548,10 +625,10 @@ async function _raceSolvers(pageUrl, siteKey, action) {
   } else {
     // Use only the solver selected in the popup; fall back to any available if its key is missing.
     switch (selected) {
-      case "anti-captcha": solvers = acKeys.length ? [_solveACFormat("AntiCaptcha", "https://api.anti-captcha.com", _pick(acKeys), pageUrl, siteKey, action)] : []; break;
-      case "2captcha":     solvers = tcKeys.length ? [_solveACFormat("2Captcha",    "https://api.2captcha.com",     _pick(tcKeys), pageUrl, siteKey, action)] : []; break;
-      case "capmonster":   solvers = cmKeys.length ? [_solveACFormat("CapMonster",  "https://api.capmonster.cloud", _pick(cmKeys), pageUrl, siteKey, action)] : []; break;
-      case "capsolver":    solvers = csKey          ? [_solveCapSolver(csKey, pageUrl, siteKey, action)]                                                          : []; break;
+      case "anti-captcha": solvers = acKeys.length ? [_solveACFormat("AntiCaptcha", "https://api.anti-captcha.com", _pick(acKeys), pageUrl, siteKey, action, proxy)] : []; break;
+      case "2captcha":     solvers = tcKeys.length ? [_solveACFormat("2Captcha",    "https://api.2captcha.com",     _pick(tcKeys), pageUrl, siteKey, action, proxy)] : []; break;
+      case "capmonster":   solvers = cmKeys.length ? [_solveACFormat("CapMonster",  "https://api.capmonster.cloud", _pick(cmKeys), pageUrl, siteKey, action, proxy)] : []; break;
+      case "capsolver":    solvers = csKey          ? [_solveCapSolver(csKey, pageUrl, siteKey, action, proxy)]                                                          : []; break;
       default:             solvers = [];
     }
     if (!solvers.length) {
@@ -674,6 +751,9 @@ async function _resetWorkflow() {
     SK.CHALLENGE_COUNT,
     SK.RUN_STATUS, SK.RUN_ERROR,
     SK.VISA_ARRIVAL_DATE, SK.VISA_DEPARTURE_DATE,
+    // Proxy credentials are NOT cleared here — they are written by _storeProxyFromMsg
+    // before each workflow starts and cleared there when proxy is null.  Clearing here
+    // would wipe credentials that were just stored by the MSG handler before wf_register.
   );
 }
 
@@ -699,6 +779,7 @@ async function _createSessionTab() {
   const tabId = tab.id;
   _activeTabId = tabId; // keep for abort/proxy-check only
   await skSet({[SK.ACTIVE_TAB_ID]: tabId});
+  _startTabFocus(tabId); // keep tab active in its window to prevent timer throttling
   return tabId;
 }
 
@@ -726,6 +807,39 @@ function _writeRunError(e) {
 
 let _pollInterval    = null;
 let _sessionProxyIp  = null; // set once in p0_openAuthPage; reused by step4 burn check
+
+// Tab focus keepalive — every 8 s:
+//   1. Makes the workflow tab the active tab in its window (prevents background-tab
+//      throttling when the user switches to another tab).
+//   2. Restores the window from minimized state WITHOUT stealing OS focus
+//      ({state:'normal'} only; no {focused:true}) so that document.hidden stays false
+//      and Chrome's basic 1-second timer throttling never kicks in.
+// Web Locks in content.js prevent the additional intensive (1/min) throttling tier
+// as a belt-and-suspenders measure, but do not stop the basic 1 s throttling.
+let _tabFocusInterval = null;
+let _tabFocusWinId    = null;
+function _startTabFocus(tabId) {
+  _stopTabFocus();
+  // Resolve the window ID once so the interval doesn't call tabs.get every tick.
+  chrome.tabs.get(tabId).then(t => { _tabFocusWinId = t.windowId ?? null; }).catch(() => {});
+  _tabFocusInterval = setInterval(async () => {
+    try {
+      await chrome.tabs.update(tabId, {active: true});
+      if (_tabFocusWinId) {
+        const win = await chrome.windows.get(_tabFocusWinId);
+        if (win.state === 'minimized') {
+          // Restore from minimized — does NOT steal OS focus, only un-hides the window
+          // so document.hidden returns false and timers run at full speed.
+          await chrome.windows.update(_tabFocusWinId, {state: 'normal'});
+        }
+      }
+    } catch (_) {}
+  }, 8_000);
+}
+function _stopTabFocus() {
+  if (_tabFocusInterval) { clearInterval(_tabFocusInterval); _tabFocusInterval = null; }
+  _tabFocusWinId = null;
+}
 
 async function _doPollTick() {
   const {[SK.EMAIL_POLL]: emailPoll} = await skGet(SK.EMAIL_POLL);
@@ -980,8 +1094,24 @@ async function step3_regFormReady(tabId) {
   }
 
   if (!openResult?.ok) {
-    const e = new Error(`step3: reg form open failed — ${openResult?.status ?? "unknown"}`);
-    e.proxyStatus = ERR_STATUS.PROXY_SLOW; e.nextAction = NEXT_ACTION.ROTATE_PROXY; throw e;
+    if (openResult?.status === "form_blocked") {
+      // Server blocked the registration form — navigate home, re-auth, and retry once.
+      // A fresh page load clears the server-side rate-limit window for this IP.
+      _runLog.entry("step3: form_blocked — navigating home for retry");
+      const homeReady = _waitForPageReady(tabId, TIMER_MS.pageReady.DEFAULT);
+      homeReady.catch(() => {});
+      await chrome.tabs.update(tabId, {url: TARGET_URL});
+      await homeReady.catch(() => {});
+      await step1_homeReady(tabId);
+      await step2_authReady(tabId);
+      openResult = await sendTabCmd(tabId, "cmd-register-open-form")
+        .catch(() => ({ok: false, status: "cmd_error"}));
+      _runLog.entry(`step3: retry after form_blocked → ${openResult?.status ?? "unknown"}`);
+    }
+    if (!openResult?.ok) {
+      const e = new Error(`step3: reg form open failed — ${openResult?.status ?? "unknown"}`);
+      e.proxyStatus = ERR_STATUS.PROXY_SLOW; e.nextAction = NEXT_ACTION.ROTATE_PROXY; throw e;
+    }
   }
   await skSet({[SK.WORKFLOW_STEP]: WF_STEPS.REG_FORM_READY});
 }
@@ -1542,9 +1672,15 @@ async function p0_openAuthPage(tabId, opts = {}) {
   if (preWarmup && !opts.skipWarmup) await step0_warmup(tabId);
   const state = await step1_homeReady(tabId);
 
-  // Fetch proxy IP exactly once per workflow run; cached for step4 burn-list check.
+  // Fetch proxy IP from the SW context so it never appears in the tab's network traffic.
+  // Content-script fetch() shows up in the tab HAR and PerformanceObserver (bot signal).
   if (!_sessionProxyIp) {
-    try { const r = await sendTabCmd(tabId, "cmd-log-ip"); _sessionProxyIp = r?.ip ?? null; } catch (_) {}
+    try {
+      const r = await fetch("https://api.ipify.org?format=json");
+      const d = await r.json();
+      _sessionProxyIp = d?.ip ?? null;
+      _runLog.entry(`proxy IP: ${_sessionProxyIp}`);
+    } catch (_) {}
   }
 
   // Already logged in or deeper — caller decides whether to continue or skip p2.
@@ -1799,7 +1935,7 @@ function _acquireWf(label) {
   if (_wfRunning) throw new Error(`wf_lock: "${label}" blocked — workflow already running`);
   _wfRunning = true;
 }
-function _releaseWf() { _wfRunning = false; }
+function _releaseWf() { _wfRunning = false; _stopTabFocus(); }
 
 //#region WorkflowHandlers
 // Each workflow handler maps one user-facing operation to a sequence of phase handlers.
@@ -2198,6 +2334,26 @@ chrome.runtime.onInstalled.addListener(() => {
 // _withDebugger removed: chrome.debugger.attach creates a measurable timing spike
 // in performance.timing that bd.js detects. CDP-based clicks are no longer used.
 
+// Write proxy credentials from a hub workflow command into extension storage so that
+// _raceSolvers() can read them and use proxy-based captcha task types.
+// msg.proxy may be null/undefined — in that case the proxy keys are cleared so a stale
+// value from a previous session doesn't bleed into the new one.
+async function _storeProxyFromMsg(msg) {
+  const p = msg.proxy ?? null;
+  if (p?.host && p?.port) {
+    await skSet({
+      [SK.PROXY_TYPE]:  p.type     ?? "socks5",
+      [SK.PROXY_HOST]:  p.host,
+      [SK.PROXY_PORT]:  Number(p.port),
+      [SK.PROXY_LOGIN]: p.login    ?? "",
+      [SK.PROXY_PASS]:  p.password ?? "",
+    });
+    _runLog.entry(`proxy credentials stored: ${p.host}:${p.port} (${p.type ?? "socks5"})`);
+  } else {
+    await skRemove(SK.PROXY_TYPE, SK.PROXY_HOST, SK.PROXY_PORT, SK.PROXY_LOGIN, SK.PROXY_PASS);
+  }
+}
+
 const _MSG_HANDLERS = {
 
   // Login with credentials, then idle at logged-in state with keep-alives until apply arrives.
@@ -2205,7 +2361,9 @@ const _MSG_HANDLERS = {
     const { username, password } = msg.payload ?? msg;
     if (!username || !password) { respond({ok: false, error: "credentials required"}); return; }
     respond({ok: true});
-    wf_login(username, password, true).catch(_writeRunError);
+    _storeProxyFromMsg(msg)
+      .then(() => wf_login(username, password, true))
+      .catch(_writeRunError);
   },
 
   // Login with credentials, then immediately run F4 form-fill + F5 scheduling.
@@ -2213,7 +2371,8 @@ const _MSG_HANDLERS = {
     const { username, password } = msg.payload ?? msg;
     if (!username || !password) { respond({ok: false, error: "credentials required"}); return; }
     respond({ok: true});
-    wf_login(username, password, false)
+    _storeProxyFromMsg(msg)
+      .then(() => wf_login(username, password, false))
       .then(() => wf_apply())
       .catch(_writeRunError);
   },
@@ -2221,13 +2380,16 @@ const _MSG_HANDLERS = {
   // Register account only — no login after.
   [MSG.REGISTER_ONLY]: (msg, _sender, respond) => {
     respond({ok: true});
-    wf_register(msg.realPerson ?? null).catch(_writeRunError);
+    _storeProxyFromMsg(msg)
+      .then(() => wf_register(msg.realPerson ?? null))
+      .catch(_writeRunError);
   },
 
   // Register then idle at logged-in state — credentials written to storage by wf_register.
   [MSG.REGISTER_LOGIN]: (msg, _sender, respond) => {
     respond({ok: true});
-    wf_register(msg.realPerson ?? null)
+    _storeProxyFromMsg(msg)
+      .then(() => wf_register(msg.realPerson ?? null))
       .then(() => wf_login(null, null, true))
       .catch(_writeRunError);
   },
@@ -2235,7 +2397,8 @@ const _MSG_HANDLERS = {
   // Full pipeline: register → login → apply.
   [MSG.REGISTER_APPLY]: (msg, _sender, respond) => {
     respond({ok: true});
-    wf_register(msg.realPerson ?? null)
+    _storeProxyFromMsg(msg)
+      .then(() => wf_register(msg.realPerson ?? null))
       .then(() => wf_login(null, null, false))
       .then(() => wf_apply())
       .catch(_writeRunError);
@@ -2521,6 +2684,14 @@ const _MSG_HANDLERS = {
     .then(([r]) => respond({ok: true, siteKey: r?.result ?? null}))
     .catch(() => respond({ok: false, siteKey: null}));
     return true;
+  },
+
+  // SW-backed sleep: the setTimeout runs in the service worker process, which is not
+  // subject to Chrome's tab-visibility timer throttling. Content script sleeps resolve
+  // at full speed even when the tab is hidden or the window is minimized.
+  [MSG.SLEEP]: (msg, _sender, respond) => {
+    setTimeout(() => respond({ok: true}), msg.ms ?? 0);
+    return true; // keep message channel open for async response
   },
 
   [MSG.EXEC_PAGE_SCRIPT]: (msg, sender, respond) => {

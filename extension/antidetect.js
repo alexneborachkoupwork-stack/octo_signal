@@ -76,10 +76,19 @@
     return fn;
   }
 
+  // Session-unique seed for pixel noise — different each page load so
+  // canvas hashes vary across sessions and don't match the known SwiftShader hash.
+  var _seed = (Math.random() * 0x7fffffff) | 0;
+  function _prng() {
+    _seed ^= _seed << 13; _seed ^= _seed >> 17; _seed ^= _seed << 5;
+    return (_seed >>> 0) / 0x100000000;
+  }
+
   function _patchCtx(Ctx) {
     if (!Ctx) return;
     var _gExt  = Ctx.prototype.getExtension;
     var _gParm = Ctx.prototype.getParameter;
+    var _rPix  = Ctx.prototype.readPixels;
     Ctx.prototype.getExtension = _native(function getExtension(name) {
       if (name === 'WEBGL_debug_renderer_info')
         return _gExt.call(this, name) || {UNMASKED_VENDOR_WEBGL: _VENDOR, UNMASKED_RENDERER_WEBGL: _RENDERER};
@@ -90,11 +99,33 @@
       if (pname === _RENDERER) return _renderer;
       return _gParm.call(this, pname);
     }, 'getParameter');
+    // Inject ±1 LSB noise into readPixels output so the canvas hash differs from
+    // the known deterministic SwiftShader fingerprint on every session.
+    // The magnitude (1 step in the LSB of each channel) is invisible to human
+    // inspection but breaks any hash-based bot detection keyed on SwiftShader output.
+    Ctx.prototype.readPixels = _native(function readPixels(x, y, w, h, fmt, type, buf) {
+      _rPix.call(this, x, y, w, h, fmt, type, buf);
+      if (buf instanceof Uint8Array || buf instanceof Uint8ClampedArray) {
+        for (var i = 0; i < buf.length; i++) {
+          if ((i & 3) !== 3) { // skip alpha channel
+            var v = buf[i] + ((_prng() < 0.5) ? 1 : -1);
+            buf[i] = v < 0 ? 0 : v > 255 ? 255 : v;
+          }
+        }
+      }
+    }, 'readPixels');
   }
 
   try { _patchCtx(window.WebGLRenderingContext);  } catch (_) {}
   try { _patchCtx(window.WebGL2RenderingContext); } catch (_) {}
 })();
+
+// navigator.language / navigator.languages — NOT patched here.
+// Patching to 'pt-PT' while the browser profile's real Accept-Language header differs
+// creates a detectable inconsistency: reCAPTCHA Enterprise compares the JS value against
+// the Accept-Language it observes on its own requests to google.com.  Matching the real
+// profile value keeps the signals consistent; set the profile's language to pt-PT at the
+// Octo Browser level to eliminate the Estonian-profile mismatch at the source.
 
 // ── Page Visibility API ───────────────────────────────────────────────────────
 // reCAPTCHA Enterprise monitors document.visibilityState and document.hidden as

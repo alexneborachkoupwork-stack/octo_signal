@@ -38,6 +38,21 @@ setInterval(() => {
   chrome.runtime.sendMessage({type: "sw-keepalive-ping"}).catch(() => {});
 }, 20_000);
 
+// ── Prevent background-tab timer throttling ───────────────────────────────────
+// Chrome throttles setTimeout to ≥1 s immediately when a tab is hidden, and to
+// once-per-minute after 5+ minutes hidden.  Holding a Web Lock exempts the tab
+// from both throttling regimes (Chrome 87+), keeping human-typing IKI and all
+// waitFor() polling running at full speed even when the tab is not focused.
+// The lock name is random so it is invisible to page-JS lock queries.
+(function _preventThrottling() {
+  try {
+    if (navigator.locks && navigator.locks.request) {
+      const _lk = '_p' + Math.random().toString(36).slice(2);
+      navigator.locks.request(_lk, {mode: 'shared'}, () => new Promise(() => {}));
+    }
+  } catch (_) {}
+})();
+
 // TARGET_HOST, TARGET_URL, MAILTM — defined in constants.js
 
 // Applicant nationality/country — ISO 3166-1 alpha-3 fallback when storage has no value.
@@ -122,13 +137,20 @@ const E = Object.freeze({
 
 let _abortFlag = false;
 let _postMonitorId = null; // { mo: MutationObserver, poll: intervalId } | null
+
+// SW-backed sleep: the setTimeout fires in the service worker process, which is NOT
+// subject to Chrome's tab-visibility timer throttling (basic 1 s minimum when tab is
+// hidden / window is minimized). All workflow timing — typing IKI, polls, dwells —
+// therefore runs at full speed regardless of whether the tab is visible.
+// Falls back to a local setTimeout if the SW is temporarily unavailable.
 function sleep(ms) {
   return new Promise((resolve, reject) => {
     if (_abortFlag) { reject(new DOMException("Aborted", "AbortError")); return; }
-    setTimeout(() => {
-      if (_abortFlag) reject(new DOMException("Aborted", "AbortError"));
-      else resolve();
-    }, ms);
+    chrome.runtime.sendMessage({type: "sleep", ms}, () => {
+      if (_abortFlag) { reject(new DOMException("Aborted", "AbortError")); return; }
+      if (chrome.runtime.lastError) { setTimeout(resolve, ms); return; }
+      resolve();
+    });
   });
 }
 
@@ -1817,9 +1839,6 @@ async function _loginSubmit() {
 }
 
 async function _registerOpenForm() {
-  // Network was already tested by cmd-log-ip before F2 starts — no need to re-probe here.
-  // Re-probing adds ~3 s overhead and can transiently fail even when the page loaded fine.
-
   // If #formReg is already on the page (e.g. after a full-navigation redirect back to
   // the registration URL), skip the link-click and go straight to waiting for fields.
   if (!document.querySelector("#formReg")) {
@@ -1969,7 +1988,7 @@ async function _registerSubmit() {
         const btn = document.querySelector("#registroSubmit");
         if (btn && !btn.disabled) { clearInterval(checkBtn); clearTimeout(navTimer); resolve("failed"); }
       }, 300);
-      const navTimer = setTimeout(() => { clearInterval(checkBtn); resolve("timeout"); }, 35000);
+      const navTimer = setTimeout(() => { clearInterval(checkBtn); resolve("timeout"); }, 100000);
       window.addEventListener("beforeunload", () => {
         clearInterval(checkBtn); clearTimeout(navTimer); resolve("navigated");
       }, {once: true});
@@ -1979,10 +1998,14 @@ async function _registerSubmit() {
 
     if (outcome === "navigated") return {ok: true, status: "navigated"};
 
-    // Timeout means the RGPD submit button stayed disabled — server silently dropped the
-    // request (null/no response). The button will not re-enable; retrying is pointless.
-    // Signal background to rotate proxy instead of burning a second captcha solve.
-    if (outcome === "timeout") return {ok: false, status: "submit_disabled"};
+    if (outcome === "timeout") {
+      // Server silently dropped the RGPD POST — #registroSubmit remains disabled and
+      // cannot be re-enabled without navigating away.  Internal attempt 2 would submit
+      // against the same stuck button and also time out.  Signal captcha_fail so step4
+      // returns {ok:false} and p1 escalates to step5 (fresh page + form) + step6 (fresh submit).
+      _logEntry(`register: RGPD silent drop (attempt ${rgpdAttempt}) — escalating to fresh-form retry`);
+      return {ok: false, status: "captcha_fail"};
+    }
 
     const _al = (_registerAlert ?? "").toLowerCase();
     // "1 more attempts" = first rejection, quota still available → let attempt 2 run.
@@ -2104,17 +2127,6 @@ async function _tokenSubmit() {
 const _CMD_HANDLERS = {
   "cmd-get-state":          async ()    => ({ok: true, state: _detectPageState()}),
   "cmd-accept-cookie":      async ()    => { await dismissCookieConsent(); return {ok: true}; },
-  "cmd-log-ip": async () => {
-    try {
-      const res = await fetch("https://api.ipify.org?format=json");
-      const {ip} = await res.json();
-      console.log("[OctoProbe] Proxy IP:", ip);
-      return {ok: true, ip};
-    } catch (e) {
-      console.warn("[OctoProbe] IP fetch failed:", e.message);
-      return {ok: true, ip: "unknown"};
-    }
-  },
   "cmd-switch-lang":        async ()    => { await switchToEnglish(); return {ok: true}; },
   "cmd-click-login-link":   async ()    => { await clickLoginLink(); return {ok: true}; },
 
