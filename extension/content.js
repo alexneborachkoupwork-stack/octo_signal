@@ -624,7 +624,12 @@ async function _waitForRecaptchaApi() {
     // Background fires _evtRcp event via executeScript when injection is done.
     document.addEventListener(_evtRcp, () => { _drifting = false; resolve(true); }, {once: true});
     bgDone.then(r => {
-      if (!r?.ok) {
+      if (r === undefined || r === null) {
+        // SW was restarted mid-solve — sendBgMessage callback got undefined.
+        _drifting = false;
+        _logEntry("captcha: SW restart lost solve response — treating as fail");
+        resolve(false);
+      } else if (!r?.ok) {
         _drifting = false;
         console.error("[OctoProbe] solve-and-inject failed:", r?.error);
         _logEntry(`captcha: solver failed — ${r?.error ?? "no result"}`);
@@ -632,9 +637,12 @@ async function _waitForRecaptchaApi() {
       } else {
         console.log(`[OctoProbe] Token accepted after ${r.totalMs}ms total.`);
         _logEntry(`captcha: token accepted after ${r.totalMs}ms`);
+        // resolved true by the _evtRcp event listener above; nothing to do here
       }
-    }).catch(() => { _drifting = false; resolve(false); });
-    setTimeout(() => { _drifting = false; resolve(false); }, 45000);
+    }).catch(e => { _drifting = false; _logEntry(`captcha: bgDone error — ${e?.message}`); resolve(false); });
+    // 165 s = 40 polls × 4 s + 5 s margin — must exceed the solver's max polling window
+    // so background always gets to respond before content gives up.
+    setTimeout(() => { _drifting = false; _logEntry("captcha: content-side timeout (165s)"); resolve(false); }, 165000);
 
     // Drift mouse while solve+inject is in progress — zero movement is a bot signal.
     (async () => {

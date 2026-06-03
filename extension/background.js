@@ -454,7 +454,7 @@ function _extractToken(msg) {
 // ---------------------------------------------------------------------------
 
 // Shared polling solver for Anti-Captcha / CapMonster / 2Captcha (identical JSON API).
-async function _solveACFormat(baseUrl, apiKey, pageUrl, siteKey, action) {
+async function _solveACFormat(label, baseUrl, apiKey, pageUrl, siteKey, action) {
   const task = {type:"RecaptchaV2EnterpriseTaskProxyless", websiteURL:pageUrl, websiteKey:siteKey, isEnterprise:true};
   if (action) task.enterprisePayload = {action};
   const cr = await fetch(`${baseUrl}/createTask`, {
@@ -462,7 +462,8 @@ async function _solveACFormat(baseUrl, apiKey, pageUrl, siteKey, action) {
     body: JSON.stringify({clientKey: apiKey, task}),
   });
   const cd = await cr.json();
-  if (cd.errorId !== 0) throw new Error(`${baseUrl} createTask err ${cd.errorId}: ${cd.errorDescription}`);
+  if (cd.errorId !== 0) throw new Error(`${label} createTask err ${cd.errorId}: ${cd.errorDescription}`);
+  console.log(`[OctoProbe BG] ${label} task created id=${cd.taskId}`);
 
   for (let i = 0; i < 40; i++) {
     await new Promise(r => setTimeout(r, TIMER_MS.captcha.POLL_INTERVAL));
@@ -471,13 +472,18 @@ async function _solveACFormat(baseUrl, apiKey, pageUrl, siteKey, action) {
       body: JSON.stringify({clientKey: apiKey, taskId: cd.taskId}),
     });
     const rd = await rr.json();
-    if (rd.errorId !== 0) throw new Error(`${baseUrl} getTaskResult err ${rd.errorId}: ${rd.errorDescription}`);
-    if (rd.status === "ready") return rd.solution.gRecaptchaResponse;
+    if (rd.errorId !== 0) throw new Error(`${label} getTaskResult err ${rd.errorId}: ${rd.errorDescription}`);
+    if (rd.status === "ready") {
+      const token = rd.solution?.gRecaptchaResponse;
+      if (!token) throw new Error(`${label} returned ready but token is empty`);
+      return token;
+    }
   }
-  throw new Error(`${baseUrl} timed out`);
+  throw new Error(`${label} timed out after ${40 * TIMER_MS.captcha.POLL_INTERVAL / 1000}s`);
 }
 
 async function _solveCapSolver(apiKey, pageUrl, siteKey, action) {
+  // CapSolver v2 Enterprise: action goes in enterprisePayload (same field, different internal handling).
   const task = {type:"ReCaptchaV2EnterpriseTaskProxyless", websiteURL:pageUrl, websiteKey:siteKey};
   if (action) task.enterprisePayload = {action};
   const cr = await fetch("https://api.capsolver.com/createTask", {
@@ -485,7 +491,8 @@ async function _solveCapSolver(apiKey, pageUrl, siteKey, action) {
     body: JSON.stringify({clientKey: apiKey, task}),
   });
   const cd = await cr.json();
-  if (cd.errorId !== 0) throw new Error(`CapSolver createTask err: ${cd.errorDescription}`);
+  if (cd.errorId !== 0) throw new Error(`CapSolver createTask err ${cd.errorId}: ${cd.errorDescription}`);
+  console.log(`[OctoProbe BG] CapSolver task created id=${cd.taskId}`);
 
   for (let i = 0; i < 40; i++) {
     await new Promise(r => setTimeout(r, TIMER_MS.captcha.POLL_INTERVAL));
@@ -494,32 +501,53 @@ async function _solveCapSolver(apiKey, pageUrl, siteKey, action) {
       body: JSON.stringify({clientKey: apiKey, taskId: cd.taskId}),
     });
     const rd = await rr.json();
-    if (rd.errorId !== 0) throw new Error(`CapSolver getTaskResult err: ${rd.errorDescription}`);
-    if (rd.status === "ready") return rd.solution.gRecaptchaResponse;
+    if (rd.errorId !== 0) throw new Error(`CapSolver getTaskResult err ${rd.errorId}: ${rd.errorDescription}`);
+    if (rd.status === "ready") {
+      const token = rd.solution?.gRecaptchaResponse;
+      if (!token) throw new Error("CapSolver returned ready but token is empty");
+      return token;
+    }
   }
-  throw new Error("CapSolver timed out");
+  throw new Error(`CapSolver timed out after ${40 * TIMER_MS.captcha.POLL_INTERVAL / 1000}s`);
 }
 
 // Race all solvers — loads API keys from storage (set by _loadExtensionConfig from config.json).
-// Resolves on first successful token, rejects only if ALL fail.
+// Only starts solvers that have a configured key. Resolves on first successful token,
+// rejects with a per-solver error summary only if ALL configured solvers fail.
 async function _raceSolvers(pageUrl, siteKey, action) {
   const stored = await skGet(SK.ANTICAPTCHA_KEYS, SK.TWOCAPTCHA_KEYS, SK.CAPMONSTER_KEYS, SK.CAPSOLVER_KEY);
   const acKeys  = stored[SK.ANTICAPTCHA_KEYS] ?? [];
   const tcKeys  = stored[SK.TWOCAPTCHA_KEYS]  ?? [];
   const cmKeys  = stored[SK.CAPMONSTER_KEYS]  ?? [];
-  const csKey   = stored[SK.CAPSOLVER_KEY]    ?? "";
+  const csKey   = String(stored[SK.CAPSOLVER_KEY] ?? "").trim();
 
+  console.log(`[OctoProbe BG] _raceSolvers siteKey=${siteKey} action=${action}`);
+  console.log(`[OctoProbe BG] keys: AC=${acKeys.length} TC=${tcKeys.length} CM=${cmKeys.length} CS=${csKey ? 1 : 0}`);
+
+  const solvers = [];
+  if (acKeys.length)  solvers.push(_solveACFormat("AntiCaptcha", "https://api.anti-captcha.com", _pick(acKeys), pageUrl, siteKey, action));
+  if (tcKeys.length)  solvers.push(_solveACFormat("2Captcha",    "https://api.2captcha.com",     _pick(tcKeys), pageUrl, siteKey, action));
+  if (cmKeys.length)  solvers.push(_solveACFormat("CapMonster",  "https://api.capmonster.cloud", _pick(cmKeys), pageUrl, siteKey, action));
+  if (csKey)          solvers.push(_solveCapSolver(csKey, pageUrl, siteKey, action));
+
+  if (!solvers.length) throw new Error("_raceSolvers: no solver keys configured");
+
+  const errors = [];
   return new Promise((resolve, reject) => {
-    let settled = false; let remaining = 4;
-    function got(token) {
+    let settled = false;
+    let remaining = solvers.length;
+    function got(token, err) {
       if (settled) return;
       if (token) { settled = true; resolve(token); return; }
-      if (--remaining === 0) reject(new Error("All solvers failed"));
+      if (err) {
+        console.warn(`[OctoProbe BG] solver failed: ${err}`);
+        errors.push(String(err));
+      }
+      if (--remaining === 0) reject(new Error(`All solvers failed: ${errors.join(" | ")}`));
     }
-    _solveACFormat("https://api.anti-captcha.com", _pick(acKeys), pageUrl, siteKey, action).then(got).catch(() => got(null));
-    _solveACFormat("https://api.2captcha.com",     _pick(tcKeys), pageUrl, siteKey, action).then(got).catch(() => got(null));
-    _solveACFormat("https://api.capmonster.cloud", _pick(cmKeys), pageUrl, siteKey, action).then(got).catch(() => got(null));
-    _solveCapSolver(csKey, pageUrl, siteKey, action).then(got).catch(() => got(null));
+    for (const p of solvers) {
+      p.then(tok => got(tok, null)).catch(e => got(null, e));
+    }
   });
 }
 
