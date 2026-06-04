@@ -807,7 +807,7 @@ function _writeRunError(e) {
 // ---------------------------------------------------------------------------
 
 let _pollInterval    = null;
-let _sessionProxyIp  = null; // set once in p0_openAuthPage; reused by step4 burn check
+let _sessionProxyIp  = null; // set once in p0_openAuthPage; logged for diagnostics
 
 // Tab focus keepalive — every 8 s:
 //   1. Makes the workflow tab the active tab in its window (prevents background-tab
@@ -970,6 +970,10 @@ async function step0_warmup(tabId) {
   await skSet({[SK.WORKFLOW_STEP]: WF_STEPS.WARMUP});
 }
 
+async function _clearTargetCookies() {
+  await chrome.browsingData.removeCookies({origins: ["https://" + TARGET_HOST]});
+}
+
 // Navigate to TARGET_URL and resolve WAF challenges.
 // Returns the page-state string on arrival ("not-logged-in", "auth", "logged-in", etc.).
 // Skips navigation when already on a known post-home state.
@@ -1117,7 +1121,7 @@ async function step3_regFormReady(tabId) {
   await skSet({[SK.WORKFLOW_STEP]: WF_STEPS.REG_FORM_READY});
 }
 
-// Fill the registration form, check burned proxies, then submit (cmd-register-submit handles
+// Fill the registration form and submit (cmd-register-submit handles
 // two RGPD+captcha cycles internally). Arms tokenPageReady BEFORE the submit call to avoid
 // the race where the server redirect arrives before we could arm the listener after submit.
 // Returns {ok:true, tokenPageReady} on success; {ok:false, status} on captcha failure.
@@ -1127,19 +1131,6 @@ async function step4_regFormSubmit(tabId, person, emailAcct) {
   if (!fillResult?.ok) {
     await skSet({[SK.WORKFLOW_STEP]: WF_STEPS.REG_FORM_FAILED});
     return {ok: false, status: fillResult?.status ?? "fill_failed"};
-  }
-
-  const _proxyIp = _sessionProxyIp;
-  if (_proxyIp) {
-    const {[SK.BURNED_PROXIES]: _burned = []} = await skGet(SK.BURNED_PROXIES);
-    const _now = Date.now();
-    const _active = _burned.filter(e => (_now - e.burnedAt) < TIMER_MS.proxy.BURN_TTL);
-    if (_active.length !== _burned.length) await skSet({[SK.BURNED_PROXIES]: _active});
-    if (_active.some(e => e.ip === _proxyIp)) {
-      const e = new Error(`step4: proxy ${_proxyIp} already burned — rotate`);
-      e.proxyStatus = ERR_STATUS.BURNED; e.nextAction = NEXT_ACTION.ROTATE_PROXY; throw e;
-    }
-    _runLog.entry(`step4: proxy ${_proxyIp} — not burned, proceeding`);
   }
 
   const tokenPageReady = _waitForPageReady(tabId, TIMER_MS.pageReady.TOKEN_PAGE);
@@ -1166,13 +1157,6 @@ async function step4_regFormSubmit(tabId, person, emailAcct) {
     e.proxyStatus = ERR_STATUS.EMAIL_TAKEN; e.nextAction = NEXT_ACTION.ROTATE_PROXY; throw e;
   }
   if (result.status === "captcha_fail") {
-    if (_proxyIp) {
-      const {[SK.BURNED_PROXIES]: _bl = []} = await skGet(SK.BURNED_PROXIES);
-      const _now = Date.now();
-      const _al = _bl.filter(e => (_now - e.burnedAt) < TIMER_MS.proxy.BURN_TTL);
-      if (!_al.some(e => e.ip === _proxyIp)) { _al.push({ip: _proxyIp, burnedAt: _now}); await skSet({[SK.BURNED_PROXIES]: _al}); }
-      _runLog.entry(`step4: proxy ${_proxyIp} marked as burned`);
-    }
     await skSet({[SK.WORKFLOW_STEP]: WF_STEPS.REG_FORM_FAILED});
     return {ok: false, status: "captcha_fail"};
   }
@@ -1252,8 +1236,7 @@ async function step6_regFormSubmit2(tabId, emailAcct) {
 // All submit attempts exhausted — mark step and throw for the workflow handler to catch.
 async function step7_regFormFailed2(tabId, status) {
   await skSet({[SK.WORKFLOW_STEP]: WF_STEPS.REG_FORM_FAILED2});
-  const e = new Error(`step7: registration failed after all attempts — ${status}`);
-  e.proxyStatus = ERR_STATUS.BURNED; e.nextAction = NEXT_ACTION.ROTATE_PROXY; throw e;
+  throw new Error(`step7: registration failed after all attempts — ${status}`);
 }
 
 // Await the token page redirect that was armed before the last submit call.
@@ -1669,6 +1652,7 @@ async function step33_completed(tabId) {
 
 // opts.skipWarmup — bypass step0 even when SK.PRE_VISIT_WARMUP is set (e.g. fresh-tab retry).
 async function p0_openAuthPage(tabId, opts = {}) {
+  await _clearTargetCookies();
   const {[SK.PRE_VISIT_WARMUP]: preWarmup = false} = await skGet(SK.PRE_VISIT_WARMUP);
   if (preWarmup && !opts.skipWarmup) await step0_warmup(tabId);
   const state = await step1_homeReady(tabId);
@@ -2440,7 +2424,6 @@ const _MSG_HANDLERS = {
     skGet(SK.TRIGGER_MODE).then(d => {
       const triggerMode = d[SK.TRIGGER_MODE] ?? "AUTO_TRIGGER";
       _runLog.entry(`target-post-available: postId=${msg.postId} triggerMode=${triggerMode}`);
-      _runLog.entry(`target-post-available: postId=${msg.postId} triggerMode=${triggerMode}`);
       _sendStatusUpdate("AUTO_TRIGGER_PENDING");
       wf_apply()
         .then(() => { _sendStatusUpdate("DONE"); })
@@ -2628,6 +2611,27 @@ const _MSG_HANDLERS = {
           target: {tabId}, world: "MAIN", args: [token, _EVT_RCP],
           func: _recaptchaInjectFunc,
         });
+        // Tick the checkbox inside the reCAPTCHA anchor iframe.
+        // Runs in all frames; the function self-filters to the anchor URL.
+        chrome.scripting.executeScript({
+          target: {tabId, allFrames: true}, world: "MAIN",
+          func: () => {
+            try {
+              if (!location.href.includes('recaptcha') || !location.href.includes('anchor')) return;
+              const el = document.querySelector('#recaptcha-anchor');
+              if (!el) return;
+              el.setAttribute('aria-checked', 'true');
+              el.classList.remove('recaptcha-checkbox-unchecked');
+              el.classList.add('recaptcha-checkbox-checked');
+              const border = el.querySelector('.recaptcha-checkbox-border');
+              if (border) {
+                border.classList.remove('recaptcha-checkbox-border');
+                border.classList.add('recaptcha-checkbox-border-checked');
+              }
+              el.dispatchEvent(new Event('recaptcha-state-change', {bubbles: true}));
+            } catch(_) {}
+          },
+        }).catch(() => {});
         respond({ok: true, totalMs});
       } catch(e) {
         respond({ok: false, error: String(e)});

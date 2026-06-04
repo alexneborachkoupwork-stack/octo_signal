@@ -157,3 +157,78 @@
   } catch (_) {}
 })();
 
+// ── Canvas 2D fingerprint noise ──────────────────────────────────────────────
+// reCAPTCHA Enterprise reads canvas hashes via getImageData / toDataURL / toBlob.
+// XOR a session-unique random byte into R and G channels — invisible to the eye
+// but breaks any hash comparison keyed on the clean pixel output.
+// getImageData: mutates the returned ImageData copy (source canvas untouched).
+// toDataURL/toBlob: renders to a temp canvas so the source canvas is never altered.
+(function () {
+  var _nr = ((Math.random() * 254 | 0) + 1) | 1; // non-zero odd byte, session-unique
+  var _ng = ((Math.random() * 254 | 0) + 1) | 2; // non-zero even byte, different from _nr
+
+  var _origGID  = CanvasRenderingContext2D.prototype.getImageData;
+  var _origTDU  = HTMLCanvasElement.prototype.toDataURL;
+  var _origTBlb = HTMLCanvasElement.prototype.toBlob;
+
+  function _noiseData(data) {
+    for (var i = 0; i < data.length; i += 4) {
+      data[i]     ^= _nr;
+      data[i + 1] ^= _ng;
+      // blue (i+2) and alpha (i+3) untouched
+    }
+  }
+
+  function _noisedTmpCtx(canvas) {
+    try {
+      var ctx = canvas.getContext('2d');
+      if (!ctx || canvas.width === 0 || canvas.height === 0) return null;
+      var id = _origGID.call(ctx, 0, 0, canvas.width, canvas.height);
+      _noiseData(id.data);
+      var tmp = document.createElement('canvas');
+      tmp.width = canvas.width; tmp.height = canvas.height;
+      tmp.getContext('2d').putImageData(id, 0, 0);
+      return tmp;
+    } catch (_) { return null; }
+  }
+
+  CanvasRenderingContext2D.prototype.getImageData = function getImageData(x, y, w, h) {
+    var d = _origGID.call(this, x, y, w, h);
+    try { _noiseData(d.data); } catch (_) {}
+    return d;
+  };
+
+  HTMLCanvasElement.prototype.toDataURL = function toDataURL(type, quality) {
+    var tmp = _noisedTmpCtx(this);
+    if (tmp) return _origTDU.call(tmp, type, quality);
+    return _origTDU.apply(this, arguments);
+  };
+
+  if (_origTBlb) {
+    HTMLCanvasElement.prototype.toBlob = function toBlob(cb, type, quality) {
+      var tmp = _noisedTmpCtx(this);
+      if (tmp) return _origTBlb.call(tmp, cb, type, quality);
+      return _origTBlb.call(this, cb, type, quality);
+    };
+  }
+})();
+
+// ── Permissions API ───────────────────────────────────────────────────────────
+// Automated environments get "denied" for notifications/geolocation/camera (no
+// prompt ever shown). Real users on a fresh profile get "prompt". Override
+// Permissions.prototype.query for the common types so bd.js sees "prompt".
+(function () {
+  try {
+    if (!navigator.permissions) return;
+    var _proto     = Object.getPrototypeOf(navigator.permissions);
+    var _origQuery = _proto.query;
+    if (!_origQuery) return;
+    var _promptSet = new Set(['notifications', 'geolocation', 'camera', 'microphone', 'push']);
+    _proto.query = function query(desc) {
+      if (desc && _promptSet.has(String(desc.name || '')))
+        return Promise.resolve({state: 'prompt', onchange: null});
+      return _origQuery.call(this, desc);
+    };
+  } catch (_) {}
+})();
+

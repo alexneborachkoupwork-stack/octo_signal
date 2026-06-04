@@ -313,6 +313,10 @@ class Session extends EventEmitter {
       type:      this.workflow.name,
       sessionId: this.sessionId,
       ...this.workflow.payload,
+      // Include proxy credentials so the extension can use proxy-based captcha task types.
+      // The extension stores these in chrome.storage.local and _raceSolvers() reads them.
+      // null when no proxy is configured — the extension clears any stale proxy keys.
+      proxy: this._proxy ?? null,
     };
     this.lastCommand = cmd;
     this._commandConnectId = this._connectCount;

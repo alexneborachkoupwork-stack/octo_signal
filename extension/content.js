@@ -232,8 +232,10 @@ async function humanMoveTo(el) {
   let prevHover = document.elementFromPoint(sx, sy);
   for (let i = 0; i <= steps; i++) {
     const t   = i / steps;
-    const cx  = Math.round(_bezier(t, sx, cp1x, cp2x, tx));
-    const cy  = Math.round(_bezier(t, sy, cp1y, cp2y, ty));
+    const _jx = i < steps ? ((Math.random() - 0.5) * 4 | 0) : 0;
+    const _jy = i < steps ? ((Math.random() - 0.5) * 4 | 0) : 0;
+    const cx  = Math.round(_bezier(t, sx, cp1x, cp2x, tx)) + _jx;
+    const cy  = Math.round(_bezier(t, sy, cp1y, cp2y, ty)) + _jy;
     const scx = cx + (window.screenX ?? 0);
     const scy = cy + (window.screenY ?? 0);
     const mvX = cx - (window._mX ?? cx);
@@ -309,6 +311,47 @@ async function humanClick(el) {
     prev.dispatchEvent(new FocusEvent("focusout", {bubbles: true,  cancelable: false, relatedTarget: el}));
   }
   el.focus();
+}
+
+async function humanScroll(targetY, opts = {}) {
+  const steps = opts.steps ?? Math.floor(6 + Math.random() * 8);
+  const startY = window.scrollY;
+  const dist   = targetY - startY;
+  if (Math.abs(dist) < 5) return;
+  for (let i = 1; i <= steps; i++) {
+    const t    = i / steps;
+    const ease = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+    window.scrollTo({ top: startY + dist * ease, behavior: "instant" });
+    await sleep(_lognormalMs(60, 0.4));
+  }
+  if (Math.random() < 0.55) {
+    const overshoot = (Math.random() * 18 + 6) * Math.sign(dist);
+    window.scrollTo({ top: targetY + overshoot, behavior: "instant" });
+    await sleep(_lognormalMs(90, 0.3));
+    window.scrollTo({ top: targetY, behavior: "instant" });
+  }
+  await sleep(_lognormalMs(120, 0.35));
+}
+
+async function _preFormIdlePhase(formEl) {
+  await sleep(1200 + Math.random() * 1800);
+  const formTop = formEl
+    ? Math.max(0, formEl.getBoundingClientRect().top + window.scrollY - 80)
+    : window.scrollY + window.innerHeight * 0.6;
+  await humanScroll(formTop * 0.45);
+  await sleep(600 + Math.random() * 800);
+  await humanScroll(formTop);
+  const candidates = [...document.querySelectorAll("h1,h2,h3,p,a,label")]
+    .filter(el => {
+      const r = el.getBoundingClientRect();
+      return r.top > 0 && r.bottom < window.innerHeight && r.width > 0;
+    });
+  const picks = candidates.sort(() => Math.random() - 0.5).slice(0, 2);
+  for (const el of picks) {
+    await humanMoveTo(el);
+    await sleep(300 + Math.random() * 500);
+  }
+  await sleep(700 + Math.random() * 1200);
 }
 
 async function humanType(el, text) {
@@ -543,18 +586,33 @@ async function fillRegisterForm(person, email) {
     ["#email",       email],
   ];
 
-  for (const [sel, value] of textFields) {
+  await _preFormIdlePhase(document.querySelector("#name") ?? document.querySelector("form"));
+
+  for (let _fi = 0; _fi < textFields.length; _fi++) {
+    const [sel, value] = textFields[_fi];
     const el = document.querySelector(sel);
     if (!el) { console.warn(`[OctoProbe] Field not found: ${sel}`); continue; }
     await humanType(el, value);
     // Inter-field pause: real users glance at next field label, think, reposition hand.
     // Base 900–2100ms; 20% chance of a longer "reading" pause (2–4s).
     await sleep(900 + Math.random() * 1200 + (Math.random() < 0.20 ? 2000 + Math.random() * 2000 : 0));
+    // Scroll to next section between field groups (username→password, valPassword→bday).
+    if (_fi === 2 || _fi === 4) {
+      const _nextEl = document.querySelector(textFields[_fi + 1]?.[0]);
+      if (_nextEl) {
+        const _nextTop = _nextEl.getBoundingClientRect().top + window.scrollY - 120;
+        if (_nextTop > window.scrollY + 40) { await humanScroll(_nextTop); await sleep(400 + Math.random() * 500); }
+      }
+    }
   }
 
-  // Select fields — click, brief look, choose
+  // Scroll to reveal select fields before interacting with them.
   const genderEl = document.querySelector("#gender");
-  if (genderEl) await humanSelect(genderEl, person.gender);
+  if (genderEl) {
+    const _gTop = genderEl.getBoundingClientRect().top + window.scrollY - 120;
+    if (_gTop > window.scrollY + 40) { await humanScroll(_gTop); await sleep(400 + Math.random() * 400); }
+    await humanSelect(genderEl, person.gender);
+  }
   await sleep(300 + Math.random() * 400);
 
   const natEl = document.querySelector("#nationality");
@@ -667,14 +725,19 @@ async function _waitForRecaptchaApi() {
     setTimeout(() => { _drifting = false; _logEntry("captcha: content-side timeout (165s)"); resolve(false); }, 165000);
 
     // Drift mouse while solve+inject is in progress — zero movement is a bot signal.
-    // Dispatch on the element under the cursor (not document) and use ±20px steps
-    // so the movement looks like a real user hovering near the captcha widget.
+    // Anchor drift around the captcha widget so events fire on/near the checkbox,
+    // not wherever the cursor happened to be before the solve started.
     (async () => {
+      const _rcEl   = document.querySelector("iframe[src*='recaptcha'], [data-sitekey], .g-recaptcha, #rc-anchor-container");
+      const _rcRect = _rcEl ? _rcEl.getBoundingClientRect() : null;
+      const _driftCx = _rcRect ? _rcRect.left + _rcRect.width  * 0.5 : (window._mX ?? innerWidth  * 0.5);
+      const _driftCy = _rcRect ? _rcRect.top  + _rcRect.height * 0.5 : (window._mY ?? innerHeight * 0.5);
+      window._mX = _driftCx; window._mY = _driftCy;
       while (_drifting) {
         await sleep(120 + Math.random() * 280);
         if (!_drifting) break;
-        const nx = Math.max(0, Math.min(innerWidth,  (window._mX ?? innerWidth  * 0.5) + (Math.random() - 0.5) * 40));
-        const ny = Math.max(0, Math.min(innerHeight, (window._mY ?? innerHeight * 0.5) + (Math.random() - 0.5) * 40));
+        const nx = Math.max(0, Math.min(innerWidth,  _driftCx + (Math.random() - 0.5) * 60));
+        const ny = Math.max(0, Math.min(innerHeight, _driftCy + (Math.random() - 0.5) * 40));
         const _dEl = document.elementFromPoint(nx, ny) ?? document;
         _dEl.dispatchEvent(new MouseEvent("mousemove", {
           bubbles: true, clientX: nx, clientY: ny,
@@ -1775,6 +1838,7 @@ async function _loginFillCredentials(creds) {
   const userEl = await waitFor(() => findBySelectors(USERNAME_SELECTORS), 10000);
   if (!userEl) return {ok: false, status: "form_not_found"};
   setBadge("Login: filling credentials…", "#f0c040");
+  await _preFormIdlePhase(userEl);
   await humanType(userEl, creds.username);
   await sleep(500 + Math.random() * 500);
   const passEl = await waitFor(() => findBySelectors(PASSWORD_SELECTORS), 4000);
@@ -1993,30 +2057,32 @@ async function _registerSubmit() {
     }, 10000);
 
     if (!rgpdPopup) {
+      const _preAl = (_registerAlert ?? "").toLowerCase();
+      if (_preAl.includes("invalid") || _preAl.includes("inválid")) {
+        _logEntry(`register: form validation failed — "${_registerAlert}"`);
+        return {ok: false, status: "form_invalid"};
+      }
       setBadge("Register: waiting for response…", "#f0c040");
-      _logEntry("register: RGPD popup absent — form accepted");
+      _logEntry("register: RGPD popup absent — form accepted without privacy modal");
       return {ok: true, status: "submitted"};
     }
 
     setBadge("Register: accepting privacy…", "#f0c040");
     await sleep(600 + Math.random() * 500);
 
-    // Tick consent checkboxes — mirrors the login RGPD flow (#loginCheckbox1/2/3).
-    // The submit button starts disabled and only enables once required boxes are checked.
-    const rcb1 = document.querySelector("#registroCheckbox1");
-    const rcb2 = document.querySelector("#registroCheckbox2");
-    const rcb3 = document.querySelector("#registroCheckbox3");
-    if (rcb3?.checked) { await humanClick(rcb3); await sleep(200 + Math.random() * 200); }
-    if (rcb1 && !rcb1.checked) { await humanClick(rcb1); await sleep(300 + Math.random() * 300); }
-    if (rcb2 && !rcb2.checked) { await humanClick(rcb2); await sleep(400 + Math.random() * 300); }
+    // Registration RGPD popup has a single optional consent checkbox (#registroCheckbox,
+    // currently commented out server-side). openPopUpRegistro() enables #registroSubmit
+    // directly when the popup opens; the checkbox only matters if the server re-enables it.
+    const rcb = document.querySelector("#registroCheckbox");
+    if (rcb && !rcb.checked) { await humanClick(rcb); await sleep(300 + Math.random() * 300); }
 
-    // Wait for submit button to become enabled (requires checkboxes to be ticked first).
+    // Wait for submit button to become enabled — openPopUpRegistro() enables it on popup open.
     const rgpdSubmit = await waitFor(() => {
       const btn = document.querySelector("#registroSubmit");
       return btn && !btn.disabled ? btn : null;
     }, 8000);
     if (!rgpdSubmit) {
-      _logEntry("register: RGPD submit still disabled after checkbox checks");
+      _logEntry("register: RGPD submit still disabled after popup open");
       return {ok: false, status: "captcha_fail"};
     }
 
@@ -2040,11 +2106,11 @@ async function _registerSubmit() {
     if (outcome === "navigated") return {ok: true, status: "navigated"};
 
     if (outcome === "timeout") {
-      // Server silently dropped the RGPD POST — #registroSubmit remains disabled and
-      // cannot be re-enabled without navigating away.  Internal attempt 2 would submit
-      // against the same stuck button and also time out.  Signal captcha_fail so step4
-      // returns {ok:false} and p1 escalates to step5 (fresh page + form) + step6 (fresh submit).
-      _logEntry(`register: RGPD silent drop (attempt ${rgpdAttempt}) — escalating to fresh-form retry`);
+      // AJAX to /VistosOnline/register never responded within 100s (network or server hang).
+      // doRegister() re-enables #registroSubmit in its always() callback, but since AJAX
+      // didn't complete the button stays disabled for the full 100s.
+      // Signal captcha_fail so step4 returns {ok:false} and p1 escalates to step5/step6.
+      _logEntry(`register: RGPD AJAX hung (attempt ${rgpdAttempt}) — escalating to fresh-form retry`);
       return {ok: false, status: "captcha_fail"};
     }
 

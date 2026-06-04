@@ -135,7 +135,12 @@ class OctoApi {
     // Flatten comma-separated paths from all --load-extension= args, then deduplicate.
     const tmplPaths  = extArgList.flatMap(a => a.slice('--load-extension='.length).split(',').filter(Boolean));
     const allPaths   = [...new Set([...tmplPaths, this._extPath])];
-    body.launch_args = [...otherArgs, `--load-extension=${allPaths.join(',')}`];
+    // --enable-unsafe-swiftshader: re-enables the software WebGL fallback that Chrome 113+
+    // disabled by default. Required on VPS/headless environments with no GPU — without it
+    // getContext('webgl') returns null, which bd.js records as an unambiguous bot signal.
+    const swiftArg = '--enable-unsafe-swiftshader';
+    const extraArgs = otherArgs.includes(swiftArg) ? otherArgs : [...otherArgs, swiftArg];
+    body.launch_args = [...extraArgs, `--load-extension=${allPaths.join(',')}`];
 
     const cr = await this._cloud.post('/profiles', body);
     const created = cr.data?.data ?? cr.data;
@@ -156,7 +161,7 @@ class OctoApi {
       title:       name,
       tags,
       fingerprint: { os: 'win' },
-      launch_args: [`--load-extension=${this._extPath}`],
+      launch_args: [`--enable-unsafe-swiftshader`, `--load-extension=${this._extPath}`],
     };
 
     if (proxy) {
