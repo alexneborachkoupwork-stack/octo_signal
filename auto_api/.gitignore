@@ -1,0 +1,11 @@
+.env
+sessions/
+output/
+current_slot.json
+.proxy_state.json
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+accounts.csv
+data/
