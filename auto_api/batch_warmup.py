@@ -193,7 +193,7 @@ async def _login_worker(ws: WorkerState, login_proxy: str | None,
 
 # ── Apply helper ───────────────────────────────────────────────────────────────
 
-async def _apply_worker(ws: WorkerState, posto_id: str, posto_id_pdf: str,
+async def _apply_worker(ws: WorkerState, posto_id: str,
                         slot_manager, nationality: str,
                         capsolver_keys, anticaptcha_keys,
                         twocaptcha_keys, capmonster_keys,
@@ -201,7 +201,7 @@ async def _apply_worker(ws: WorkerState, posto_id: str, posto_id_pdf: str,
     from batch_apply import apply_one
     ws.state = "questionnaire"
     result = await apply_one(
-        ws.acct, posto_id, posto_id_pdf, slot_manager,
+        ws.acct, posto_id, slot_manager,
         capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
         executor,
         nationality=nationality,
@@ -266,9 +266,8 @@ async def main_async(args: argparse.Namespace, env: dict,
         print("[warmup] no verified/active accounts")
         return
 
-    posto_id     = args.posto
-    posto_id_pdf = env.get("POSTO_ID_PDF", str(int(posto_id) - 2))
-    nationality  = args.nationality
+    posto_id    = args.posto
+    nationality = args.nationality
 
     print(f"\n[warmup] {len(accounts)} accounts  posto={posto_id}  nationality={nationality}  concurrency={args.concurrency}")
     print(f"[warmup] login mode: proxy required (datacenter IP blocked by target)")
@@ -340,7 +339,7 @@ async def main_async(args: argparse.Namespace, env: dict,
     async def apply_bounded(ws):
         async with apply_sem:
             return await _apply_worker(
-                ws, posto_id, posto_id_pdf, slot_manager, nationality,
+                ws, posto_id, slot_manager, nationality,
                 capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
                 executor)
 

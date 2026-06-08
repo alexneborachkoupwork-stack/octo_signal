@@ -172,7 +172,7 @@ def _extract_csrf(html: str) -> str | None:
     return m.group(1) if m else None
 
 
-async def apply_one(acct: dict, posto_id: str, posto_id_pdf: str,
+async def apply_one(acct: dict, posto_id: str,
                     slot_manager,  # SlotManager | None
                     capsolver_keys: list[str], anticaptcha_keys: list[str],
                     twocaptcha_keys: list[str], capmonster_keys: list[str],
@@ -370,7 +370,7 @@ async def apply_one(acct: dict, posto_id: str, posto_id_pdf: str,
 
         # Step 9: SubmeterVistoCriaPDF (HAR: XHR cors, Referer: Schedule.jsp)
         r = await loop.run_in_executor(executor, lambda: client.post(
-            SUBMIT_URL, params={"posto_id": posto_id_pdf},
+            SUBMIT_URL, params={"posto_id": posto_id},
             data={"lang": "ENG", "txtHuman": "", "back": "",
                   "f_date_c": slot_date, "cmbPeriodo": slot_period},
             headers={**sess.HEADERS_XHR, "Referer": sched_jsp_url}, timeout=30))
@@ -428,11 +428,10 @@ async def main_async(args: argparse.Namespace,
         print("[batch_apply] no active accounts to apply")
         return
 
-    posto_id     = args.posto
-    posto_id_pdf = args.posto_pdf or args.posto_id_pdf_env
-    nat          = args.nationality
+    posto_id = args.posto
+    nat      = args.nationality
 
-    print(f"\n[batch_apply] {len(accounts)} accounts  posto={posto_id}  posto_pdf={posto_id_pdf}"
+    print(f"\n[batch_apply] {len(accounts)} accounts  posto={posto_id}"
           f"  nationality={nat}  concurrency={args.concurrency}")
 
     sem      = asyncio.Semaphore(args.concurrency)
@@ -441,7 +440,7 @@ async def main_async(args: argparse.Namespace,
     async def bounded(acct):
         async with sem:
             return await apply_one(
-                acct, posto_id, posto_id_pdf,
+                acct, posto_id,
                 None,   # no slot manager in standalone mode
                 capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
                 executor,
@@ -474,12 +473,9 @@ def main() -> None:
     parser.add_argument("--concurrency",  type=int, default=5)
     parser.add_argument("--posto",        default=env.get("POSTO_ID", "5086"),
                         help="Consular post ID (ScheduleController + slots)")
-    parser.add_argument("--posto-pdf",    default="", dest="posto_pdf",
-                        help="Post ID for SubmeterVistoCriaPDF (default: POSTO_ID_PDF from .env)")
     parser.add_argument("--nationality",  default=env.get("NATIONALITY", "CPV"),
                         help="ISO 3166-1 alpha-3 nationality code (default: NATIONALITY from .env)")
     args = parser.parse_args()
-    args.posto_id_pdf_env = env.get("POSTO_ID_PDF", str(int(args.posto) - 2))
 
     def _keys(k: str) -> list[str]:
         return [x.strip() for x in env.get(k, "").split(",") if x.strip()]

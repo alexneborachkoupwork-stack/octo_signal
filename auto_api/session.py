@@ -181,12 +181,22 @@ class PlaywrightSession:
     _CMD_LOGIN  = "login"
     _CMD_CLOSE  = "close"
 
-    def __init__(self, proxy: str | None):
-        self.proxy    = proxy
-        self._primp   = None          # set after challenge bypass
+    def __init__(self, proxy: str | None, inject_cookies: dict | None = None,
+                 headless: bool = True):
+        self.proxy           = proxy          # original URL — used by primp + CapSolver
+        self._inject_cookies = inject_cookies or {}   # pre-load cookies → skip WAF challenge
+        self._headless       = headless
+        # Chromium cannot authenticate with SOCKS5 user:pass; route via a local
+        # HTTP→SOCKS5 bridge. primp handles socks5:// natively and needs no bridge.
+        if proxy and proxy.startswith('socks5://'):
+            from proxy_bridge import start_bridge
+            self._playwright_proxy = start_bridge(proxy)
+        else:
+            self._playwright_proxy = proxy
+        self._primp   = None
         self._cookie_header: str = ""
-        self._cmd_q:  queue.Queue = queue.Queue()   # jobs to worker
-        self._res_q:  queue.Queue = queue.Queue()   # results from worker
+        self._cmd_q:  queue.Queue = queue.Queue()
+        self._res_q:  queue.Queue = queue.Queue()
         self._thread  = threading.Thread(target=self._worker, daemon=True)
         self._ready   = threading.Event()
         self._error: Exception | None = None
@@ -204,7 +214,7 @@ class PlaywrightSession:
         pw = None
         page = None
         try:
-            server, username, password = _parse_proxy(self.proxy)
+            server, username, password = _parse_proxy(self._playwright_proxy)
             proxy_config = None
             if server:
                 proxy_config = {"server": server}
@@ -219,7 +229,7 @@ class PlaywrightSession:
 
             pw = sync_playwright().start()
             browser = pw.chromium.launch(
-                headless=True,
+                headless=self._headless,
                 args=["--disable-blink-features=AutomationControlled",
                       "--disable-dev-shm-usage", "--no-sandbox"],
                 proxy=proxy_config,
@@ -237,6 +247,18 @@ class PlaywrightSession:
                 },
             )
             ctx.add_init_script(_make_stealth_script(vp_w, vp_h))
+
+            # Pre-inject saved cookies so the server skips the WAF challenge
+            # (used when reopening a browser for email verification after closing
+            # the registration browser to free RAM during the email-poll wait).
+            if self._inject_cookies:
+                ctx.add_cookies([
+                    {"name": k, "value": v, "domain": "pedidodevistos.mne.gov.pt",
+                     "path": "/"}
+                    for k, v in self._inject_cookies.items()
+                ])
+                print(f"[session] pre-injected {len(self._inject_cookies)} cookies (verify mode)")
+
             page = ctx.new_page()
 
             print(f"[session] nav -> {HOME_URL}")
@@ -403,54 +425,151 @@ class PlaywrightSession:
 
     def _do_browser_login(self, page, cmd: dict) -> dict:
         """
-        Solve the reCAPTCHA widget on AUTH_URL in the actual browser, then submit
-        the login via the page's jQuery $.ajax call. This produces a genuine
-        Enterprise CAPTCHA token with correct browser fingerprint and action name.
+        Navigate fresh to AUTH_URL, type credentials to build reCAPTCHA behavioral
+        signals, click the checkbox, then submit login via jQuery $.ajax.
+        Falls back to an external CapSolver token if the image challenge appears.
         Returns {"status": int, "body": str}.
         """
-        username = cmd["username"]
-        password = cmd["password"]
-        lang     = cmd.get("lang", "PT")
+        username   = cmd["username"]
+        password   = cmd["password"]
+        lang       = cmd.get("lang", "PT")
+        solver_key = cmd.get("solver_key", "")
 
-        # Page should already be on AUTH_URL from challenge bypass.
-        # Scroll to and activate the reCAPTCHA widget.
-        print(f"[session] browser login: clicking reCAPTCHA checkbox for {username}")
+        # Fresh navigation — don't rely on stale page from session init
+        print(f"[session] browser_login: nav -> AUTH_URL  user={username}")
+        page.goto(AUTH_URL, timeout=25000)
+        page.wait_for_load_state("networkidle", timeout=15000)
+        time.sleep(random.uniform(1.2, 2.0))
+
+        # Type credentials into form fields — keystrokes build reCAPTCHA Enterprise
+        # behavioral score (same pattern that makes registration CAPTCHA pass).
         try:
-            # Find the reCAPTCHA iframe and click the checkbox
+            uf = page.locator(
+                'input[name="username"], input#username, '
+                'input[autocomplete="username"], input[type="text"]:visible'
+            ).first
+            uf.click(timeout=5000)
+            time.sleep(random.uniform(0.4, 0.8))
+            uf.type(username, delay=random.randint(70, 150))
+            time.sleep(random.uniform(0.4, 0.9))
+        except Exception as e:
+            print(f"[session] username field not found: {e}")
+
+        try:
+            pf = page.locator(
+                'input[name="password"], input#password, input[type="password"]:visible'
+            ).first
+            pf.click(timeout=5000)
+            time.sleep(random.uniform(0.3, 0.7))
+            pf.type(password, delay=random.randint(70, 150))
+            time.sleep(random.uniform(0.8, 1.5))
+        except Exception as e:
+            print(f"[session] password field not found: {e}")
+
+        # Move mouse toward reCAPTCHA before clicking
+        try:
+            box = page.locator('iframe[title*="reCAPTCHA"]').first.bounding_box(timeout=5000)
+            if box:
+                page.mouse.move(
+                    box["x"] + box["width"] * 0.3,
+                    box["y"] + box["height"] * 0.5,
+                    steps=random.randint(10, 20),
+                )
+                time.sleep(random.uniform(0.3, 0.6))
+        except Exception:
+            pass
+
+        # Click the reCAPTCHA checkbox
+        print(f"[session] browser_login: clicking checkbox")
+        clicked = False
+        try:
             rc_frame = page.frame_locator('iframe[title*="reCAPTCHA"]').first
             rc_frame.locator("#recaptcha-anchor").click(timeout=10000)
+            clicked = True
         except Exception as e:
-            print(f"[session] reCAPTCHA click failed: {e} — trying alternate selector")
+            print(f"[session] checkbox click 1 failed: {e}")
+        if not clicked:
             try:
                 rc_frame = page.frame_locator('iframe[src*="recaptcha"]').first
                 rc_frame.locator(".recaptcha-checkbox").click(timeout=8000)
+                clicked = True
             except Exception as e2:
-                print(f"[session] reCAPTCHA click 2 failed: {e2}")
+                print(f"[session] checkbox click 2 failed: {e2}")
 
-        # Wait for the widget to auto-complete (no challenge = checkbox goes green)
-        # or for a challenge to appear (we skip challenges for now)
+        # Poll for auto-solve token (checkbox goes green without image challenge)
         token = ""
-        for _ in range(20):  # up to 20s
+        challenge_detected = False
+        for _ in range(25):
             time.sleep(1)
             try:
-                token = page.evaluate("grecaptcha.enterprise.getResponse()")
+                token = page.evaluate("grecaptcha.enterprise.getResponse()") or ""
                 if token:
                     break
             except Exception:
                 pass
+            try:
+                vis = page.locator(
+                    'iframe[title*="recaptcha challenge"], iframe[src*="bframe"]'
+                ).is_visible(timeout=300)
+                if vis:
+                    print(f"[session] image challenge appeared")
+                    challenge_detected = True
+                    break
+            except Exception:
+                pass
 
+        # Fallback: inject external CapSolver token when challenged or no auto-solve
+        if not token and solver_key:
+            print(f"[session] no auto-solve token — requesting external CapSolver token")
+            try:
+                token = _capsolver_token_sync(
+                    solver_key,
+                    sitekey="6LdOB9crAAAAADT4RFruc5sPmzLKIgvJVfL830d4",
+                    page_url=AUTH_URL,
+                    proxy=self.proxy,
+                )
+                if token:
+                    # Inject into page so doLogin picks it up
+                    tok_js = _json.dumps(token)
+                    page.evaluate(
+                        f"document.getElementById('g-recaptcha-response').value = {tok_js};"
+                        f"window._injected_token = {tok_js};"
+                    )
+                    print(f"[session] external token injected  len={len(token)}")
+            except Exception as e:
+                print(f"[session] external CapSolver failed: {e}")
+
+        # Last-resort: hidden input value
         if not token:
-            # Try getting token from hidden input (fallback)
             try:
                 token = page.evaluate("document.getElementById('g-recaptcha-response').value") or ""
             except Exception:
                 pass
 
-        print(f"[session] browser login: reCAPTCHA token_len={len(token)}")
+        print(f"[session] browser_login: token_len={len(token)}  challenge={challenge_detected}")
         if not token:
-            raise RuntimeError("reCAPTCHA widget did not produce a token — may need challenge solving")
+            raise RuntimeError(
+                f"reCAPTCHA: no token after all attempts (challenge_detected={challenge_detected})"
+            )
 
-        # Submit login via jQuery $.ajax (exactly as doLogin does)
+        # Intercept the raw /login response via Playwright before jQuery can transform it
+        _login_raw: dict = {}
+
+        def _on_response(resp):
+            try:
+                if "/VistosOnline/login" in resp.url and resp.request.method == "POST":
+                    raw = resp.body()
+                    ct  = resp.headers.get("content-type", "")
+                    _login_raw["status"] = resp.status
+                    _login_raw["body"]   = raw.decode("utf-8", errors="replace")
+                    _login_raw["ct"]     = ct
+                    print(f"[session] raw_login_resp: status={resp.status}  ct={ct!r}  body={_login_raw['body']!r}")
+            except Exception as ex:
+                print(f"[session] raw_login_resp capture error: {ex}")
+
+        page.on("response", _on_response)
+
+        # Submit via fetch() from the browser context
         username_js = _json.dumps(username)
         password_js = _json.dumps(password)
         lang_js     = _json.dumps(lang)
@@ -458,31 +577,32 @@ class PlaywrightSession:
 
         js = f"""
         async () => {{
-            return new Promise((resolve) => {{
-                $.ajax({{
-                    url: '/VistosOnline/login',
-                    data: {{
-                        username: {username_js},
-                        password: {password_js},
-                        language: {lang_js},
-                        rgpd: 'Y',
-                        captchaResponse: {token_js},
-                    }},
-                    type: 'POST',
-                    success: (data, status, xhr) => {{
-                        const buf = xhr.responseText || JSON.stringify(data);
-                        resolve({{ status: 200, body: buf }});
-                    }},
-                    error: (xhr) => {{
-                        resolve({{ status: xhr.status, body: xhr.responseText || '' }});
-                    }},
-                }});
+            const resp = await fetch('/VistosOnline/login', {{
+                method: 'POST',
+                headers: {{
+                    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                    'X-Requested-With': 'XMLHttpRequest',
+                    'Accept': '*/*',
+                }},
+                body: new URLSearchParams({{
+                    username: {username_js},
+                    password: {password_js},
+                    language: {lang_js},
+                    rgpd: 'Y',
+                    captchaResponse: {token_js},
+                }}).toString(),
             }});
+            const text = await resp.text();
+            const ct   = resp.headers.get('content-type') || '';
+            return {{ status: resp.status, body: text, ct: ct }};
         }}
         """
         result = page.evaluate(js)
+        page.remove_listener("response", _on_response)
+
         body = result.get("body", "")
-        print(f"[session] browser login status={result.get('status')}  body={body[:100]}")
+        ct   = result.get("ct", "")
+        print(f"[session] browser_login: status={result.get('status')}  ct={ct!r}  body={body!r}")
         return {"status": result.get("status", 0), "body": body}
 
     # ── Public interface ──────────────────────────────────────────────────────
@@ -535,17 +655,19 @@ class PlaywrightSession:
         return result
 
     def browser_login(self, username: str, password: str, lang: str = "PT",
-                      timeout: int = 60) -> dict:
+                      solver_key: str = "", timeout: int = 240) -> dict:
         """
-        Solve the reCAPTCHA widget on the live browser page, then submit login.
-        Produces a genuine Enterprise CAPTCHA token with browser fingerprint/action.
+        Type credentials into the login form to build behavioral signals, click the
+        reCAPTCHA checkbox, and submit. Falls back to an external CapSolver token if
+        the image challenge appears or auto-solve fails.
         Returns {"status": int, "body": str}.
         """
         self._cmd_q.put({
-            "action":   self._CMD_LOGIN,
-            "username": username,
-            "password": password,
-            "lang":     lang,
+            "action":     self._CMD_LOGIN,
+            "username":   username,
+            "password":   password,
+            "lang":       lang,
+            "solver_key": solver_key,
         })
         try:
             status, result = self._res_q.get(timeout=timeout)
@@ -597,6 +719,60 @@ class PlaywrightSession:
             pass
 
 
+# ── External CAPTCHA solver (synchronous, for browser fallback) ───────────────
+
+def _capsolver_token_sync(api_key: str, sitekey: str, page_url: str,
+                          proxy: str | None = None, timeout: int = 120) -> str:
+    """
+    Call CapSolver to solve a reCAPTCHA v2 Enterprise checkbox in the background.
+    Uses ReCaptchaV2EnterpriseTask (proxy-aware) or ProxyLess variant.
+    Returns the gRecaptchaResponse token string, or raises on failure.
+    """
+    import urllib.request as _req
+    import json as _j
+
+    task: dict = {
+        "type":       "ReCaptchaV2EnterpriseTask",
+        "websiteURL": page_url,
+        "websiteKey": sitekey,
+    }
+    if proxy:
+        try:
+            from urllib.parse import urlparse, unquote
+            p = urlparse(proxy)
+            scheme = (p.scheme or "http").lower()
+            task["proxyType"]    = "socks5" if "socks" in scheme else "http"
+            task["proxyAddress"] = p.hostname or ""
+            task["proxyPort"]    = p.port or 80
+            if p.username:
+                task["proxyLogin"]    = p.username
+                task["proxyPassword"] = unquote(p.password or "")
+        except Exception:
+            pass
+
+    def _post(url: str, body: dict) -> dict:
+        data = _j.dumps(body).encode()
+        r = _req.Request(url, data=data, headers={"Content-Type": "application/json"})
+        return _j.loads(_req.urlopen(r, timeout=15).read())
+
+    result = _post("https://api.capsolver.com/createTask",
+                   {"clientKey": api_key, "task": task})
+    task_id = result.get("taskId")
+    if not task_id:
+        raise RuntimeError(f"CapSolver createTask failed: {result}")
+
+    get_body = {"clientKey": api_key, "taskId": task_id}
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(4)
+        res = _post("https://api.capsolver.com/getTaskResult", get_body)
+        if res.get("status") == "ready":
+            return res["solution"]["gRecaptchaResponse"]
+        if res.get("status") == "failed":
+            raise RuntimeError(f"CapSolver task failed: {res}")
+    raise RuntimeError("CapSolver: timed out waiting for result")
+
+
 # ── Proxy URL parser ──────────────────────────────────────────────────────────
 
 def _parse_proxy(proxy_url: str | None) -> tuple[str | None, str | None, str | None]:
@@ -614,9 +790,12 @@ def _parse_proxy(proxy_url: str | None) -> tuple[str | None, str | None, str | N
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
-def get_session(proxy: str | None = None) -> PlaywrightSession:
+def get_session(proxy: str | None = None,
+                inject_cookies: dict | None = None,
+                headless: bool = True) -> PlaywrightSession:
     """
-    Bypass the bot challenge via headless Chrome and return a ready-to-use
-    session. The browser stays alive for verify_email(); call s.close() when done.
+    Launch a Chrome session. If inject_cookies is provided, the saved session
+    cookies are pre-loaded before navigation — the WAF challenge is skipped.
+    Pass headless=False to open a visible browser window (for manual inspection).
     """
-    return PlaywrightSession(proxy)
+    return PlaywrightSession(proxy, inject_cookies=inject_cookies, headless=headless)

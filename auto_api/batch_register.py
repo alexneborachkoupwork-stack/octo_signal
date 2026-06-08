@@ -90,15 +90,31 @@ def _load_proxies_from_file(path: Path) -> list[str]:
 
 # ── Per-account registration worker ───────────────────────────────────────────
 
-async def _register_one(acct: dict, all_proxies: list[str], base_proxy_idx: int,
-                         proxy_pool,  # ProxyPool | None — for burn_today()
+# How many proxies to search per registration attempt to find one with a fresh exit IP.
+# If SOAX maps multiple session IDs to the same IP, we skip those and search further.
+_IP_SEARCH_PER_ATTEMPT = 20
+
+
+async def _register_one(acct: dict, pool,  # PersistentProxyPool
                          capsolver_keys: list[str], anticaptcha_keys: list[str],
                          twocaptcha_keys: list[str], capmonster_keys: list[str],
                          lang: str, email_provider: str,
-                         executor: ThreadPoolExecutor) -> str:
+                         executor: ThreadPoolExecutor,
+                         browser_sem: asyncio.Semaphore,
+                         headed: bool = False) -> str:
     """
     Full register+verify flow for one account.
-    On type=error from the server (proxy burned), rotates to the next proxy and retries.
+
+    Two-phase browser design for high concurrency (200-500):
+      Phase 1 (browser_sem held): WAF bypass + CAPTCHA + register POST.
+                                  Browser is closed immediately on success.
+      Gap (no browser): email polling — 60-300 s, uses zero browser slots.
+      Phase 2 (browser_sem held): reopen browser with saved cookies + verify.
+
+    This limits peak simultaneous Chromium processes to browser_sem capacity
+    (~400 for 128 GB RAM) even when account concurrency is 500.
+
+    Uses PersistentProxyPool for cross-run exit-IP deduplication.
     Returns final status: "verified", "registered", "failed", "exists".
     """
     username = acct["username"]
@@ -123,153 +139,153 @@ async def _register_one(acct: dict, all_proxies: list[str], base_proxy_idx: int,
         _log(username, f"FAIL create email: {e}")
         return "failed"
 
-    reg_token_raw = ""
-    used_proxy = all_proxies[base_proxy_idx % len(all_proxies)] if all_proxies else ""
-    used_proxy_idx = base_proxy_idx
+    reg_token_raw   = ""
+    used_proxy      = ""
+    saved_cookies: dict = {}   # Vistos_sid etc, saved after registration to reuse in verify
 
-    # ── Proxy retry loop ──────────────────────────────────────────────────────
-    for proxy_attempt in range(MAX_PROXY_RETRIES):
-        proxy = all_proxies[(base_proxy_idx + proxy_attempt) % len(all_proxies)]
-        if proxy_attempt > 0:
-            _log(username, f"retry proxy_attempt={proxy_attempt} proxy={_proxy_host(proxy)}")
-
-        # Step 2 — fresh session per proxy attempt
-        try:
-            s = await loop.run_in_executor(executor, sess.get_session, proxy)
-        except Exception as e:
-            _log(username, f"FAIL get_session ({_proxy_host(proxy)}): {e}")
-            continue
-
-        # Step 3 — race all CAPTCHA solvers in parallel (first token wins)
-        token = None
-        try:
-            _log(username, f"CAPTCHA race-all (proxy={_proxy_host(proxy)})")
-            token = await loop.run_in_executor(
-                executor, solvermod.race_all,
-                capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
-                "REGISTER_EVISA", proxy,
+    async def _next_fresh_proxy() -> tuple[str, str] | None:
+        for _ in range(_IP_SEARCH_PER_ATTEMPT):
+            candidate = pool.advance()
+            ip = await loop.run_in_executor(
+                executor, pool.verify_and_claim, candidate, username,
             )
-        except Exception as e:
-            _log(username, f"CAPTCHA race-all failed: {e}")
+            if ip is not None:
+                return candidate, ip
+            _log(username, f"IP already used or dead on {_proxy_host(candidate)} — skipping")
+        return None
 
-        if not token:
-            _log(username, "FAIL all CAPTCHA attempts failed — skipping proxy")
-            continue
+    # ── Phase 1: browser — WAF bypass + CAPTCHA + register POST ──────────────
+    # browser_sem limits simultaneous Chromium processes regardless of total
+    # account concurrency. Browser is CLOSED immediately after registration
+    # succeeds to free RAM during the email-polling gap (60-300 s).
 
-        # Step 4 — POST /register
-        payload = {
-            "name":            acct.get("first_name", ""),
-            "surname":         acct.get("last_name", ""),
-            "username":        username,
-            "password":        acct["password"],
-            "valPassword":     acct["password"],
-            "gender":          acct.get("gender", "M"),
-            "bday":            acct.get("birthdate", "1985/01/01"),
-            "nationality":     acct.get("nationality", "PRT"),
-            "traveldoc":       acct.get("traveldoc", ""),
-            "email":           email_addr,
-            "language":        lang,
-            "rgpd":            "Y",
-            "captchaResponse": token,
-        }
-        try:
-            def _do_register(s=s, payload=payload):
-                return s.post(REGISTER_URL, data=payload, headers=sess.HEADERS_XHR, timeout=90)
-            reg_resp = await loop.run_in_executor(executor, _do_register)
-            reg_body = reg_resp.text.strip()
-            _log(username, f"register status={reg_resp.status_code} body={reg_body[:150]}")
-        except Exception as e:
-            # Timeout means the server likely processed the registration but
-            # didn't respond in time. Poll email rather than retrying (retrying
-            # would burn the proxy with additional CAPTCHA POSTs).
-            _log(username, f"register POST exception ({type(e).__name__}) — may be registered; polling email")
-            reg_token_raw = ""
-            used_proxy = proxy
-            used_proxy_idx = base_proxy_idx + proxy_attempt
+    for proxy_attempt in range(MAX_PROXY_RETRIES):
+        fresh = await _next_fresh_proxy()
+        if fresh is None:
+            _log(username, "FAIL no fresh exit IPs found within search budget")
             break
+        proxy, exit_ip = fresh
+        if proxy_attempt > 0:
+            _log(username, f"retry proxy_attempt={proxy_attempt} exit_ip={exit_ip}")
 
+        async with browser_sem:
+            try:
+                s = await loop.run_in_executor(
+                    executor, lambda _p=proxy: sess.get_session(_p, headless=not headed))
+            except Exception as e:
+                _log(username, f"FAIL get_session ({exit_ip}): {e}")
+                continue
 
-        try:
-            reg_result = json.loads(reg_body)
-            reg_type   = reg_result.get("type", "")
-            reg_desc   = reg_result.get("description", "")
-        except json.JSONDecodeError:
-            reg_type = ""
-            reg_desc = reg_body[:80]
+            token = None
+            try:
+                _log(username, f"CAPTCHA race-all (exit_ip={exit_ip})")
+                token = await loop.run_in_executor(
+                    executor, solvermod.race_all,
+                    capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
+                    "REGISTER_EVISA", proxy,
+                )
+            except Exception as e:
+                _log(username, f"CAPTCHA race-all failed: {e}")
 
-        if reg_type == "secblock":
-            _log(username, f"BLOCKED secblock on {_proxy_host(proxy)} — trying next")
-            if proxy_pool:
-                proxy_pool.burn_today(proxy, "secblock")
+            if not token:
+                _log(username, "FAIL all CAPTCHA attempts failed — skipping proxy")
+                try: s.close()
+                except Exception: pass
+                continue
+
+            payload = {
+                "name":            acct.get("first_name", ""),
+                "surname":         acct.get("last_name", ""),
+                "username":        username,
+                "password":        acct["password"],
+                "valPassword":     acct["password"],
+                "gender":          acct.get("gender", "M"),
+                "bday":            acct.get("birthdate", "1985/01/01"),
+                "nationality":     acct.get("nationality", "PRT"),
+                "traveldoc":       acct.get("traveldoc", ""),
+                "email":           email_addr,
+                "language":        lang,
+                "rgpd":            "Y",
+                "captchaResponse": token,
+            }
+            try:
+                def _do_register(s=s, payload=payload):
+                    return s.post(REGISTER_URL, data=payload,
+                                  headers=sess.HEADERS_XHR, timeout=90)
+                reg_resp = await loop.run_in_executor(executor, _do_register)
+                reg_body = reg_resp.text.strip()
+                _log(username, f"register status={reg_resp.status_code} body={reg_body[:150]}")
+            except Exception as e:
+                _log(username, f"register POST exception ({type(e).__name__}) — retrying with next proxy")
+                try: s.close()
+                except Exception: pass
+                continue
+
+            try:
+                reg_result = json.loads(reg_body)
+                reg_type   = reg_result.get("type", "")
+                reg_desc   = reg_result.get("description", "")
+            except json.JSONDecodeError:
+                reg_type = ""
+                reg_desc = reg_body[:80]
+
+            if reg_type == "secblock":
+                _log(username, f"secblock on {exit_ip} — burning, trying next")
+                pool.burn_today(proxy, "secblock")
+                try: s.close()
+                except Exception: pass
+                continue
+
+            if reg_type == "ReCaptchaError":
+                _log(username, "CAPTCHA rejected (low score) — trying next proxy")
+                try: s.close()
+                except Exception: pass
+                continue
+
+            if reg_type == "error":
+                _log(username, f"type=error on {exit_ip} — burning, trying next")
+                pool.burn_today(proxy, "register:type=error")
+                try: s.close()
+                except Exception: pass
+                continue
+
+            if "already_exists" in reg_type or "already_exists" in reg_desc.lower():
+                _log(username, "INFO account already exists on server")
+                _csv_update(username, status="registered", email=email_addr,
+                            email_pass=email_pass, proxy=_proxy_host(proxy))
+                try: s.close()
+                except Exception: pass
+                return "exists"
+
+            if reg_type == "200" or reg_resp.status_code == 503:
+                reg_token_raw = reg_result.get("description", "") if reg_type == "200" else ""
+                used_proxy    = proxy
+                _log(username, f"register SUCCESS  reg_token={reg_token_raw}  exit_ip={exit_ip}")
+                _csv_update(username, status="registered", email=email_addr,
+                            email_pass=email_pass, proxy=_proxy_host(proxy))
+                # Save cookies BEFORE closing — needed to reopen browser for verification
+                saved_cookies = s.get_cookies(AUTH_URL)
+                try: s.close()   # FREE BROWSER — email poll needs no browser
+                except Exception: pass
+                break
+
+            if reg_resp.status_code == 403:
+                _log(username, f"403 WAF on {exit_ip} — proxy burned, aborting")
+                pool.burn_today(proxy, "register:403waf")
+                try: s.close()
+                except Exception: pass
+                _csv_update(username, status="failed", notes="403 WAF block")
+                return "failed"
+
+            _log(username, f"WARN unexpected response HTTP {reg_resp.status_code}: {reg_desc[:80]}")
             try: s.close()
             except Exception: pass
             continue
-
-        if reg_type == "ReCaptchaError":
-            _log(username, "FAIL CAPTCHA rejected by server (low score)")
-            try: s.close()
-            except Exception: pass
-            continue
-
-        if reg_type == "error":
-            _log(username, f"proxy {_proxy_host(proxy)} burned (type=error) — trying next")
-            if proxy_pool:
-                proxy_pool.burn_today(proxy, "register:type=error")
-            try: s.close()
-            except Exception: pass
-            continue
-
-        if "already_exists" in reg_type or "already_exists" in reg_desc.lower():
-            _log(username, "INFO account already on server — marking registered")
-            _csv_update(username, status="registered", email=email_addr,
-                        email_pass=email_pass, proxy=_proxy_host(proxy),
-                        proxy_idx=base_proxy_idx + proxy_attempt)
-            return "exists"
-
-        if reg_type == "200":
-            reg_token_raw = reg_result.get("description", "")
-            used_proxy = proxy
-            used_proxy_idx = base_proxy_idx + proxy_attempt
-            _log(username, f"register SUCCESS  reg_token={reg_token_raw}  proxy={_proxy_host(proxy)}")
-            _csv_update(username, status="registered", email=email_addr,
-                        email_pass=email_pass, proxy=_proxy_host(proxy),
-                        proxy_idx=used_proxy_idx)
-            break  # proceed to verification
-
-        # 503 = server-side LB error; registration may have been processed
-        if reg_resp.status_code == 503:
-            _log(username, f"503 from server — registration may have been processed; polling email")
-            reg_token_raw = ""
-            used_proxy = proxy
-            used_proxy_idx = base_proxy_idx + proxy_attempt
-            _csv_update(username, status="registered", email=email_addr,
-                        email_pass=email_pass, proxy=_proxy_host(proxy),
-                        proxy_idx=used_proxy_idx)
-            break
-
-        # 403 = WAF hard block; proxy is now burned
-        if reg_resp.status_code == 403:
-            _log(username, f"403 WAF on {_proxy_host(proxy)} — proxy burned, stopping")
-            if proxy_pool:
-                proxy_pool.burn_today(proxy, "register:403waf")
-            try: s.close()
-            except Exception: pass
-            return "failed"
-
-        # Other unexpected response — treat as transient failure and try next proxy
-        _log(username, f"WARN unexpected reg response (HTTP {reg_resp.status_code}): {reg_desc[:80]}")
-        try: s.close()
-        except Exception: pass
-        continue
 
     else:
-        _log(username, f"FAIL exhausted {MAX_PROXY_RETRIES} proxy attempts")
-        try:
-            s.close()
-        except Exception:
-            pass
+        _log(username, f"FAIL exhausted {MAX_PROXY_RETRIES} registration attempts")
         _csv_update(username, status="failed",
-                    notes=f"exhausted {MAX_PROXY_RETRIES} proxy attempts")
+                    notes=f"exhausted {MAX_PROXY_RETRIES} registration attempts")
         return "failed"
 
     # ── Verification — browser stays alive until verify is done ─────────────────
@@ -296,32 +312,40 @@ async def _register_one(acct: dict, all_proxies: list[str], base_proxy_idx: int,
     )
     _log(username, f"email tokens: link={link_token}  code={code_token}")
 
+    # ── Phase 2: reopen browser for email verification ────────────────────────
+    # The registration browser was already closed. Reopen with saved_cookies so
+    # the WAF challenge is skipped (server sees a valid Vistos_sid immediately).
     token_page = f"{AUTH_URL}?token={token_search}"
-    try:
-        # Use the browser for verification (it has the correct session/TLS context)
-        def _do_verify(s=s):
-            return s.verify_email(
-                token_url=token_page,
-                insert_jsp=INSERT_TOKEN_JSP,
-                verify_url=VERIFY_URL,
-                token_input=token_input,
-                token_search=token_search,
-                lang=lang,
-                timeout=90,
-            )
-        vr_dict = await loop.run_in_executor(executor, _do_verify)
-        vr_status = vr_dict.get("status", 0)
-        vr_body   = vr_dict.get("body", "").strip()
-        _log(username, f"verify status={vr_status}  body={vr_body[:150]}")
-    except Exception as e:
-        _log(username, f"FAIL verify request: {e}")
-        try: s.close()
-        except Exception: pass
-        return "registered"
-    finally:
-        # Browser can be closed now — verification is complete
-        try: s.close()
-        except Exception: pass
+    async with browser_sem:
+        try:
+            def _open_verify_session(p=used_proxy, ck=saved_cookies):
+                return sess.get_session(p, inject_cookies=ck, headless=not headed)
+            sv = await loop.run_in_executor(executor, _open_verify_session)
+        except Exception as e:
+            _log(username, f"FAIL reopen session for verify: {e}")
+            return "registered"
+
+        try:
+            def _do_verify(sv=sv):
+                return sv.verify_email(
+                    token_url=token_page,
+                    insert_jsp=INSERT_TOKEN_JSP,
+                    verify_url=VERIFY_URL,
+                    token_input=token_input,
+                    token_search=token_search,
+                    lang=lang,
+                    timeout=90,
+                )
+            vr_dict   = await loop.run_in_executor(executor, _do_verify)
+            vr_status = vr_dict.get("status", 0)
+            vr_body   = vr_dict.get("body", "").strip()
+            _log(username, f"verify status={vr_status}  body={vr_body[:150]}")
+        except Exception as e:
+            _log(username, f"FAIL verify request: {e}")
+            return "registered"
+        finally:
+            try: sv.close()
+            except Exception: pass
 
     verified = False
     if vr_status == 200:
@@ -346,8 +370,10 @@ async def _register_one(acct: dict, all_proxies: list[str], base_proxy_idx: int,
     return "verified"
 
 
-async def _verify_one(acct: dict, all_proxies: list[str], base_proxy_idx: int,
-                      lang: str, executor: ThreadPoolExecutor) -> str:
+async def _verify_one(acct: dict, pool,  # PersistentProxyPool
+                      lang: str, executor: ThreadPoolExecutor,
+                      browser_sem: asyncio.Semaphore,
+                      headed: bool = False) -> str:
     """
     Email-verify an already-registered account whose inbox may still hold the token.
     Polls the CF Worker (or mail.tm) once, then uses a browser session to submit.
@@ -395,34 +421,36 @@ async def _verify_one(acct: dict, all_proxies: list[str], base_proxy_idx: int,
 
     # ── Browser verify ─────────────────────────────────────────────────────────
     token_page = f"{AUTH_URL}?token={token_search}"
-    proxy = all_proxies[base_proxy_idx % len(all_proxies)] if all_proxies else ""
-    try:
-        s = await loop.run_in_executor(executor, sess.get_session, proxy)
-    except Exception as e:
-        _log(username, f"FAIL get_session ({_proxy_host(proxy)}): {e}")
-        return "registered"
+    proxy = pool.advance()
+    async with browser_sem:
+        try:
+            s = await loop.run_in_executor(
+                executor, lambda _p=proxy: sess.get_session(_p, headless=not headed))
+        except Exception as e:
+            _log(username, f"FAIL get_session ({_proxy_host(proxy)}): {e}")
+            return "registered"
 
-    try:
-        def _do_verify(s=s):
-            return s.verify_email(
-                token_url=token_page,
-                insert_jsp=INSERT_TOKEN_JSP,
-                verify_url=VERIFY_URL,
-                token_input=token_input,
-                token_search=token_search,
-                lang=lang,
-                timeout=90,
-            )
-        vr_dict   = await loop.run_in_executor(executor, _do_verify)
-        vr_status = vr_dict.get("status", 0)
-        vr_body   = vr_dict.get("body", "").strip()
-        _log(username, f"verify status={vr_status}  body={vr_body[:150]}")
-    except Exception as e:
-        _log(username, f"FAIL verify: {e}")
-        return "registered"
-    finally:
-        try: s.close()
-        except Exception: pass
+        try:
+            def _do_verify(s=s):
+                return s.verify_email(
+                    token_url=token_page,
+                    insert_jsp=INSERT_TOKEN_JSP,
+                    verify_url=VERIFY_URL,
+                    token_input=token_input,
+                    token_search=token_search,
+                    lang=lang,
+                    timeout=90,
+                )
+            vr_dict   = await loop.run_in_executor(executor, _do_verify)
+            vr_status = vr_dict.get("status", 0)
+            vr_body   = vr_dict.get("body", "").strip()
+            _log(username, f"verify status={vr_status}  body={vr_body[:150]}")
+        except Exception as e:
+            _log(username, f"FAIL verify: {e}")
+            return "registered"
+        finally:
+            try: s.close()
+            except Exception: pass
 
     verified = False
     if vr_status == 200:
@@ -462,28 +490,33 @@ def _csv_update(username: str, **fields) -> None:
         pool.update(username, **fields)
 
 
-def _build_proxy_list(args: "argparse.Namespace") -> "list[str] | None":
-    """Build proxy list from args. Returns None and prints error on failure."""
-    from account_pool import webshare_proxy
+def _build_persistent_pool(args: "argparse.Namespace"):
+    """
+    Build a PersistentProxyPool from args. Returns the pool or None on failure.
+    The pool's state file lives next to the proxy file and persists cursor + used IPs
+    across runs so no two accounts (in any run) share the same exit IP.
+    """
+    from proxy_pool import PersistentProxyPool
     if getattr(args, "proxy", None):
-        return [_fix_proxy_url(args.proxy)]
-    if args.proxy_type == "isp":
-        proxies = _load_proxies_from_file(_ISP_PROXY_FILE)
-        if not proxies:
-            print("[batch] ERROR no ISP proxies loaded from proxies_isp.txt")
+        # Single forced proxy — wrap in a one-element temp file would be awkward;
+        # just fall through to soax/isp with a warning.
+        print("[batch] WARN --proxy flag not supported with PersistentProxyPool; "
+              "ignoring and using --proxy-type pool instead")
+    try:
+        if args.proxy_type == "soax":
+            return PersistentProxyPool(_SOAX_PROXY_FILE)
+        if args.proxy_type == "isp":
+            return PersistentProxyPool(_ISP_PROXY_FILE)
+        if args.proxy_type == "webshare":
+            if _WEBSHARE_PROXY_FILE.exists():
+                return PersistentProxyPool(_WEBSHARE_PROXY_FILE)
+            print("[batch] ERROR webshare proxy file not found")
             return None
-        return proxies
-    if args.proxy_type == "soax":
-        proxies = _load_proxies_from_file(_SOAX_PROXY_FILE)
-        if not proxies:
-            print("[batch] ERROR no SOAX proxies loaded from proxies_soax.txt")
-            return None
-        return proxies
-    if args.proxy_type == "webshare":
-        if _WEBSHARE_PROXY_FILE.exists():
-            return _load_proxies_from_file(_WEBSHARE_PROXY_FILE)
-        return [webshare_proxy(args.ws_start + i) for i in range(200)]
-    return [webshare_proxy(args.ws_start + i) for i in range(200)]
+    except Exception as e:
+        print(f"[batch] ERROR building proxy pool: {e}")
+        return None
+    print("[batch] ERROR unknown proxy-type")
+    return None
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -492,9 +525,14 @@ async def main_async(args: argparse.Namespace,
                      capsolver_keys: list[str], anticaptcha_keys: list[str],
                      twocaptcha_keys: list[str], capmonster_keys: list[str]) -> None:
     from account_pool import AccountPool, webshare_proxy
-    from proxy_pool import ProxyPool
+    from proxy_pool import PersistentProxyPool
 
     acc_pool = AccountPool(_ACCOUNT_FILE)
+
+    # Build the persistent proxy pool (shared across all workers in this run)
+    pool = _build_persistent_pool(args)
+    if pool is None:
+        return
 
     # ── verify-registered mode ─────────────────────────────────────────────────
     if getattr(args, "verify_registered", False):
@@ -507,21 +545,20 @@ async def main_async(args: argparse.Namespace,
             print("[batch] No registered accounts with email to verify")
             return
         print(f"\n[batch] verify-registered: {len(accounts)} accounts  "
-              f"concurrency={args.concurrency}  proxy-type={args.proxy_type}")
-        all_proxies = _build_proxy_list(args)
-        if all_proxies is None:
-            return
-        print(f"[batch] proxy pool size: {len(all_proxies)}")
+              f"concurrency={args.concurrency}")
         if args.dry_run:
-            for i, a in enumerate(accounts):
-                print(f"  {a['username']}  email={a['email']}  proxy={_proxy_host(all_proxies[i % len(all_proxies)])}")
+            for a in accounts:
+                print(f"  {a['username']}  email={a['email']}")
             return
-        sem      = asyncio.Semaphore(args.concurrency)
-        executor = ThreadPoolExecutor(max_workers=args.concurrency + 4)
-        async def bounded_verify(acct, idx):
+        bc_arg = getattr(args, "browser_concurrency", 0) or args.concurrency
+        browser_concurrency = min(bc_arg, args.concurrency)
+        sem         = asyncio.Semaphore(args.concurrency)
+        browser_sem = asyncio.Semaphore(browser_concurrency)
+        executor    = ThreadPoolExecutor(max_workers=args.concurrency * 2 + 20)
+        async def bounded_verify(acct):
             async with sem:
-                return await _verify_one(acct, all_proxies, idx, args.lang, executor)
-        tasks   = [bounded_verify(a, i % len(all_proxies)) for i, a in enumerate(accounts)]
+                return await _verify_one(acct, pool, args.lang, executor, browser_sem, headed=args.headed)
+        tasks   = [bounded_verify(a) for a in accounts]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         counts: dict[str, int] = {}
         for r in results:
@@ -538,7 +575,6 @@ async def main_async(args: argparse.Namespace,
     want_statuses = {"new", "failed"} if args.include_failed else {"new"}
     all_new = [a for a in acc_pool.all() if a["status"] in want_statuses]
 
-    # Optional account_type filter (fake / real)
     if getattr(args, "account_type", None):
         all_new = [a for a in all_new if a.get("account_type") == args.account_type]
 
@@ -547,47 +583,33 @@ async def main_async(args: argparse.Namespace,
         return
 
     accounts = all_new[:args.count] if args.count > 0 else all_new
-    print(f"\n[batch] {len(accounts)} accounts to process  concurrency={args.concurrency}  proxy-type={args.proxy_type}")
-
-    # Build ordered proxy list
-    proxy_pool_obj = None
-    if getattr(args, "proxy", None):
-        all_proxies = [_fix_proxy_url(args.proxy)]
-        print(f"[batch] forced proxy: {_proxy_host(all_proxies[0])}")
-    else:
-        all_proxies = _build_proxy_list(args)
-        if all_proxies is None:
-            return
-        try:
-            if args.proxy_type == "isp":
-                proxy_pool_obj = ProxyPool(_ISP_PROXY_FILE)
-            elif args.proxy_type == "soax":
-                proxy_pool_obj = ProxyPool(_SOAX_PROXY_FILE)
-            elif args.proxy_type == "webshare" and _WEBSHARE_PROXY_FILE.exists():
-                proxy_pool_obj = ProxyPool(_WEBSHARE_PROXY_FILE)
-        except Exception:
-            pass
-
-    print(f"[batch] proxy pool size: {len(all_proxies)}  (each account gets up to {MAX_PROXY_RETRIES} retries)")
+    bc_arg = getattr(args, "browser_concurrency", 0) or args.concurrency
+    browser_concurrency = min(bc_arg, args.concurrency)
+    print(f"\n[batch] {len(accounts)} accounts  "
+          f"concurrency={args.concurrency}  browser_concurrency={browser_concurrency}  "
+          f"proxy-type={args.proxy_type}  "
+          f"pool: cursor={pool.cursor}  used={pool.used_count}/{pool.total}")
 
     if args.dry_run:
         print("\n[dry-run] Would process:")
-        for i, acct in enumerate(accounts):
-            proxy = all_proxies[i % len(all_proxies)]
-            print(f"  {acct['username']}  base_proxy={_proxy_host(proxy)}  (retries up to {MAX_PROXY_RETRIES-1} more)")
+        for acct in accounts:
+            print(f"  {acct['username']}")
         return
 
-    sem = asyncio.Semaphore(args.concurrency)
-    executor = ThreadPoolExecutor(max_workers=args.concurrency + 4)
+    sem         = asyncio.Semaphore(args.concurrency)
+    browser_sem = asyncio.Semaphore(browser_concurrency)
+    # Executor: 2× concurrency so IP-checks + Playwright + CAPTCHA don't block each other
+    executor    = ThreadPoolExecutor(max_workers=args.concurrency * 2 + 20)
 
-    async def bounded(acct, base_idx):
+    async def bounded(acct):
         async with sem:
-            return await _register_one(acct, all_proxies, base_idx, proxy_pool_obj,
+            return await _register_one(acct, pool,
                                         capsolver_keys, anticaptcha_keys,
                                         twocaptcha_keys, capmonster_keys,
-                                        args.lang, args.email, executor)
+                                        args.lang, args.email, executor,
+                                        browser_sem, headed=args.headed)
 
-    tasks = [bounded(acct, i % len(all_proxies)) for i, acct in enumerate(accounts)]
+    tasks = [bounded(acct) for acct in accounts]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     # Summary
@@ -614,7 +636,12 @@ def main() -> None:
     parser.add_argument("--count", type=int, default=0,
                         help="Max accounts to register (0=all new)")
     parser.add_argument("--concurrency", type=int, default=10,
-                        help="Max simultaneous workers (default: 10)")
+                        help="Total simultaneous account workers (default: 10)")
+    parser.add_argument("--browser-concurrency", type=int, default=0,
+                        dest="browser_concurrency",
+                        help="Max simultaneous Playwright browsers (default: same as --concurrency). "
+                             "128 GB RAM supports up to ~400. Set lower than --concurrency so browsers "
+                             "are closed during email polling and slots are reused.")
     parser.add_argument("--proxy", default="",
                         help="Force a single proxy URL (overrides --proxy-type and pool)")
     parser.add_argument("--proxy-type", choices=("isp", "webshare", "soax"), default="isp",
@@ -634,6 +661,8 @@ def main() -> None:
     parser.add_argument("--account-type", choices=("fake", "real"), default=None,
                         dest="account_type",
                         help="Filter: only process fake or real accounts")
+    parser.add_argument("--headed", action="store_true",
+                        help="Open visible browser windows (for manual inspection)")
 
     args = parser.parse_args()
 

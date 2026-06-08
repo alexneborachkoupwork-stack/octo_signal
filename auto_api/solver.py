@@ -2,10 +2,8 @@
 reCAPTCHA Enterprise solver wrapper.
 Supports: CapSolver, Anti-Captcha, 2Captcha, CapMonster.
 
-The target site mixes two reCAPTCHA Enterprise widget types:
-- REGISTER_EVISA: v2 Enterprise (visible checkbox, ReCaptchaV2EnterpriseTask)
-- LOGIN_EVISA, SCHEDULE_EVISA: v3 Enterprise (invisible score-based, ReCaptchaV3Task
-  with isEnterprise=true). Real-device tokens start with "0cAFcWeA…" confirming v3.
+All actions on the target site use ReCaptchaV2EnterpriseTask (proxy-aware).
+_V3_ACTIONS is intentionally empty — do not add LOGIN_EVISA or any other action to it.
 
 IMPORTANT: Use proxy-aware task types (not ProxyLess) so the CAPTCHA solve
 happens from the same IP as the page load. ProxyLess tasks score poorly with
@@ -24,11 +22,7 @@ AUTH_URL   = "https://pedidodevistos.mne.gov.pt/VistosOnline/Authentication.jsp"
 POLL_DELAY = 3
 MAX_POLLS  = 40  # ~2 minutes
 
-# Actions that use v3 Enterprise (invisible, score-based).
-# LOGIN_EVISA: CapSolver rejected ReCaptchaV3Task with "wrong captcha type" — it confirmed
-# the login page uses v2 checkbox, not v3. Only SCHEDULE_EVISA is left as a candidate.
-# If CapSolver also rejects v3 for SCHEDULE_EVISA during testing, remove it too.
-_V3_ACTIONS = frozenset({"SCHEDULE_EVISA"})
+_V3_ACTIONS: frozenset[str] = frozenset()  # all actions use ReCaptchaV2Enterprise
 
 
 def _parse_proxy(proxy_url: str | None) -> dict | None:
@@ -235,6 +229,13 @@ def _capsolver(api_key: str, action: str, proxy_info: dict | None,
 
 # ── Anti-Captcha ──────────────────────────────────────────────────────────────
 
+_AC_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+
+
 def _anticaptcha(api_key: str, action: str, proxy_info: dict | None,
                  session_cookies: dict | None = None) -> str:
     if action in _V3_ACTIONS:
@@ -254,6 +255,7 @@ def _anticaptcha(api_key: str, action: str, proxy_info: dict | None,
         task["type"] = "RecaptchaV2EnterpriseTask" if proxy_info else "RecaptchaV2EnterpriseTaskProxyless"
     if proxy_info:
         task.update(proxy_info)
+    task["userAgent"] = _AC_USER_AGENT
     cookies_str = _cookies_str(session_cookies)
     if cookies_str:
         task["cookies"] = cookies_str
@@ -265,7 +267,9 @@ def _anticaptcha(api_key: str, action: str, proxy_info: dict | None,
     data = r.json()
     if data.get("errorId", 0) != 0:
         raise RuntimeError(f"createTask error: {data}")
-    task_id = data["taskId"]
+    task_id = data.get("taskId")
+    if not task_id:
+        raise RuntimeError(f"createTask no taskId: {data}")
     print(f"[solver] task_id={task_id}")
     return _poll("https://api.anti-captcha.com/getTaskResult", api_key, task_id)
 

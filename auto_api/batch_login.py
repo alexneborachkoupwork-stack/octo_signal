@@ -31,7 +31,7 @@ _ISP_PROXY_FILE      = Path(__file__).parent / "data" / "proxies_isp.txt"
 _SOAX_PROXY_FILE     = Path(__file__).parent / "data" / "proxies_soax.txt"
 _WEBSHARE_PROXY_FILE = Path(__file__).parent / "data" / "proxies_webshare.txt"
 
-MAX_PROXY_RETRIES = 5
+MAX_PROXY_RETRIES = 15
 
 _csv_lock   = threading.Lock()
 _print_lock = threading.Lock()
@@ -100,14 +100,19 @@ def _csv_update(username: str, **fields) -> None:
 
 # ── Per-account login worker ───────────────────────────────────────────────────
 
-async def _login_account(acct: dict, all_proxies: list[str], base_proxy_idx: int,
-                          proxy_pool,  # ProxyPool | None
+# How many proxies to search per login attempt to find one with a fresh exit IP.
+_IP_SEARCH_PER_ATTEMPT = 20
+
+
+async def _login_account(acct: dict, pool,  # PersistentProxyPool
                           capsolver_keys: list[str], anticaptcha_keys: list[str],
                           twocaptcha_keys: list[str], capmonster_keys: list[str],
-                          lang: str, executor: ThreadPoolExecutor) -> str:
+                          lang: str, executor: ThreadPoolExecutor,
+                          headed: bool = False) -> str:
     """
     Login flow for one verified account.
-    Returns: "active", "blocked", "error", "captcha_failed"
+    Uses PersistentProxyPool for cross-run deduplication via real exit IP.
+    Returns: "active", "unverified", "error"
     """
     username = acct["username"]
     password = acct["password"]
@@ -115,56 +120,78 @@ async def _login_account(acct: dict, all_proxies: list[str], base_proxy_idx: int
 
     import session as sess
 
+    async def _next_fresh_proxy() -> tuple[str, str] | None:
+        for _ in range(_IP_SEARCH_PER_ATTEMPT):
+            candidate = pool.advance()
+            ip = await loop.run_in_executor(
+                executor, pool.verify_and_claim, candidate, username,
+            )
+            if ip is not None:
+                return candidate, ip
+            _log(username, f"IP already used or dead on {_proxy_host(candidate)} — skipping")
+        return None
+
     for proxy_attempt in range(MAX_PROXY_RETRIES):
-        proxy = all_proxies[(base_proxy_idx + proxy_attempt) % len(all_proxies)]
+        fresh = await _next_fresh_proxy()
+        if fresh is None:
+            _log(username, "FAIL no fresh exit IPs within search budget")
+            break
+        proxy, exit_ip = fresh
         if proxy_attempt > 0:
-            _log(username, f"retry proxy_attempt={proxy_attempt}  proxy={_proxy_host(proxy)}")
+            _log(username, f"retry proxy_attempt={proxy_attempt}  exit_ip={exit_ip}")
 
-        # Get session (handles WAF challenge)
+        # Get session — browser bypasses WAF challenge; cookies land in primp client
         try:
-            s = await loop.run_in_executor(executor, sess.get_session, proxy)
+            s = await loop.run_in_executor(
+                executor, lambda _p=proxy: sess.get_session(_p, headless=not headed))
         except Exception as e:
-            _log(username, f"FAIL get_session ({_proxy_host(proxy)}): {e}")
+            _log(username, f"FAIL get_session ({exit_ip}): {e}")
             continue
 
-        # Login via browser: Playwright clicks the reCAPTCHA checkbox on AUTH_URL,
-        # gets a genuine Enterprise token, submits via jQuery $.ajax (doLogin).
-        # External solver tokens score too low for the login Enterprise threshold.
+        # Login via browser: types credentials for behavioral signals, clicks
+        # reCAPTCHA checkbox, falls back to external CapSolver token if needed.
+        solver_key = (capsolver_keys or twocaptcha_keys or capmonster_keys or [""])[0]
         try:
-            def _do_login(s=s):
-                return s.browser_login(username, password, lang=lang, timeout=60)
-            lr_dict = await loop.run_in_executor(executor, _do_login)
-            body = lr_dict.get("body", "").strip()
-            lr_status = lr_dict.get("status", 0)
-            _log(username, f"login status={lr_status}  resp={body[:150]}")
+            lr = await loop.run_in_executor(
+                executor, lambda _s=s: _s.browser_login(username, password, lang, solver_key))
+            body = lr.get("body", "").strip()
+            _log(username, f"login resp={body[:200]}")
         except Exception as e:
-            _log(username, f"FAIL login POST: {e}")
-            continue
-        finally:
-            # Close browser regardless of login outcome
+            _log(username, f"FAIL browser_login: {e}")
             try: s.close()
             except Exception: pass
+            continue
 
         try:
             resp  = json.loads(body)
             rtype = resp.get("type", "")
         except json.JSONDecodeError:
-            rtype = ""
+            _log(username, f"FAIL non-JSON response (HTML?): {body[:120]}")
+            try: s.close()
+            except Exception: pass
+            continue
 
         if rtype in ("", "200"):
-            _log(username, f"LOGIN OK  proxy={_proxy_host(proxy)}")
+            _log(username, f"LOGIN OK  exit_ip={exit_ip}")
             _csv_update(username, status="active", last_login=_now(),
                         proxy=_proxy_host(proxy))
+            if not headed:
+                try: s.close()
+                except Exception: pass
+            else:
+                _log(username, "browser left open — close the window manually when done")
             return "active"
 
+        try: s.close()
+        except Exception: pass
+
         if rtype == "secblock":
-            _log(username, f"secblock on {_proxy_host(proxy)} — trying next")
-            if proxy_pool and proxy:
-                proxy_pool.burn_today(proxy, "login:secblock")
+            _log(username, f"secblock on {exit_ip} — burning, trying next")
+            pool.burn_today(proxy, "login:secblock")
             continue
 
         if rtype == "ReCaptchaError":
-            _log(username, "CAPTCHA token rejected by server")
+            _log(username, f"CAPTCHA token rejected  exit_ip={exit_ip}")
             continue
 
         if rtype == "EmailSend":
@@ -172,13 +199,10 @@ async def _login_account(acct: dict, all_proxies: list[str], base_proxy_idx: int
             _csv_update(username, status="registered", notes="EmailSend on login")
             return "unverified"
 
-        # type=error — could be wrong creds or rate-limited proxy
-        _log(username, f"type=error on {_proxy_host(proxy)} — burning, trying next")
-        if proxy_pool and proxy:
-            proxy_pool.burn_today(proxy, "login:type=error")
+        _log(username, f"type={rtype!r} on {exit_ip} — retrying next proxy (no burn)")
         continue
 
-    _log(username, f"FAIL exhausted {MAX_PROXY_RETRIES} proxy attempts")
+    _log(username, f"FAIL exhausted {MAX_PROXY_RETRIES} login attempts")
     return "error"
 
 
@@ -188,9 +212,24 @@ async def main_async(args: argparse.Namespace,
                      capsolver_keys: list[str], anticaptcha_keys: list[str],
                      twocaptcha_keys: list[str], capmonster_keys: list[str]) -> None:
     from account_pool import AccountPool
-    from proxy_pool import ProxyPool
+    from proxy_pool import PersistentProxyPool
 
     acc_pool = AccountPool(_ACCOUNT_FILE)
+
+    # Build persistent proxy pool (cursor + used IPs persist across runs)
+    try:
+        if args.proxy_type == "soax":
+            pool = PersistentProxyPool(_SOAX_PROXY_FILE)
+        elif args.proxy_type == "isp":
+            pool = PersistentProxyPool(_ISP_PROXY_FILE)
+        elif args.proxy_type == "webshare":
+            pool = PersistentProxyPool(_WEBSHARE_PROXY_FILE)
+        else:
+            print("[batch_login] ERROR: specify --proxy-type soax|isp|webshare")
+            return
+    except Exception as e:
+        print(f"[batch_login] ERROR building proxy pool: {e}")
+        return
 
     # Pick accounts
     if args.account:
@@ -211,72 +250,27 @@ async def main_async(args: argparse.Namespace,
         print("[batch_login] No accounts to login")
         return
 
-    print(f"\n[batch_login] {len(accounts)} accounts  concurrency={args.concurrency}  proxy-type={args.proxy_type}")
-
-    # Build proxy list
-    proxy_pool_obj = None
-    if False:  # placeholder — "none" proxy type removed (datacenter IP blocked by target)
-        pass
-    elif args.proxy_type == "isp":
-        all_proxies = _load_proxies_from_file(_ISP_PROXY_FILE)
-        if not all_proxies:
-            print("[batch_login] ERROR no ISP proxies loaded")
-            return
-        try:
-            proxy_pool_obj = ProxyPool(_ISP_PROXY_FILE)
-        except Exception:
-            pass
-    elif args.proxy_type == "soax":
-        all_proxies = _load_proxies_from_file(_SOAX_PROXY_FILE)
-        if not all_proxies:
-            print("[batch_login] ERROR no SOAX proxies loaded")
-            return
-        try:
-            proxy_pool_obj = ProxyPool(_SOAX_PROXY_FILE)
-        except Exception:
-            pass
-    elif args.proxy_type == "webshare":
-        all_proxies = _load_proxies_from_file(_WEBSHARE_PROXY_FILE)
-        if not all_proxies:
-            print("[batch_login] ERROR no Webshare proxies loaded from data/proxies_webshare.txt")
-            return
-        try:
-            proxy_pool_obj = ProxyPool(_WEBSHARE_PROXY_FILE)
-        except Exception:
-            pass
-    else:
-        # Use the proxy stored in accounts.csv for each account (registration proxy)
-        all_proxies = []
-        for a in accounts:
-            p = a.get("proxy", "")
-            if p and ":" in p:
-                full = f"http://WHnPcVTJPqBz:le6VhGXHYF0UPR@{p}" if "@" not in p else p
-                all_proxies.append(full)
-        if not all_proxies:
-            print("[batch_login] ERROR no stored proxies found in accounts.csv — specify --proxy-type")
-            return
-        print(f"[batch_login] using stored per-account proxies ({len(all_proxies)} found)")
-
-    print(f"[batch_login] proxy pool: {len(all_proxies)} proxies")
+    print(f"\n[batch_login] {len(accounts)} accounts  concurrency={args.concurrency}  "
+          f"proxy-type={args.proxy_type}  pool: cursor={pool.cursor}  used={pool.used_count}/{pool.total}")
 
     if args.dry_run:
         print("\n[dry-run] Would login:")
-        for i, acct in enumerate(accounts):
-            proxy = all_proxies[i % len(all_proxies)]
-            print(f"  {acct['username']}  status={acct['status']}  proxy={_proxy_host(proxy)}")
+        for acct in accounts:
+            print(f"  {acct['username']}  status={acct['status']}")
         return
 
     sem      = asyncio.Semaphore(args.concurrency)
     executor = ThreadPoolExecutor(max_workers=args.concurrency + 4)
 
-    async def bounded(acct, base_idx):
+    async def bounded(acct):
         async with sem:
-            return await _login_account(acct, all_proxies, base_idx, proxy_pool_obj,
+            return await _login_account(acct, pool,
                                          capsolver_keys, anticaptcha_keys,
                                          twocaptcha_keys, capmonster_keys,
-                                         args.lang, executor)
+                                         args.lang, executor,
+                                         headed=args.headed)
 
-    tasks   = [bounded(acct, i % len(all_proxies)) for i, acct in enumerate(accounts)]
+    tasks   = [bounded(acct) for acct in accounts]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     counts: dict[str, int] = {}
@@ -289,6 +283,12 @@ async def main_async(args: argparse.Namespace,
     for k, v in sorted(counts.items()):
         print(f"  {k:<14}: {v}")
     print("="*50)
+
+    if args.headed:
+        try:
+            input("\n[batch_login] Browser is open — press Enter to close and exit...")
+        except (KeyboardInterrupt, EOFError):
+            pass
 
 
 def main() -> None:
@@ -313,6 +313,8 @@ def main() -> None:
                         help="Also re-login accounts already marked active")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print plan without executing")
+    parser.add_argument("--headed", action="store_true",
+                        help="Open a visible browser window (for manual inspection)")
 
     args = parser.parse_args()
 
