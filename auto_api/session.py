@@ -74,21 +74,29 @@ def _pick_fingerprint() -> tuple:
 
 
 def _get_proxy_timezone(proxy_url: str | None) -> str:
-    """Detect the proxy exit-IP's timezone via ipwho.is."""
+    """Detect the proxy exit-IP's timezone via ipwho.is. Falls back to Europe/Lisbon
+    (all configured proxies are Portuguese ISP/SOAX-PT)."""
+    _DEFAULT = "Europe/Lisbon"
     if not proxy_url:
-        return "America/New_York"
-    try:
-        import primp
-        client = primp.Client(impersonate=IMPERSONATE, proxy=proxy_url,
-                              follow_redirects=True, verify=False, timeout=8)
-        r = client.get("https://ipwho.is/json/")
-        data = r.json()
-        tz = data.get("timezone", {})
-        if isinstance(tz, dict):
-            return tz.get("id", "America/New_York")
-        return str(tz) or "America/New_York"
-    except Exception:
-        return "America/New_York"
+        return _DEFAULT
+    for svc in ("https://ipwho.is/json/", "https://ipapi.co/json/"):
+        try:
+            import primp
+            client = primp.Client(impersonate=IMPERSONATE, proxy=proxy_url,
+                                  follow_redirects=True, verify=False, timeout=8)
+            r = client.get(svc)
+            data = r.json()
+            tz = data.get("timezone", {})
+            if isinstance(tz, dict):
+                tz = tz.get("id", "")
+            tz = str(tz).strip()
+            if tz and "/" in tz:
+                print(f"[session] tz lookup OK: {tz}")
+                return tz
+        except Exception as _e:
+            pass
+    print(f"[session] tz lookup failed — using {_DEFAULT}")
+    return _DEFAULT
 
 
 BASE     = "https://pedidodevistos.mne.gov.pt"
@@ -129,20 +137,97 @@ HEADERS_XHR = {
 
 
 def _make_stealth_script(vp_w: int, vp_h: int) -> str:
+    import random as _r
+    # Per-session random noise values (makes canvas/WebGL fingerprint unique)
+    _noise = _r.randint(1, 9)
+    _gl_vendor  = _r.choice(["Intel Inc.", "NVIDIA Corporation", "AMD"])
+    _gl_renderer = _r.choice([
+        "Intel Iris OpenGL Engine",
+        "ANGLE (Intel, Intel(R) UHD Graphics Direct3D11 vs_5_0 ps_5_0)",
+        "ANGLE (NVIDIA, NVIDIA GeForce GTX 1060 Direct3D11 vs_5_0 ps_5_0)",
+    ])
     return f"""
+// Hide automation signals
 Object.defineProperty(navigator,'webdriver',{{get:()=>undefined}});
+delete navigator.__proto__.webdriver;
+
+// Fake chrome object (real Chrome has this)
 window.chrome={{runtime:{{}},loadTimes:function(){{}},csi:function(){{}},app:{{}}}};
-Object.defineProperty(navigator,'plugins',{{get:()=>[
-  {{name:'Chrome PDF Plugin'}},{{name:'Chrome PDF Viewer'}},{{name:'Native Client'}}
-]}});
-Object.defineProperty(navigator,'languages',{{get:()=>['en-US','en']}});
+
+// Realistic plugin list
+Object.defineProperty(navigator,'plugins',{{get:()=>{{
+  const p=[
+    {{name:'Chrome PDF Plugin',filename:'internal-pdf-viewer',description:'Portable Document Format'}},
+    {{name:'Chrome PDF Viewer',filename:'mhjfbmdgcfjbbpaeojofohoefgiehjai',description:''}},
+    {{name:'Native Client',filename:'internal-nacl-plugin',description:''}}
+  ];
+  p.__proto__=PluginArray.prototype;
+  return p;
+}}}});
+
+// Languages
+Object.defineProperty(navigator,'languages',{{get:()=>['pt-PT','pt','en-US','en']}});
+
+// Permissions API patch
 const _origQuery=window.navigator.permissions.query;
 window.navigator.permissions.query=(p)=>p.name==='notifications'
   ?Promise.resolve({{state:'denied'}}):_origQuery(p);
+
+// Hardware / screen
 Object.defineProperty(navigator,'hardwareConcurrency',{{get:()=>4}});
+Object.defineProperty(navigator,'deviceMemory',{{get:()=>8}});
 Object.defineProperty(screen,'colorDepth',{{get:()=>24}});
 Object.defineProperty(screen,'width',{{get:()=>{vp_w}}});
 Object.defineProperty(screen,'height',{{get:()=>{vp_h}}});
+
+// Canvas fingerprint randomization (unique per session — prevents fingerprint tracking)
+(function(){{
+  const _noise = {_noise};
+  const _oTDU = HTMLCanvasElement.prototype.toDataURL;
+  HTMLCanvasElement.prototype.toDataURL = function(t,...a){{
+    const ctx = this.getContext('2d');
+    if(ctx && (t==='image/png'||!t)){{
+      const w=this.width||300,h=this.height||150;
+      if(w>0&&h>0){{
+        ctx.fillStyle='rgba(255,255,255,0.0'+_noise+')';
+        ctx.fillRect(0,0,1,1);
+      }}
+    }}
+    return _oTDU.apply(this,[t,...a]);
+  }};
+  const _oGetCtx = HTMLCanvasElement.prototype.getContext;
+  HTMLCanvasElement.prototype.getContext = function(t,...a){{
+    const ctx = _oGetCtx.apply(this,[t,...a]);
+    if(ctx&&t==='2d'){{
+      const _oFT=ctx.fillText.bind(ctx);
+      ctx.fillText=function(tx,x,y,...rest){{
+        ctx.save();
+        ctx.shadowColor='rgba('+_noise+','+_noise+','+_noise+',0.01)';
+        _oFT(tx,x,y,...rest);
+        ctx.restore();
+      }};
+    }}
+    return ctx;
+  }};
+}})();
+
+// WebGL fingerprint (vendor/renderer)
+(function(){{
+  const _oGPA = WebGLRenderingContext.prototype.getParameter;
+  WebGLRenderingContext.prototype.getParameter = function(p){{
+    if(p===37445) return '{_gl_vendor}';
+    if(p===37446) return '{_gl_renderer}';
+    return _oGPA.call(this,p);
+  }};
+  if(window.WebGL2RenderingContext){{
+    const _oGPA2 = WebGL2RenderingContext.prototype.getParameter;
+    WebGL2RenderingContext.prototype.getParameter = function(p){{
+      if(p===37445) return '{_gl_vendor}';
+      if(p===37446) return '{_gl_renderer}';
+      return _oGPA2.call(this,p);
+    }};
+  }}
+}})();
 """
 
 
@@ -179,6 +264,7 @@ class PlaywrightSession:
     _CMD_VERIFY = "verify"
     _CMD_FETCH  = "fetch"
     _CMD_LOGIN  = "login"
+    _CMD_EVAL   = "eval"
     _CMD_CLOSE  = "close"
 
     def __init__(self, proxy: str | None, inject_cookies: dict | None = None,
@@ -329,6 +415,13 @@ class PlaywrightSession:
                     except Exception as exc:
                         self._res_q.put(("err", str(exc)))
 
+                elif cmd.get("action") == self._CMD_EVAL:
+                    try:
+                        result = page.evaluate(cmd["js"])
+                        self._res_q.put(("ok", result))
+                    except Exception as exc:
+                        self._res_q.put(("err", str(exc)))
+
         except Exception as exc:
             self._error = exc
             self._ready.set()
@@ -423,6 +516,140 @@ class PlaywrightSession:
               f"status={result.get('status')}  body={body[:80]}")
         return {"status": result.get("status", 0), "body": body}
 
+    def _solve_audio_challenge(self, page, twocaptcha_key: str) -> str:
+        """
+        When a reCAPTCHA image challenge is showing, switch to audio challenge,
+        download the audio file, send to 2captcha audio endpoint, type the
+        transcription, and submit. Returns the reCAPTCHA token on success or "".
+        Token from real browser challenge interaction scores higher than injected tokens.
+        """
+        print(f"[session] audio_challenge: attempting")
+        try:
+            ch_frame = page.frame_locator(
+                'iframe[title*="recaptcha challenge"], iframe[src*="bframe"]'
+            ).first
+
+            # Click audio button
+            audio_btn = ch_frame.locator("#recaptcha-audio-button")
+            if not audio_btn.is_visible(timeout=5000):
+                print(f"[session] audio_challenge: audio button not visible")
+                return ""
+            audio_btn.click()
+            page.wait_for_timeout(2000)
+
+            # Check for "too many requests" error
+            try:
+                err_vis = ch_frame.locator(".rc-doscaptcha-body").is_visible(timeout=1000)
+                if err_vis:
+                    print(f"[session] audio_challenge: too-many-requests error")
+                    return ""
+            except Exception:
+                pass
+
+            # Get audio source URL
+            audio_src = ""
+            for sel in [
+                "audio.rc-audiochallenge-audio-src",
+                ".rc-audiochallenge-tdownload-link",
+                "audio[src]",
+            ]:
+                try:
+                    el = ch_frame.locator(sel).first
+                    if el.count() > 0:
+                        audio_src = el.get_attribute("src", timeout=3000) or \
+                                    el.get_attribute("href", timeout=3000) or ""
+                        if audio_src:
+                            break
+                except Exception:
+                    pass
+
+            if not audio_src:
+                print(f"[session] audio_challenge: no audio source found")
+                return ""
+            print(f"[session] audio_challenge: audio_src={audio_src[:80]}")
+
+            # Download audio via proxy
+            import primp as _primp
+            audio_client = _primp.Client(proxy=self.proxy, verify=False,
+                                         follow_redirects=True, timeout=20)
+            r = audio_client.get(audio_src)
+            audio_bytes = r.content
+            if not audio_bytes:
+                print(f"[session] audio_challenge: empty audio response")
+                return ""
+            print(f"[session] audio_challenge: downloaded {len(audio_bytes)} bytes")
+
+            # Submit to 2captcha audio solver
+            if not twocaptcha_key:
+                print(f"[session] audio_challenge: no 2captcha key — cannot solve audio")
+                return ""
+            import base64, requests as _req
+            audio_b64 = base64.b64encode(audio_bytes).decode()
+            submit_r = _req.post(
+                "https://2captcha.com/in.php",
+                data={"key": twocaptcha_key, "method": "audio",
+                      "lang": "en", "body": audio_b64},
+                timeout=30,
+            )
+            submit_text = submit_r.text.strip()
+            if not submit_text.startswith("OK|"):
+                print(f"[session] audio_challenge: submit error: {submit_text}")
+                return ""
+            task_id = submit_text.split("|", 1)[1]
+            print(f"[session] audio_challenge: task_id={task_id}")
+
+            # Poll for result
+            transcription = ""
+            for poll in range(30):
+                time.sleep(5)
+                poll_r = _req.get(
+                    f"https://2captcha.com/res.php?key={twocaptcha_key}"
+                    f"&action=get&id={task_id}",
+                    timeout=15,
+                )
+                pt = poll_r.text.strip()
+                if pt == "CAPCHA_NOT_READY":
+                    continue
+                if pt.startswith("OK|"):
+                    transcription = pt.split("|", 1)[1].strip().lower()
+                    print(f"[session] audio_challenge: transcription={transcription!r}")
+                    break
+                print(f"[session] audio_challenge: poll error: {pt}")
+                return ""
+
+            if not transcription:
+                print(f"[session] audio_challenge: timed out waiting for transcription")
+                return ""
+
+            # Type transcription into audio input field and click verify
+            audio_input = ch_frame.locator("#audio-response")
+            audio_input.fill(transcription, timeout=5000)
+            page.wait_for_timeout(500)
+            verify_btn = ch_frame.locator("#recaptcha-verify-button")
+            verify_btn.click(timeout=5000)
+            page.wait_for_timeout(3000)
+
+            # Check if token was generated (challenge solved)
+            token = ""
+            for _ in range(15):
+                try:
+                    token = page.evaluate("grecaptcha.enterprise.getResponse()") or ""
+                    if token:
+                        break
+                except Exception:
+                    pass
+                page.wait_for_timeout(1000)
+
+            if token:
+                print(f"[session] audio_challenge: token obtained  len={len(token)}")
+            else:
+                print(f"[session] audio_challenge: no token after verify (wrong answer?)")
+            return token
+
+        except Exception as e:
+            print(f"[session] audio_challenge: error: {e}")
+            return ""
+
     def _do_browser_login(self, page, cmd: dict) -> dict:
         """
         Navigate fresh to AUTH_URL, type credentials to build reCAPTCHA behavioral
@@ -435,11 +662,72 @@ class PlaywrightSession:
         lang       = cmd.get("lang", "PT")
         solver_key = cmd.get("solver_key", "")
 
-        # Fresh navigation — don't rely on stale page from session init
-        print(f"[session] browser_login: nav -> AUTH_URL  user={username}")
-        page.goto(AUTH_URL, timeout=25000)
-        page.wait_for_load_state("networkidle", timeout=15000)
-        time.sleep(random.uniform(1.2, 2.0))
+        # Navigate to auth page — reuse existing page if already there (avoids WAF retrigger),
+        # otherwise go HOME_URL → AUTH_URL to match session init pattern.
+        try:
+            cur_url = page.url
+        except Exception:
+            cur_url = ""
+        already_on_auth = AUTH_URL in cur_url or cur_url.endswith("/Authentication.jsp")
+        # Check if form is clean and usable: username input present AND no challenge overlay
+        form_ready = False
+        if already_on_auth:
+            try:
+                form_ready = page.locator('input[name="username"]').count() > 0
+            except Exception:
+                pass
+            if form_ready:
+                try:
+                    # Challenge iframe overlay blocks field clicks — must navigate fresh
+                    ch_vis = page.locator(
+                        'iframe[title*="recaptcha challenge"], iframe[src*="bframe"]'
+                    ).is_visible(timeout=500)
+                    if ch_vis:
+                        form_ready = False
+                        print(f"[session] browser_login: challenge overlay visible — navigating fresh")
+                except Exception:
+                    pass
+        if form_ready:
+            print(f"[session] browser_login: reusing existing AUTH_URL page  user={username}")
+            time.sleep(random.uniform(0.5, 1.0))
+        else:
+            print(f"[session] browser_login: nav HOME_URL -> AUTH_URL  user={username}")
+            page.goto(HOME_URL, timeout=30000)
+            page.wait_for_load_state("networkidle", timeout=15000)
+            page.goto(AUTH_URL, timeout=25000)
+            page.wait_for_load_state("networkidle", timeout=15000)
+            time.sleep(random.uniform(1.2, 2.0))
+
+        # Debug: dump reCAPTCHA widget configuration to confirm action name
+        try:
+            rc_info = page.evaluate("""
+            () => {
+                const info = {};
+                // data-action attributes on reCAPTCHA widget divs
+                const divs = document.querySelectorAll('[data-sitekey],[data-action],[class*="recaptcha"]');
+                info.widgets = Array.from(divs).map(el => ({
+                    tag: el.tagName, id: el.id,
+                    dataAction: el.getAttribute('data-action'),
+                    dataSitekey: el.getAttribute('data-sitekey') ? el.getAttribute('data-sitekey').slice(0,12)+'...' : null,
+                    dataCallback: el.getAttribute('data-callback'),
+                }));
+                // Look for grecaptcha render args in script content
+                const scripts = Array.from(document.querySelectorAll('script:not([src])'));
+                const hits = [];
+                for (const s of scripts) {
+                    const t = s.textContent;
+                    const m = t.match(/action\\s*[:=]\\s*['"]([^'"]{1,40})['"]/g);
+                    if (m) hits.push(...m);
+                    const m2 = t.match(/grecaptcha[^;]{0,120}/g);
+                    if (m2) hits.push(...m2.slice(0,5));
+                }
+                info.scriptHits = hits.slice(0, 20);
+                return info;
+            }
+            """)
+            print(f"[session] rcaptcha_info: {_json.dumps(rc_info)[:600]}")
+        except Exception as e:
+            print(f"[session] rcaptcha_info error: {e}")
 
         # Type credentials into form fields — keystrokes build reCAPTCHA Enterprise
         # behavioral score (same pattern that makes registration CAPTCHA pass).
@@ -518,28 +806,23 @@ class PlaywrightSession:
             except Exception:
                 pass
 
-        # Fallback: inject external CapSolver token when challenged or no auto-solve
-        if not token and solver_key:
-            print(f"[session] no auto-solve token — requesting external CapSolver token")
-            try:
-                token = _capsolver_token_sync(
-                    solver_key,
-                    sitekey="6LdOB9crAAAAADT4RFruc5sPmzLKIgvJVfL830d4",
-                    page_url=AUTH_URL,
-                    proxy=self.proxy,
-                )
-                if token:
-                    # Inject into page so doLogin picks it up
-                    tok_js = _json.dumps(token)
-                    page.evaluate(
-                        f"document.getElementById('g-recaptcha-response').value = {tok_js};"
-                        f"window._injected_token = {tok_js};"
-                    )
-                    print(f"[session] external token injected  len={len(token)}")
-            except Exception as e:
-                print(f"[session] external CapSolver failed: {e}")
+        # Primary fallback: solve audio challenge in the real browser.
+        # Audio challenge produces a token from actual browser/IP interaction, scoring
+        # higher than external solver tokens for enterprise endpoints.
+        if not token and challenge_detected:
+            token = self._solve_audio_challenge(page, cmd.get("twocaptcha_key", ""))
 
-        # Last-resort: hidden input value
+        # Last-resort: inject external solver token (lower quality, may score too low)
+        if not token and solver_key:
+            print(f"[session] no audio token — requesting external solver token")
+            try:
+                import solver as _solver
+                token = _solver.solve("capsolver", [solver_key], "LOGIN_EVISA", proxy=self.proxy)
+                print(f"[session] external token obtained  len={len(token)}")
+            except Exception as e:
+                print(f"[session] external solver failed: {e}")
+
+        # Last-resort: read injected textarea value
         if not token:
             try:
                 token = page.evaluate("document.getElementById('g-recaptcha-response').value") or ""
@@ -552,58 +835,188 @@ class PlaywrightSession:
                 f"reCAPTCHA: no token after all attempts (challenge_detected={challenge_detected})"
             )
 
-        # Intercept the raw /login response via Playwright before jQuery can transform it
-        _login_raw: dict = {}
+        tok_js = _json.dumps(token)
 
-        def _on_response(resp):
-            try:
-                if "/VistosOnline/login" in resp.url and resp.request.method == "POST":
-                    raw = resp.body()
-                    ct  = resp.headers.get("content-type", "")
-                    _login_raw["status"] = resp.status
-                    _login_raw["body"]   = raw.decode("utf-8", errors="replace")
-                    _login_raw["ct"]     = ct
-                    print(f"[session] raw_login_resp: status={resp.status}  ct={ct!r}  body={_login_raw['body']!r}")
-            except Exception as ex:
-                print(f"[session] raw_login_resp capture error: {ex}")
+        # Set the reCAPTCHA textarea value (makes getResponse() return token)
+        page.evaluate(f"""
+        (() => {{
+            const _tok = {tok_js};
+            for (const sel of ['#g-recaptcha-response-1', '#g-recaptcha-response']) {{
+                const ta = document.querySelector(sel);
+                if (!ta) continue;
+                const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+                if (setter) setter.call(ta, _tok); else ta.value = _tok;
+                ta.dispatchEvent(new Event('input',  {{bubbles: true}}));
+                ta.dispatchEvent(new Event('change', {{bubbles: true}}));
+            }}
+        }})()
+        """)
+        print(f"[session] token set in textarea")
 
-        page.on("response", _on_response)
+        # Override grecaptcha.enterprise.getResponse so doLogin() reads our token.
+        # The internal reCAPTCHA widget state is separate from the textarea DOM value;
+        # getResponse() reads widget state, not the textarea. Without this override
+        # doLogin() sends an empty captchaResponse and the server returns type:error.
+        page.evaluate(f"""
+        (() => {{
+            const _tok = {tok_js};
+            const _patch = (obj) => {{
+                if (!obj) return;
+                const _orig = obj.getResponse;
+                obj.getResponse = function(opt_widget_id) {{
+                    const r = _orig ? _orig.call(this, opt_widget_id) : '';
+                    return r || _tok;
+                }};
+            }};
+            if (window.grecaptcha) {{
+                _patch(window.grecaptcha);
+                if (window.grecaptcha.enterprise) _patch(window.grecaptcha.enterprise);
+            }}
+        }})()
+        """)
+        print(f"[session] grecaptcha.getResponse patched to return injected token")
 
-        # Submit via fetch() from the browser context
-        username_js = _json.dumps(username)
-        password_js = _json.dumps(password)
-        lang_js     = _json.dumps(lang)
-        token_js    = _json.dumps(token)
-
-        js = f"""
-        async () => {{
-            const resp = await fetch('/VistosOnline/login', {{
-                method: 'POST',
-                headers: {{
-                    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                    'X-Requested-With': 'XMLHttpRequest',
-                    'Accept': '*/*',
-                }},
-                body: new URLSearchParams({{
-                    username: {username_js},
-                    password: {password_js},
-                    language: {lang_js},
-                    rgpd: 'Y',
-                    captchaResponse: {token_js},
-                }}).toString(),
-            }});
-            const text = await resp.text();
-            const ct   = resp.headers.get('content-type') || '';
-            return {{ status: resp.status, body: text, ct: ct }};
-        }}
+        # Use page.expect_response() — the Playwright-native way to wait for a network
+        # response. Unlike time.sleep() loops with page.on("response") callbacks,
+        # expect_response() properly integrates with Playwright's event loop and handles
+        # slow responses (large WAF HTML bodies, slow server processing) correctly.
+        _CONSENT_JS = f"""
+        (() => {{
+            const results = [];
+            for (let i = 1; i <= 2; i++) {{
+                const cb = document.getElementById('loginCheckbox' + i);
+                if (cb && !cb.checked) {{
+                    cb.checked = true;
+                    cb.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    cb.dispatchEvent(new Event('click',  {{bubbles: true}}));
+                    results.push('checked:loginCheckbox' + i);
+                }}
+            }}
+            const cb3 = document.getElementById('loginCheckbox3');
+            if (cb3 && cb3.checked) {{
+                cb3.checked = false;
+                cb3.dispatchEvent(new Event('change', {{bubbles: true}}));
+                results.push('unchecked:loginCheckbox3');
+            }}
+            const btn = document.getElementById('loginFormSubmitButton')
+                      || document.getElementById('loginSubmit');
+            if (btn) {{
+                btn.click();
+                results.push('clicked:' + btn.id);
+            }} else {{
+                results.push('no-submit-btn');
+            }}
+            return results;
+        }})()
         """
-        result = page.evaluate(js)
-        page.remove_listener("response", _on_response)
+        _CALLBACK_JS = f"""
+        (() => {{
+            const tok = {tok_js};
+            const fired = [];
+            const widgets = document.querySelectorAll('[data-callback]');
+            for (const w of widgets) {{
+                const cbName = w.getAttribute('data-callback');
+                if (cbName && typeof window[cbName] === 'function') {{
+                    try {{ window[cbName](tok); fired.push('data-callback:' + cbName); }}
+                    catch(e) {{ fired.push('err:' + cbName + ':' + e.message); }}
+                }}
+            }}
+            if (!fired.length && typeof window.onCaptchaSuccess === 'function') {{
+                try {{ window.onCaptchaSuccess(tok); fired.push('onCaptchaSuccess'); }}
+                catch(e) {{ fired.push('err:onCaptchaSuccess:' + e.message); }}
+            }}
+            return fired;
+        }})()
+        """
 
-        body = result.get("body", "")
-        ct   = result.get("ct", "")
-        print(f"[session] browser_login: status={result.get('status')}  ct={ct!r}  body={body!r}")
-        return {"status": result.get("status", 0), "body": body}
+        # Debug: log all requests during login attempt
+        def _dbg_request(req):
+            try:
+                if "VistosOnline" in req.url or "login" in req.url.lower():
+                    print(f"[session] REQ {req.method} {req.url[:80]}")
+            except Exception:
+                pass
+
+        page.on("request", _dbg_request)
+
+        login_result: dict = {}
+        try:
+            with page.expect_response(
+                lambda r: "/VistosOnline/login" in r.url and r.request.method == "POST",
+                timeout=90000,
+            ) as resp_info:
+                # Fire the CAPTCHA callback — shows consent popup or fires AJAX directly
+                cb_result = page.evaluate(_CALLBACK_JS)
+                print(f"[session] recaptcha callback fired: {cb_result}")
+
+                # Wait for popup to render, then check via computed style
+                # (is_visible() returns False when the popup is covered by the image
+                # challenge overlay, even though display:block — use JS instead)
+                page.wait_for_timeout(3000)
+                popup_vis = False
+                for _attempt in range(4):
+                    try:
+                        popup_display = page.evaluate(
+                            "() => { const el = document.getElementById('consintoPopup');"
+                            " return el ? getComputedStyle(el).display : 'not-found'; }"
+                        )
+                        popup_vis = popup_display not in ("none", "not-found", "")
+                    except Exception:
+                        popup_vis = False
+                    if popup_vis:
+                        print(f"[session] consent popup display={popup_display!r}")
+                        break
+                    if _attempt < 3:
+                        page.wait_for_timeout(1000)
+
+                if popup_vis:
+                    clicked = page.evaluate(_CONSENT_JS)
+                    print(f"[session] consent+click: {clicked}")
+                else:
+                    # Debug: log what's on the page after callback
+                    try:
+                        pg_state = page.evaluate("""
+                        () => ({
+                            url: location.href,
+                            consintoPopup: document.getElementById('consintoPopup')
+                                ? getComputedStyle(document.getElementById('consintoPopup')).display
+                                : 'not-found',
+                            loginMsg: document.getElementById('loginMsg')
+                                ? getComputedStyle(document.getElementById('loginMsg')).display
+                                : 'not-found',
+                        })
+                        """)
+                        print(f"[session] page state after callback: {pg_state}")
+                    except Exception:
+                        pass
+                    print(f"[session] no consent popup — waiting for direct AJAX")
+
+            resp = resp_info.value
+            try:
+                post_data = resp.request.post_data or ""
+                cap_val = next(
+                    (p[16:36] + "..." for p in post_data.split("&") if p.startswith("captchaResponse=")),
+                    ""
+                )
+                print(f"[session] /login POST: status={resp.status}  captchaResponse={cap_val!r}")
+            except Exception:
+                print(f"[session] /login POST: status={resp.status}")
+            body = resp.body().decode("utf-8", errors="replace")
+            print(f"[session] /login body: {body[:120]!r}")
+            login_result = {"status": resp.status, "body": body}
+
+        except Exception as e:
+            print(f"[session] expect_response failed: {e}")
+        finally:
+            try:
+                page.remove_listener("request", _dbg_request)
+            except Exception:
+                pass
+
+        if login_result.get("body"):
+            return login_result
+
+        return {"status": 0, "body": ""}
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -655,19 +1068,21 @@ class PlaywrightSession:
         return result
 
     def browser_login(self, username: str, password: str, lang: str = "PT",
-                      solver_key: str = "", timeout: int = 240) -> dict:
+                      solver_key: str = "", twocaptcha_key: str = "",
+                      timeout: int = 300) -> dict:
         """
         Type credentials into the login form to build behavioral signals, click the
-        reCAPTCHA checkbox, and submit. Falls back to an external CapSolver token if
-        the image challenge appears or auto-solve fails.
+        reCAPTCHA checkbox, and submit. Tries audio challenge first (higher score),
+        then falls back to external CapSolver token.
         Returns {"status": int, "body": str}.
         """
         self._cmd_q.put({
-            "action":     self._CMD_LOGIN,
-            "username":   username,
-            "password":   password,
-            "lang":       lang,
-            "solver_key": solver_key,
+            "action":         self._CMD_LOGIN,
+            "username":       username,
+            "password":       password,
+            "lang":           lang,
+            "solver_key":     solver_key,
+            "twocaptcha_key": twocaptcha_key,
         })
         try:
             status, result = self._res_q.get(timeout=timeout)
@@ -675,6 +1090,17 @@ class PlaywrightSession:
             raise RuntimeError(f"browser_login timed out after {timeout}s")
         if status == "err":
             raise RuntimeError(f"browser_login failed: {result}")
+        return result
+
+    def browser_eval(self, js: str, timeout: int = 30):
+        """Execute arbitrary JS in the live browser page and return the result."""
+        self._cmd_q.put({"action": self._CMD_EVAL, "js": js})
+        try:
+            status, result = self._res_q.get(timeout=timeout)
+        except queue.Empty:
+            raise RuntimeError(f"browser_eval timed out after {timeout}s")
+        if status == "err":
+            raise RuntimeError(f"browser_eval failed: {result}")
         return result
 
     def verify_email(self, token_url: str, insert_jsp: str, verify_url: str,
@@ -722,11 +1148,17 @@ class PlaywrightSession:
 # ── External CAPTCHA solver (synchronous, for browser fallback) ───────────────
 
 def _capsolver_token_sync(api_key: str, sitekey: str, page_url: str,
-                          proxy: str | None = None, timeout: int = 120) -> str:
+                          proxy: str | None = None, timeout: int = 120,
+                          cookies: str | None = None,
+                          user_agent: str | None = None) -> str:
     """
     Call CapSolver to solve a reCAPTCHA v2 Enterprise checkbox in the background.
     Uses ReCaptchaV2EnterpriseTask (proxy-aware) or ProxyLess variant.
     Returns the gRecaptchaResponse token string, or raises on failure.
+
+    cookies: browser cookie header string (e.g. "Vistos_sid=abc; cookiesession1=xyz").
+             Passed to CapSolver so the token is generated inside the same server
+             session — the Enterprise reCAPTCHA token will carry the session signals.
     """
     import urllib.request as _req
     import json as _j
@@ -749,6 +1181,10 @@ def _capsolver_token_sync(api_key: str, sitekey: str, page_url: str,
                 task["proxyPassword"] = unquote(p.password or "")
         except Exception:
             pass
+    if cookies:
+        task["cookies"] = cookies
+    if user_agent:
+        task["userAgent"] = user_agent
 
     def _post(url: str, body: dict) -> dict:
         data = _j.dumps(body).encode()

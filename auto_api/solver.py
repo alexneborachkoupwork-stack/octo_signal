@@ -186,13 +186,6 @@ def solve(service: str, keys: list[str], action: str = "LOGIN_EVISA",
 
 # ── CapSolver ─────────────────────────────────────────────────────────────────
 
-def _cookies_str(session_cookies: dict | None) -> str | None:
-    """Format primp cookie dict as 'key=val; key=val' for solver APIs."""
-    if not session_cookies:
-        return None
-    return "; ".join(f"{k}={v}" for k, v in session_cookies.items())
-
-
 def _capsolver(api_key: str, action: str, proxy_info: dict | None,
                session_cookies: dict | None = None) -> str:
     if action in _V3_ACTIONS:
@@ -211,9 +204,6 @@ def _capsolver(api_key: str, action: str, proxy_info: dict | None,
         task["type"] = "ReCaptchaV2EnterpriseTask" if proxy_info else "ReCaptchaV2EnterpriseTaskProxyLess"
     if proxy_info:
         task.update(proxy_info)
-    cookies_str = _cookies_str(session_cookies)
-    if cookies_str:
-        task["cookies"] = cookies_str
 
     r = requests.post("https://api.capsolver.com/createTask", json={
         "clientKey": api_key,
@@ -256,9 +246,6 @@ def _anticaptcha(api_key: str, action: str, proxy_info: dict | None,
     if proxy_info:
         task.update(proxy_info)
     task["userAgent"] = _AC_USER_AGENT
-    cookies_str = _cookies_str(session_cookies)
-    if cookies_str:
-        task["cookies"] = cookies_str
 
     r = requests.post("https://api.anti-captcha.com/createTask", json={
         "clientKey": api_key,
@@ -295,9 +282,6 @@ def _twocaptcha(api_key: str, action: str, proxy_info: dict | None,
         task["type"] = "RecaptchaV2EnterpriseTask" if proxy_info else "RecaptchaV2EnterpriseTaskProxyless"
     if proxy_info:
         task.update(proxy_info)
-    cookies_str = _cookies_str(session_cookies)
-    if cookies_str:
-        task["cookies"] = cookies_str
 
     r = requests.post("https://api.2captcha.com/createTask", json={
         "clientKey": api_key,
@@ -332,9 +316,6 @@ def _capmonster(api_key: str, action: str, proxy_info: dict | None,
         task["type"] = "RecaptchaV2EnterpriseTask" if proxy_info else "RecaptchaV2EnterpriseTaskProxyless"
     if proxy_info:
         task.update(proxy_info)
-    cookies_str = _cookies_str(session_cookies)
-    if cookies_str:
-        task["cookies"] = cookies_str
 
     r = requests.post("https://api.capmonster.cloud/createTask", json={
         "clientKey": api_key,

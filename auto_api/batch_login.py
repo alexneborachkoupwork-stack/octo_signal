@@ -14,7 +14,9 @@ Usage:
 
 import argparse
 import asyncio
+import hashlib
 import json
+import re
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -24,6 +26,18 @@ from pathlib import Path
 BASE       = "https://pedidodevistos.mne.gov.pt"
 LOGIN_URL  = BASE + "/VistosOnline/login"
 AUTH_URL   = BASE + "/VistosOnline/Authentication.jsp"
+WAF_VERIFY = BASE + "/ch/v"
+
+HEADERS_XHR = {
+    "Accept":           "*/*",
+    "Content-Type":     "application/x-www-form-urlencoded; charset=UTF-8",
+    "X-Requested-With": "XMLHttpRequest",
+    "Origin":           BASE,
+    "Referer":          AUTH_URL,
+    "Sec-Fetch-Dest":   "empty",
+    "Sec-Fetch-Mode":   "cors",
+    "Sec-Fetch-Site":   "same-origin",
+}
 
 _ENV_FILE        = Path(__file__).parent / ".env"
 _ACCOUNT_FILE    = Path(__file__).parent / "data" / "accounts.csv"
@@ -31,10 +45,92 @@ _ISP_PROXY_FILE      = Path(__file__).parent / "data" / "proxies_isp.txt"
 _SOAX_PROXY_FILE     = Path(__file__).parent / "data" / "proxies_soax.txt"
 _WEBSHARE_PROXY_FILE = Path(__file__).parent / "data" / "proxies_webshare.txt"
 
-MAX_PROXY_RETRIES = 15
 
 _csv_lock   = threading.Lock()
 _print_lock = threading.Lock()
+
+
+# ── WAF PoW bypass ────────────────────────────────────────────────────────────
+
+def _is_waf_challenge(text: str) -> bool:
+    return "/ch/bd.js" in text
+
+
+def _parse_waf_challenge(html: str) -> dict | None:
+    """Extract nonce/token/difficulty from the WAF challenge HTML."""
+    m = re.search(
+        r'"nonce"\s*:\s*"([a-f0-9]+)"[^}]*"token"\s*:\s*"([a-f0-9]+)"[^}]*"difficulty"\s*:\s*(\d+)',
+        html, re.DOTALL,
+    )
+    if not m:
+        m = re.search(
+            r'"difficulty"\s*:\s*(\d+)[^}]*"token"\s*:\s*"([a-f0-9]+)"[^}]*"nonce"\s*:\s*"([a-f0-9]+)"',
+            html, re.DOTALL,
+        )
+        if not m:
+            return None
+        return {"difficulty": int(m.group(1)), "token": m.group(2), "nonce": m.group(3)}
+    return {"nonce": m.group(1), "token": m.group(2), "difficulty": int(m.group(3))}
+
+
+def _solve_pow(nonce: str, token: str, difficulty: int) -> str:
+    """Brute-force SHA256 PoW: find p s.t. sha256(nonce+token+p).startswith('0'*difficulty)."""
+    prefix = "0" * difficulty
+    p = 0
+    base = (nonce + token).encode()
+    while True:
+        candidate = base + str(p).encode()
+        if hashlib.sha256(candidate).hexdigest().startswith(prefix):
+            return str(p)
+        p += 1
+
+
+def _waf_bypass(session, html: str, label: str) -> bool:
+    """
+    Parse WAF challenge from html, solve PoW, POST solution to /ch/v via the
+    browser context (same connection as the challenge was received on).
+    Returns True if server accepted the proof.
+    """
+    challenge = _parse_waf_challenge(html)
+    if not challenge:
+        print(f"[waf] {label}: could not parse challenge params")
+        return False
+
+    nonce, token, difficulty = challenge["nonce"], challenge["token"], challenge["difficulty"]
+    print(f"[waf] {label}: solving PoW difficulty={difficulty} nonce={nonce[:8]}...")
+    proof = _solve_pow(nonce, token, difficulty)
+    print(f"[waf] {label}: proof={proof} — submitting via browser fetch")
+
+    signals = {"eval_length": {"triggered": False, "confidence": 0},
+               "product_sub": {"triggered": False, "confidence": 0}}
+
+    waf_js = f"""
+    async () => {{
+        const r = await fetch('/ch/v', {{
+            method: 'POST',
+            headers: {{
+                'Content-Type': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+                'Origin': '{BASE}',
+            }},
+            body: JSON.stringify({{
+                nonce:   {json.dumps(nonce)},
+                token:   {json.dumps(token)},
+                proof:   {json.dumps(proof)},
+                signals: {json.dumps(signals)},
+            }}),
+        }});
+        return {{ status: r.status, ok: r.ok }};
+    }}
+    """
+    try:
+        result = session.browser_eval(waf_js, timeout=30)
+        ok = result.get("ok", False)
+        print(f"[waf] {label}: /ch/v status={result.get('status')}  ok={ok}")
+        return ok
+    except Exception as e:
+        print(f"[waf] {label}: /ch/v browser_eval error: {e}")
+        return False
 
 
 
@@ -100,109 +196,161 @@ def _csv_update(username: str, **fields) -> None:
 
 # ── Per-account login worker ───────────────────────────────────────────────────
 
-# How many proxies to search per login attempt to find one with a fresh exit IP.
-_IP_SEARCH_PER_ATTEMPT = 20
+# How many proxies to search to find one with a fresh exit IP.
+_IP_SEARCH_LIMIT = 20
 
 
 async def _login_account(acct: dict, pool,  # PersistentProxyPool
                           capsolver_keys: list[str], anticaptcha_keys: list[str],
                           twocaptcha_keys: list[str], capmonster_keys: list[str],
                           lang: str, executor: ThreadPoolExecutor,
+                          stop_event: asyncio.Event,
                           headed: bool = False) -> str:
     """
-    Login flow for one verified account.
-    Uses PersistentProxyPool for cross-run deduplication via real exit IP.
+    Login flow for one verified account. One attempt per account — no proxy retry.
     Returns: "active", "unverified", "error"
+    stop_event: set when the proxy pool is exhausted — all accounts stop immediately.
     """
     username = acct["username"]
     password = acct["password"]
     loop = asyncio.get_event_loop()
 
     import session as sess
+    import solver as solvermod
 
-    async def _next_fresh_proxy() -> tuple[str, str] | None:
-        for _ in range(_IP_SEARCH_PER_ATTEMPT):
-            candidate = pool.advance()
-            ip = await loop.run_in_executor(
-                executor, pool.verify_and_claim, candidate, username,
-            )
-            if ip is not None:
-                return candidate, ip
-            _log(username, f"IP already used or dead on {_proxy_host(candidate)} — skipping")
-        return None
+    if stop_event.is_set():
+        _log(username, "pool exhausted — skipping")
+        return "error"
 
-    for proxy_attempt in range(MAX_PROXY_RETRIES):
-        fresh = await _next_fresh_proxy()
-        if fresh is None:
-            _log(username, "FAIL no fresh exit IPs within search budget")
+    # Find one fresh proxy
+    fresh = None
+    for _ in range(_IP_SEARCH_LIMIT):
+        candidate = pool.advance()
+        ip = await loop.run_in_executor(
+            executor, pool.verify_and_claim, candidate, username,
+        )
+        if ip is not None:
+            fresh = (candidate, ip)
             break
-        proxy, exit_ip = fresh
-        if proxy_attempt > 0:
-            _log(username, f"retry proxy_attempt={proxy_attempt}  exit_ip={exit_ip}")
+        _log(username, f"IP already used or dead on {_proxy_host(candidate)} — skipping")
 
-        # Get session — browser bypasses WAF challenge; cookies land in primp client
-        try:
-            s = await loop.run_in_executor(
-                executor, lambda _p=proxy: sess.get_session(_p, headless=not headed))
-        except Exception as e:
-            _log(username, f"FAIL get_session ({exit_ip}): {e}")
-            continue
+    if fresh is None:
+        _log(username, "FAIL no fresh exit IPs — pool exhausted, stopping batch")
+        stop_event.set()
+        return "error"
 
-        # Login via browser: types credentials for behavioral signals, clicks
-        # reCAPTCHA checkbox, falls back to external CapSolver token if needed.
-        solver_key = (capsolver_keys or twocaptcha_keys or capmonster_keys or [""])[0]
-        try:
-            lr = await loop.run_in_executor(
-                executor, lambda _s=s: _s.browser_login(username, password, lang, solver_key))
-            body = lr.get("body", "").strip()
-            _log(username, f"login resp={body[:200]}")
-        except Exception as e:
-            _log(username, f"FAIL browser_login: {e}")
-            try: s.close()
-            except Exception: pass
-            continue
+    proxy, exit_ip = fresh
 
-        try:
-            resp  = json.loads(body)
-            rtype = resp.get("type", "")
-        except json.JSONDecodeError:
-            _log(username, f"FAIL non-JSON response (HTML?): {body[:120]}")
-            try: s.close()
-            except Exception: pass
-            continue
+    # Step 1: browser WAF bypass — cookies land in primp client (same as registration)
+    try:
+        s = await loop.run_in_executor(
+            executor, lambda _p=proxy: sess.get_session(_p, headless=not headed))
+    except Exception as e:
+        _log(username, f"FAIL get_session ({exit_ip}): {e}")
+        return "error"
 
-        if rtype in ("", "200"):
-            _log(username, f"LOGIN OK  exit_ip={exit_ip}")
-            _csv_update(username, status="active", last_login=_now(),
-                        proxy=_proxy_host(proxy))
-            if not headed:
-                try: s.close()
-                except Exception: pass
-            else:
-                _log(username, "browser left open — close the window manually when done")
-            return "active"
-
+    # Step 2: full browser login — types credentials (builds reCAPTCHA behavioral signals),
+    # clicks the checkbox, handles consent popup, and fires doLogin() AJAX from within
+    # the real browser context.  Falls back to external CapSolver token if auto-solve fails.
+    # This produces shorter, higher-quality tokens vs race_all() + browser_fetch.
+    solver_key        = capsolver_keys[0]   if capsolver_keys   else ""
+    twocaptcha_key    = twocaptcha_keys[0]  if twocaptcha_keys  else ""
+    body = ""
+    status = 0
+    try:
+        _log(username, f"browser_login: typing creds + clicking checkbox (exit_ip={exit_ip})")
+        result = await loop.run_in_executor(
+            executor,
+            lambda: s.browser_login(username, password, lang=lang,
+                                    solver_key=solver_key,
+                                    twocaptcha_key=twocaptcha_key,
+                                    timeout=360),
+        )
+        body   = (result.get("body") or "").strip()
+        status = result.get("status", 0)
+        _log(username, f"login status={status}  waf={_is_waf_challenge(body)}  resp={body[:200]}")
+    except Exception as e:
+        _log(username, f"FAIL browser_login: {e}")
+        _csv_update(username, status="login_failed", notes=f"browser_login error: {e}")
         try: s.close()
         except Exception: pass
+        return "error"
 
-        if rtype == "secblock":
-            _log(username, f"secblock on {exit_ip} — burning, trying next")
-            pool.burn_today(proxy, "login:secblock")
-            continue
+    # WAF PoW challenge — solve and retry login via browser_login (fresh CAPTCHA token)
+    if _is_waf_challenge(body):
+        _log(username, "WAF challenge received — solving PoW")
+        bypassed = await loop.run_in_executor(
+            executor,
+            lambda: _waf_bypass(s, body, username),
+        )
+        if not bypassed:
+            _log(username, "FAIL WAF bypass rejected")
+            _csv_update(username, status="login_failed", notes="WAF PoW rejected")
+            try: s.close()
+            except Exception: pass
+            return "error"
+        # After bypass, get a fresh CAPTCHA token and POST via browser_fetch.
+        # browser_fetch uses the browser's fetch() (with bypass cookie) — no consent popup needed.
+        _log(username, "WAF bypassed — getting fresh CAPTCHA token for retry")
+        retry_token = ""
+        try:
+            retry_token = await loop.run_in_executor(
+                executor, solvermod.race_all,
+                capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
+                "LOGIN_EVISA", proxy,
+            )
+        except Exception as e:
+            _log(username, f"WARN retry CAPTCHA race_all failed: {e} — retrying with empty token")
 
-        if rtype == "ReCaptchaError":
-            _log(username, f"CAPTCHA token rejected  exit_ip={exit_ip}")
-            continue
+        login_data = {"username": username, "password": password,
+                      "language": lang, "rgpd": "Y",
+                      "captchaResponse": retry_token}
+        try:
+            result = await loop.run_in_executor(
+                executor,
+                lambda: s.browser_fetch(LOGIN_URL, data=login_data, timeout=60),
+            )
+            body   = (result.get("body") or "").strip()
+            status = result.get("status", 0)
+            _log(username, f"login retry status={status}  waf={_is_waf_challenge(body)}  resp={body[:200]}")
+        except Exception as e:
+            _log(username, f"FAIL login retry browser_fetch: {e}")
+            _csv_update(username, status="login_failed", notes=f"retry browser_fetch error: {e}")
+            try: s.close()
+            except Exception: pass
+            return "error"
 
-        if rtype == "EmailSend":
-            _log(username, "FAIL account not verified server-side (EmailSend)")
-            _csv_update(username, status="registered", notes="EmailSend on login")
-            return "unverified"
+    try: s.close()
+    except Exception: pass
 
-        _log(username, f"type={rtype!r} on {exit_ip} — retrying next proxy (no burn)")
-        continue
+    if not body:
+        _log(username, f"FAIL empty response body  status={status}")
+        _csv_update(username, status="login_failed", notes=f"empty body status={status}")
+        return "error"
 
-    _log(username, f"FAIL exhausted {MAX_PROXY_RETRIES} login attempts")
+    try:
+        resp  = json.loads(body)
+        rtype = resp.get("type", "__missing__")
+    except json.JSONDecodeError:
+        _log(username, f"FAIL non-JSON response (WAF/HTML?): {body[:120]}")
+        _csv_update(username, status="login_failed", notes="non-JSON response")
+        return "error"
+
+    # Server returns {"type":""} or {"type":"200"} on success (200 OK, small JSON body).
+    # Any 4xx or JSON without a "type" key is a failure.
+    if status == 200 and rtype in ("", "200"):
+        _log(username, f"LOGIN OK  exit_ip={exit_ip}")
+        _csv_update(username, status="active", last_login=_now(),
+                    proxy=_proxy_host(proxy))
+        return "active"
+
+    if rtype == "EmailSend":
+        _log(username, "FAIL account not verified server-side (EmailSend)")
+        _csv_update(username, status="registered", notes="EmailSend on login")
+        return "unverified"
+
+    _log(username, f"FAIL type={rtype!r}  exit_ip={exit_ip}")
+    _csv_update(username, status="login_failed", notes=f"type={rtype}")
     return "error"
 
 
@@ -259,15 +407,21 @@ async def main_async(args: argparse.Namespace,
             print(f"  {acct['username']}  status={acct['status']}")
         return
 
-    sem      = asyncio.Semaphore(args.concurrency)
-    executor = ThreadPoolExecutor(max_workers=args.concurrency + 4)
+    sem        = asyncio.Semaphore(args.concurrency)
+    executor   = ThreadPoolExecutor(max_workers=args.concurrency + 4)
+    stop_event = asyncio.Event()   # set when proxy pool exhausted — all workers stop
 
     async def bounded(acct):
+        if stop_event.is_set():
+            return "skipped"
         async with sem:
+            if stop_event.is_set():
+                return "skipped"
             return await _login_account(acct, pool,
                                          capsolver_keys, anticaptcha_keys,
                                          twocaptcha_keys, capmonster_keys,
                                          args.lang, executor,
+                                         stop_event,
                                          headed=args.headed)
 
     tasks   = [bounded(acct) for acct in accounts]
