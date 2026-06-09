@@ -347,6 +347,18 @@ class PlaywrightSession:
 
             page = ctx.new_page()
 
+            # Apply playwright-stealth for comprehensive bot-detection evasion.
+            # Patches 20+ signals: canvas getImageData noise, audio fingerprint,
+            # getBoundingClientRect, Function.toString, webdriver, chrome runtime, etc.
+            try:
+                from playwright_stealth import Stealth
+                Stealth().apply_stealth_sync(page)
+                print("[session] playwright-stealth applied")
+            except ImportError:
+                print("[session] playwright-stealth not installed — using fallback script only")
+            except Exception as _se:
+                print(f"[session] playwright-stealth warning: {_se}")
+
             print(f"[session] nav -> {HOME_URL}")
             page.goto(HOME_URL, timeout=30000)
             page.wait_for_load_state("networkidle", timeout=15000)
@@ -657,10 +669,14 @@ class PlaywrightSession:
         Falls back to an external CapSolver token if the image challenge appears.
         Returns {"status": int, "body": str}.
         """
-        username   = cmd["username"]
-        password   = cmd["password"]
-        lang       = cmd.get("lang", "PT")
-        solver_key = cmd.get("solver_key", "")
+        username          = cmd["username"]
+        password          = cmd["password"]
+        lang              = cmd.get("lang", "PT")
+        solver_key        = cmd.get("solver_key", "")
+        capsolver_keys    = cmd.get("capsolver_keys", [solver_key] if solver_key else [])
+        anticaptcha_keys  = cmd.get("anticaptcha_keys", [])
+        twocaptcha_keys   = cmd.get("twocaptcha_keys", [])
+        capmonster_keys   = cmd.get("capmonster_keys", [])
 
         # Navigate to auth page — reuse existing page if already there (avoids WAF retrigger),
         # otherwise go HOME_URL → AUTH_URL to match session init pattern.
@@ -812,15 +828,22 @@ class PlaywrightSession:
         if not token and challenge_detected:
             token = self._solve_audio_challenge(page, cmd.get("twocaptcha_key", ""))
 
-        # Last-resort: inject external solver token (lower quality, may score too low)
-        if not token and solver_key:
-            print(f"[session] no audio token — requesting external solver token")
-            try:
-                import solver as _solver
-                token = _solver.solve("capsolver", [solver_key], "LOGIN_EVISA", proxy=self.proxy)
-                print(f"[session] external token obtained  len={len(token)}")
-            except Exception as e:
-                print(f"[session] external solver failed: {e}")
+        # External solver fallback — race all available services (ProxyLess).
+        # race_all gives capmonster a chance to win; it consistently produces
+        # higher-quality tokens than capsolver alone for LOGIN_EVISA.
+        if not token:
+            any_keys = capsolver_keys or anticaptcha_keys or twocaptcha_keys or capmonster_keys
+            if any_keys:
+                print(f"[session] no audio token — race_best x3 external solvers (proxyless)")
+                try:
+                    import solver as _solver
+                    token = _solver.race_best(
+                        capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
+                        "LOGIN_EVISA", proxy=None, n_races=3, min_score=85,
+                    )
+                    print(f"[session] race_best token obtained  len={len(token)}  score={_solver.score_token(token)}")
+                except Exception as e:
+                    print(f"[session] race_all failed: {e}")
 
         # Last-resort: read injected textarea value
         if not token:
@@ -1069,20 +1092,27 @@ class PlaywrightSession:
 
     def browser_login(self, username: str, password: str, lang: str = "PT",
                       solver_key: str = "", twocaptcha_key: str = "",
+                      capsolver_keys: list | None = None,
+                      anticaptcha_keys: list | None = None,
+                      twocaptcha_keys: list | None = None,
+                      capmonster_keys: list | None = None,
                       timeout: int = 300) -> dict:
         """
         Type credentials into the login form to build behavioral signals, click the
-        reCAPTCHA checkbox, and submit. Tries audio challenge first (higher score),
-        then falls back to external CapSolver token.
+        reCAPTCHA checkbox, and submit. Races all solver services (ProxyLess) for token.
         Returns {"status": int, "body": str}.
         """
         self._cmd_q.put({
-            "action":         self._CMD_LOGIN,
-            "username":       username,
-            "password":       password,
-            "lang":           lang,
-            "solver_key":     solver_key,
-            "twocaptcha_key": twocaptcha_key,
+            "action":          self._CMD_LOGIN,
+            "username":        username,
+            "password":        password,
+            "lang":            lang,
+            "solver_key":      solver_key,
+            "twocaptcha_key":  twocaptcha_key,
+            "capsolver_keys":  capsolver_keys or ([solver_key] if solver_key else []),
+            "anticaptcha_keys": anticaptcha_keys or [],
+            "twocaptcha_keys": twocaptcha_keys or ([twocaptcha_key] if twocaptcha_key else []),
+            "capmonster_keys": capmonster_keys or [],
         })
         try:
             status, result = self._res_q.get(timeout=timeout)

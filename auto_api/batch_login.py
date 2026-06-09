@@ -58,6 +58,8 @@ def _is_waf_challenge(text: str) -> bool:
 
 def _parse_waf_challenge(html: str) -> dict | None:
     """Extract nonce/token/difficulty from the WAF challenge HTML."""
+    if len(html) < 500:
+        print(f"[waf] body too short to contain params ({len(html)} bytes): {html[:200]!r}")
     m = re.search(
         r'"nonce"\s*:\s*"([a-f0-9]+)"[^}]*"token"\s*:\s*"([a-f0-9]+)"[^}]*"difficulty"\s*:\s*(\d+)',
         html, re.DOTALL,
@@ -68,6 +70,8 @@ def _parse_waf_challenge(html: str) -> dict | None:
             html, re.DOTALL,
         )
         if not m:
+            # Log what we actually received to understand parse failures
+            print(f"[waf] parse FAIL — body len={len(html)}, first 1000 chars: {html[:1000]!r}")
             return None
         return {"difficulty": int(m.group(1)), "token": m.group(2), "nonce": m.group(3)}
     return {"nonce": m.group(1), "token": m.group(2), "difficulty": int(m.group(3))}
@@ -93,7 +97,31 @@ def _waf_bypass(session, html: str, label: str) -> bool:
     """
     challenge = _parse_waf_challenge(html)
     if not challenge:
-        print(f"[waf] {label}: could not parse challenge params")
+        # bd.js loads params async on some proxies — inline params missing.
+        # Fetch HOME_URL from the browser context to get a fresh WAF challenge
+        # that typically embeds params inline.
+        print(f"[waf] {label}: inline parse failed — fetching HOME_URL for fresh WAF challenge")
+        try:
+            fresh_html = session.browser_eval(
+                f"async () => {{ const r = await fetch('{HOME_URL}', {{"
+                f"  method: 'GET', credentials: 'include',"
+                f"  headers: {{'Accept': 'text/html', 'Cache-Control': 'no-cache'}}"
+                f"}}); return await r.text(); }}",
+                timeout=20,
+            )
+            if _is_waf_challenge(fresh_html):
+                challenge = _parse_waf_challenge(fresh_html)
+                if challenge:
+                    print(f"[waf] {label}: got fresh challenge params from HOME_URL fetch")
+                else:
+                    print(f"[waf] {label}: HOME_URL fetch also missing inline params")
+            else:
+                print(f"[waf] {label}: HOME_URL fetch returned no WAF challenge")
+        except Exception as e:
+            print(f"[waf] {label}: HOME_URL fetch failed: {e}")
+
+    if not challenge:
+        print(f"[waf] {label}: could not parse challenge params from any source")
         return False
 
     nonce, token, difficulty = challenge["nonce"], challenge["token"], challenge["difficulty"]
@@ -264,6 +292,10 @@ async def _login_account(acct: dict, pool,  # PersistentProxyPool
             lambda: s.browser_login(username, password, lang=lang,
                                     solver_key=solver_key,
                                     twocaptcha_key=twocaptcha_key,
+                                    capsolver_keys=capsolver_keys,
+                                    anticaptcha_keys=anticaptcha_keys,
+                                    twocaptcha_keys=twocaptcha_keys,
+                                    capmonster_keys=capmonster_keys,
                                     timeout=360),
         )
         body   = (result.get("body") or "").strip()
@@ -295,12 +327,14 @@ async def _login_account(acct: dict, pool,  # PersistentProxyPool
         retry_token = ""
         try:
             retry_token = await loop.run_in_executor(
-                executor, solvermod.race_all,
-                capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
-                "LOGIN_EVISA", proxy,
+                executor,
+                lambda: solvermod.race_best(
+                    capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
+                    "LOGIN_EVISA", proxy=None, n_races=3, min_score=85,
+                ),
             )
         except Exception as e:
-            _log(username, f"WARN retry CAPTCHA race_all failed: {e} — retrying with empty token")
+            _log(username, f"WARN retry CAPTCHA race_best failed: {e} — retrying with empty token")
 
         login_data = {"username": username, "password": password,
                       "language": lang, "rgpd": "Y",
@@ -336,9 +370,9 @@ async def _login_account(acct: dict, pool,  # PersistentProxyPool
         _csv_update(username, status="login_failed", notes="non-JSON response")
         return "error"
 
-    # Server returns {"type":""} or {"type":"200"} on success (200 OK, small JSON body).
+    # Server success responses observed: {"type":""}, {"type":"200"}, {"type":"success"}
     # Any 4xx or JSON without a "type" key is a failure.
-    if status == 200 and rtype in ("", "200"):
+    if status == 200 and rtype in ("", "200", "success"):
         _log(username, f"LOGIN OK  exit_ip={exit_ip}")
         _csv_update(username, status="active", last_login=_now(),
                     proxy=_proxy_host(proxy))

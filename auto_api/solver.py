@@ -2,13 +2,10 @@
 reCAPTCHA Enterprise solver wrapper.
 Supports: CapSolver, Anti-Captcha, 2Captcha, CapMonster.
 
-All actions on the target site use ReCaptchaV2EnterpriseTask (proxy-aware).
-_V3_ACTIONS is intentionally empty — do not add LOGIN_EVISA or any other action to it.
-
-IMPORTANT: Use proxy-aware task types (not ProxyLess) so the CAPTCHA solve
-happens from the same IP as the page load. ProxyLess tasks score poorly with
-Google's reCAPTCHA Enterprise because the solver service IPs have low trust.
-Pass proxy= to solve() to enable proxy-aware solving.
+All Enterprise v2 tasks use ProxyLess task types. Solver-service IPs (CapSolver,
+AntiCaptcha, etc.) have dedicated high-trust Google reputation that produces
+higher reCAPTCHA Enterprise scores than passing our own ISP proxy IPs through
+proxy-aware tasks. Competitor analysis confirmed ProxyLess is the working approach.
 
 solve() rotates through the provided key list on failure.
 """
@@ -45,6 +42,64 @@ def _parse_proxy(proxy_url: str | None) -> dict | None:
         }
     except Exception:
         return None
+
+
+def score_token(token: str) -> int:
+    """
+    Estimate reCAPTCHA Enterprise score from token length.
+    Shorter = auto-pass checkbox (no image challenge) = higher Google score.
+    Based on observed token lengths: successful logins tend toward shorter tokens.
+    Returns 0-100; higher is better.
+    """
+    n = len(token)
+    if n < 2320:  return 100  # auto-pass — no image challenge, highest score
+    if n < 2380:  return 85
+    if n < 2430:  return 70
+    if n < 2470:  return 55   # confirmed working at this length (neupir2449: len=2446)
+    if n < 2510:  return 40
+    if n < 2550:  return 25
+    return 10
+
+
+def race_best(
+    capsolver_keys: list[str], anticaptcha_keys: list[str],
+    twocaptcha_keys: list[str], capmonster_keys: list[str],
+    action: str, proxy: str | None = None,
+    n_races: int = 3,
+    min_score: int = 85,
+) -> str:
+    """
+    Run up to n_races sequential solver races; return the highest-scoring token.
+    Stops early only if a token reaches min_score (auto-pass quality, < ~2380 chars).
+    For image-challenge tokens (~2400-2574), always runs all races and picks shortest.
+    Running multiple races statistically improves success rate for strict Enterprise
+    endpoints like LOGIN_EVISA.
+    """
+    best_token = ""
+    best_score = 0
+
+    for i in range(n_races):
+        print(f"[solver] race_best: race {i+1}/{n_races}  best_score_so_far={best_score}")
+        try:
+            token = race_all(
+                capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
+                action, proxy=proxy,
+            )
+            score = score_token(token)
+            print(f"[solver] race_best: race {i+1} done  score={score}  token_len={len(token)}")
+            if score > best_score:
+                best_score = score
+                best_token = token
+            if score >= min_score:
+                print(f"[solver] race_best: threshold met ({score}>={min_score}) — stopping early")
+                break
+        except Exception as e:
+            print(f"[solver] race_best: race {i+1} failed: {e}")
+
+    if best_token:
+        print(f"[solver] race_best: final  score={best_score}  token_len={len(best_token)}")
+        return best_token
+    raise RuntimeError(f"race_best: all {n_races} races failed")
 
 
 def race_all(capsolver_keys: list[str], anticaptcha_keys: list[str],
@@ -167,10 +222,7 @@ def solve(service: str, keys: list[str], action: str = "LOGIN_EVISA",
     Raises RuntimeError if all keys fail.
     """
     proxy_info = _parse_proxy(proxy)
-    if proxy_info:
-        print(f"[solver] proxy-aware mode: {proxy_info['proxyAddress']}:{proxy_info['proxyPort']}")
-    else:
-        print(f"[solver] proxyless mode (lower reCAPTCHA score)")
+    print(f"[solver] proxyless mode (solver-service IPs — higher Enterprise score)")
 
     last_err = None
     for i, key in enumerate(keys):
@@ -190,20 +242,18 @@ def _capsolver(api_key: str, action: str, proxy_info: dict | None,
                session_cookies: dict | None = None) -> str:
     if action in _V3_ACTIONS:
         task = {
+            "type":        "ReCaptchaV3TaskProxyLess",
             "websiteURL":  AUTH_URL,
             "websiteKey":  SITE_KEY,
             "pageAction":  action,
             "isEnterprise": True,
         }
-        task["type"] = "ReCaptchaV3Task" if proxy_info else "ReCaptchaV3TaskProxyLess"
     else:
         task = {
+            "type":       "ReCaptchaV2EnterpriseTaskProxyLess",
             "websiteURL": AUTH_URL,
             "websiteKey": SITE_KEY,
         }
-        task["type"] = "ReCaptchaV2EnterpriseTask" if proxy_info else "ReCaptchaV2EnterpriseTaskProxyLess"
-    if proxy_info:
-        task.update(proxy_info)
 
     r = requests.post("https://api.capsolver.com/createTask", json={
         "clientKey": api_key,
@@ -236,15 +286,13 @@ def _anticaptcha(api_key: str, action: str, proxy_info: dict | None,
             "pageAction":   action,
             "isEnterprise": True,
         }
-        task["type"] = "RecaptchaV3Task" if proxy_info else "RecaptchaV3TaskProxyless"
+        task["type"] = "RecaptchaV3TaskProxyless"
     else:
         task = {
+            "type":       "RecaptchaV2EnterpriseTaskProxyless",
             "websiteURL": AUTH_URL,
             "websiteKey": SITE_KEY,
         }
-        task["type"] = "RecaptchaV2EnterpriseTask" if proxy_info else "RecaptchaV2EnterpriseTaskProxyless"
-    if proxy_info:
-        task.update(proxy_info)
     task["userAgent"] = _AC_USER_AGENT
 
     r = requests.post("https://api.anti-captcha.com/createTask", json={
@@ -267,21 +315,19 @@ def _twocaptcha(api_key: str, action: str, proxy_info: dict | None,
                 session_cookies: dict | None = None) -> str:
     if action in _V3_ACTIONS:
         task = {
+            "type":         "RecaptchaV3TaskProxyless",
             "websiteURL":   AUTH_URL,
             "websiteKey":   SITE_KEY,
             "minScore":     0.3,
             "pageAction":   action,
             "isEnterprise": True,
         }
-        task["type"] = "RecaptchaV3Task" if proxy_info else "RecaptchaV3TaskProxyless"
     else:
         task = {
+            "type":       "RecaptchaV2EnterpriseTaskProxyless",
             "websiteURL": AUTH_URL,
             "websiteKey": SITE_KEY,
         }
-        task["type"] = "RecaptchaV2EnterpriseTask" if proxy_info else "RecaptchaV2EnterpriseTaskProxyless"
-    if proxy_info:
-        task.update(proxy_info)
 
     r = requests.post("https://api.2captcha.com/createTask", json={
         "clientKey": api_key,
@@ -301,21 +347,19 @@ def _capmonster(api_key: str, action: str, proxy_info: dict | None,
                 session_cookies: dict | None = None) -> str:
     if action in _V3_ACTIONS:
         task = {
+            "type":         "RecaptchaV3TaskProxyless",
             "websiteURL":   AUTH_URL,
             "websiteKey":   SITE_KEY,
             "minScore":     0.3,
             "pageAction":   action,
             "isEnterprise": True,
         }
-        task["type"] = "RecaptchaV3Task" if proxy_info else "RecaptchaV3TaskProxyless"
     else:
         task = {
+            "type":       "RecaptchaV2EnterpriseTaskProxyless",
             "websiteURL": AUTH_URL,
             "websiteKey": SITE_KEY,
         }
-        task["type"] = "RecaptchaV2EnterpriseTask" if proxy_info else "RecaptchaV2EnterpriseTaskProxyless"
-    if proxy_info:
-        task.update(proxy_info)
 
     r = requests.post("https://api.capmonster.cloud/createTask", json={
         "clientKey": api_key,
