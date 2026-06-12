@@ -30,6 +30,7 @@ import queue
 import random
 import threading
 import time
+from pathlib import Path
 
 IMPERSONATE = None   # None = primp built-in default; no "does not exist" warning
 
@@ -261,17 +262,23 @@ class PlaywrightSession:
     close() enqueues a shutdown job and waits for the worker to exit.
     """
 
-    _CMD_VERIFY = "verify"
-    _CMD_FETCH  = "fetch"
-    _CMD_LOGIN  = "login"
-    _CMD_EVAL   = "eval"
-    _CMD_CLOSE  = "close"
+    _CMD_VERIFY     = "verify"
+    _CMD_FETCH      = "fetch"
+    _CMD_LOGIN      = "login"
+    _CMD_EVAL       = "eval"
+    _CMD_NAV        = "nav"
+    _CMD_SAVE_STATE = "save_state"
+    _CMD_CLOSE      = "close"
 
     def __init__(self, proxy: str | None, inject_cookies: dict | None = None,
-                 headless: bool = True):
+                 headless: bool = True, storage_state: str | None = None,
+                 fp: tuple | None = None):
         self.proxy           = proxy          # original URL — used by primp + CapSolver
         self._inject_cookies = inject_cookies or {}   # pre-load cookies → skip WAF challenge
         self._headless       = headless
+        self._storage_state  = storage_state  # Playwright storage_state path for session restore
+        self._fp_override    = fp             # fixed fingerprint tuple for session restoration
+        self._fp: tuple | None = None         # set by _worker once fingerprint is chosen
         # Chromium cannot authenticate with SOCKS5 user:pass; route via a local
         # HTTP→SOCKS5 bridge. primp handles socks5:// natively and needs no bridge.
         if proxy and proxy.startswith('socks5://'):
@@ -309,7 +316,12 @@ class PlaywrightSession:
                 if password:
                     proxy_config["password"] = password
 
-            ua, sec_ch_ua, vp_w, vp_h, platform = _pick_fingerprint()
+            if self._fp_override:
+                ua, sec_ch_ua, vp_w, vp_h, platform = self._fp_override
+                print(f"[session] fp restored  ua=...{ua[55:85]}  vp={vp_w}x{vp_h}")
+            else:
+                ua, sec_ch_ua, vp_w, vp_h, platform = _pick_fingerprint()
+            self._fp = (ua, sec_ch_ua, vp_w, vp_h, platform)
             tz = _get_proxy_timezone(self.proxy)
             print(f"[session] fp ua=...{ua[55:85]}  tz={tz}  vp={vp_w}x{vp_h}")
 
@@ -320,7 +332,7 @@ class PlaywrightSession:
                       "--disable-dev-shm-usage", "--no-sandbox"],
                 proxy=proxy_config,
             )
-            ctx = browser.new_context(
+            ctx_kwargs = dict(
                 user_agent=ua,
                 viewport={"width": vp_w, "height": vp_h},
                 screen={"width": vp_w, "height": vp_h},
@@ -332,6 +344,10 @@ class PlaywrightSession:
                     "sec-ch-ua-platform": f'"{platform}"',
                 },
             )
+            if self._storage_state:
+                ctx_kwargs["storage_state"] = self._storage_state
+                print(f"[session] restoring session from {self._storage_state}")
+            ctx = browser.new_context(**ctx_kwargs)
             ctx.add_init_script(_make_stealth_script(vp_w, vp_h))
 
             # Pre-inject saved cookies so the server skips the WAF challenge
@@ -434,6 +450,40 @@ class PlaywrightSession:
                     except Exception as exc:
                         self._res_q.put(("err", str(exc)))
 
+                elif cmd.get("action") == self._CMD_NAV:
+                    try:
+                        page.goto(cmd["url"], timeout=cmd.get("nav_timeout", 30000))
+                        page.wait_for_load_state("networkidle", timeout=15000)
+                        self._res_q.put(("ok", page.url))
+                    except Exception as exc:
+                        try:
+                            self._res_q.put(("ok", page.url))
+                        except Exception:
+                            self._res_q.put(("err", str(exc)))
+
+                elif cmd.get("action") == self._CMD_SAVE_STATE:
+                    try:
+                        ctx.storage_state(path=cmd["path"])
+                        # Write companion profile so the same fingerprint can be
+                        # restored on next get_session_from_state() call.
+                        if self._fp:
+                            import json as _js
+                            profile = {
+                                "user_agent": self._fp[0],
+                                "sec_ch_ua":  self._fp[1],
+                                "viewport_w": self._fp[2],
+                                "viewport_h": self._fp[3],
+                                "platform":   self._fp[4],
+                                "proxy":      self.proxy,
+                                "saved_at":   time.time(),
+                            }
+                            p = Path(cmd["path"])
+                            profile_path = p.parent / (p.stem + "_profile.json")
+                            profile_path.write_text(_js.dumps(profile, indent=2), encoding="utf-8")
+                        self._res_q.put(("ok", cmd["path"]))
+                    except Exception as exc:
+                        self._res_q.put(("err", str(exc)))
+
         except Exception as exc:
             self._error = exc
             self._ready.set()
@@ -524,8 +574,9 @@ class PlaywrightSession:
         """
         result = page.evaluate(js)
         body = result.get("body", "")
+        safe_body = body[:80].encode("utf-8", errors="replace").decode("utf-8", errors="replace")
         print(f"[session] browser_fetch {method} {url.split('?')[0].split('/')[-1]} "
-              f"status={result.get('status')}  body={body[:80]}")
+              f"status={result.get('status')}  body={safe_body}")
         return {"status": result.get("status", 0), "body": body}
 
     def _solve_audio_challenge(self, page, twocaptcha_key: str) -> str:
@@ -677,6 +728,8 @@ class PlaywrightSession:
         anticaptcha_keys  = cmd.get("anticaptcha_keys", [])
         twocaptcha_keys   = cmd.get("twocaptcha_keys", [])
         capmonster_keys   = cmd.get("capmonster_keys", [])
+        skip_checkbox     = cmd.get("skip_checkbox", False)
+        min_score         = cmd.get("min_score", 80)
 
         # Navigate to auth page — reuse existing page if already there (avoids WAF retrigger),
         # otherwise go HOME_URL → AUTH_URL to match session init pattern.
@@ -779,71 +832,84 @@ class PlaywrightSession:
                     box["y"] + box["height"] * 0.5,
                     steps=random.randint(10, 20),
                 )
-                time.sleep(random.uniform(0.3, 0.6))
+                time.sleep(random.uniform(0.5, 2.0))
         except Exception:
             pass
 
-        # Click the reCAPTCHA checkbox
-        print(f"[session] browser_login: clicking checkbox")
-        clicked = False
-        try:
-            rc_frame = page.frame_locator('iframe[title*="reCAPTCHA"]').first
-            rc_frame.locator("#recaptcha-anchor").click(timeout=10000)
-            clicked = True
-        except Exception as e:
-            print(f"[session] checkbox click 1 failed: {e}")
-        if not clicked:
-            try:
-                rc_frame = page.frame_locator('iframe[src*="recaptcha"]').first
-                rc_frame.locator(".recaptcha-checkbox").click(timeout=8000)
-                clicked = True
-            except Exception as e2:
-                print(f"[session] checkbox click 2 failed: {e2}")
-
-        # Poll for auto-solve token (checkbox goes green without image challenge)
         token = ""
         challenge_detected = False
-        for _ in range(25):
-            time.sleep(1)
-            try:
-                token = page.evaluate("grecaptcha.enterprise.getResponse()") or ""
-                if token:
-                    break
-            except Exception:
-                pass
-            try:
-                vis = page.locator(
-                    'iframe[title*="recaptcha challenge"], iframe[src*="bframe"]'
-                ).is_visible(timeout=300)
-                if vis:
-                    print(f"[session] image challenge appeared")
-                    challenge_detected = True
-                    break
-            except Exception:
-                pass
 
-        # Primary fallback: solve audio challenge in the real browser.
-        # Audio challenge produces a token from actual browser/IP interaction, scoring
-        # higher than external solver tokens for enterprise endpoints.
-        if not token and challenge_detected:
-            token = self._solve_audio_challenge(page, cmd.get("twocaptcha_key", ""))
+        if skip_checkbox:
+            # Skip checkbox click and 25s polling — go straight to external solver.
+            # race_all() (single parallel race) is faster than race_best() (3 sequential
+            # races) and produces the same token quality for LOGIN_EVISA.
+            print(f"[session] browser_login: skip_checkbox=True — silent token injection")
+        else:
+            # Click the reCAPTCHA checkbox
+            print(f"[session] browser_login: clicking checkbox")
+            clicked = False
+            try:
+                rc_frame = page.frame_locator('iframe[title*="reCAPTCHA"]').first
+                rc_frame.locator("#recaptcha-anchor").click(timeout=10000)
+                clicked = True
+            except Exception as e:
+                print(f"[session] checkbox click 1 failed: {e}")
+            if not clicked:
+                try:
+                    rc_frame = page.frame_locator('iframe[src*="recaptcha"]').first
+                    rc_frame.locator(".recaptcha-checkbox").click(timeout=8000)
+                    clicked = True
+                except Exception as e2:
+                    print(f"[session] checkbox click 2 failed: {e2}")
 
-        # External solver fallback — race all available services (ProxyLess).
-        # race_all gives capmonster a chance to win; it consistently produces
-        # higher-quality tokens than capsolver alone for LOGIN_EVISA.
+            # Poll for auto-solve token (checkbox goes green without image challenge)
+            for _ in range(25):
+                time.sleep(1)
+                try:
+                    token = page.evaluate("grecaptcha.enterprise.getResponse()") or ""
+                    if token:
+                        break
+                except Exception:
+                    pass
+                try:
+                    vis = page.locator(
+                        'iframe[title*="recaptcha challenge"], iframe[src*="bframe"]'
+                    ).is_visible(timeout=300)
+                    if vis:
+                        print(f"[session] image challenge appeared")
+                        challenge_detected = True
+                        break
+                except Exception:
+                    pass
+
+        # External solver — race all available services (ProxyLess).
+        # Audio challenge is intentionally skipped: clicking the audio button and
+        # downloading .mp3 files through the proxy are known bot signals that degrade
+        # the IP's reCAPTCHA trust score. External ProxyLess tokens work without it.
         if not token:
             any_keys = capsolver_keys or anticaptcha_keys or twocaptcha_keys or capmonster_keys
             if any_keys:
-                print(f"[session] no audio token — race_best x3 external solvers (proxyless)")
-                try:
-                    import solver as _solver
-                    token = _solver.race_best(
-                        capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
-                        "LOGIN_EVISA", proxy=None, n_races=3, min_score=85,
-                    )
-                    print(f"[session] race_best token obtained  len={len(token)}  score={_solver.score_token(token)}")
-                except Exception as e:
-                    print(f"[session] race_all failed: {e}")
+                import solver as _solver
+                if skip_checkbox:
+                    print(f"[session] race_all (min_score={min_score}, skip_checkbox mode)")
+                    try:
+                        token = _solver.race_all(
+                            capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
+                            "LOGIN_EVISA", proxy=None, min_score=min_score,
+                        )
+                        print(f"[session] race_all token obtained  len={len(token)}  score={_solver.score_token(token)}")
+                    except Exception as e:
+                        print(f"[session] race_all failed: {e}")
+                else:
+                    print(f"[session] no audio token — race_best x3 external solvers (proxyless)")
+                    try:
+                        token = _solver.race_best(
+                            capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
+                            "LOGIN_EVISA", proxy=None, n_races=3, min_score=85,
+                        )
+                        print(f"[session] race_best token obtained  len={len(token)}  score={_solver.score_token(token)}")
+                    except Exception as e:
+                        print(f"[session] race_all failed: {e}")
 
         # Last-resort: read injected textarea value
         if not token:
@@ -899,149 +965,92 @@ class PlaywrightSession:
         """)
         print(f"[session] grecaptcha.getResponse patched to return injected token")
 
-        # Use page.expect_response() — the Playwright-native way to wait for a network
-        # response. Unlike time.sleep() loops with page.on("response") callbacks,
-        # expect_response() properly integrates with Playwright's event loop and handles
-        # slow responses (large WAF HTML bodies, slow server processing) correctly.
-        _CONSENT_JS = f"""
-        (() => {{
-            const results = [];
-            for (let i = 1; i <= 2; i++) {{
-                const cb = document.getElementById('loginCheckbox' + i);
-                if (cb && !cb.checked) {{
-                    cb.checked = true;
-                    cb.dispatchEvent(new Event('change', {{bubbles: true}}));
-                    cb.dispatchEvent(new Event('click',  {{bubbles: true}}));
-                    results.push('checked:loginCheckbox' + i);
-                }}
-            }}
-            const cb3 = document.getElementById('loginCheckbox3');
-            if (cb3 && cb3.checked) {{
-                cb3.checked = false;
-                cb3.dispatchEvent(new Event('change', {{bubbles: true}}));
-                results.push('unchecked:loginCheckbox3');
-            }}
-            const btn = document.getElementById('loginFormSubmitButton')
-                      || document.getElementById('loginSubmit');
-            if (btn) {{
-                btn.click();
-                results.push('clicked:' + btn.id);
-            }} else {{
-                results.push('no-submit-btn');
-            }}
-            return results;
-        }})()
+        # POST login credentials directly via browser fetch() — uses the browser's
+        # session cookies and TLS fingerprint without any page interaction.
+        uname_js   = _json.dumps(username)
+        passwd_js  = _json.dumps(password)
+        lang_js    = _json.dumps(lang)
+        login_url  = BASE + "/VistosOnline/login"
+        login_url_js = _json.dumps(login_url)
+
+        login_fetch_js = f"""
+        async () => {{
+            const resp = await fetch({login_url_js}, {{
+                method: "POST",
+                headers: {{
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Accept": "*/*",
+                }},
+                body: new URLSearchParams({{
+                    "username":        {uname_js},
+                    "password":        {passwd_js},
+                    "language":        {lang_js},
+                    "rgpd":            "Y",
+                    "captchaResponse": {tok_js},
+                }}).toString(),
+            }});
+            const text = await resp.text();
+            return {{ status: resp.status, body: text }};
+        }}
         """
-        _CALLBACK_JS = f"""
-        (() => {{
-            const tok = {tok_js};
-            const fired = [];
-            const widgets = document.querySelectorAll('[data-callback]');
-            for (const w of widgets) {{
-                const cbName = w.getAttribute('data-callback');
-                if (cbName && typeof window[cbName] === 'function') {{
-                    try {{ window[cbName](tok); fired.push('data-callback:' + cbName); }}
-                    catch(e) {{ fired.push('err:' + cbName + ':' + e.message); }}
-                }}
-            }}
-            if (!fired.length && typeof window.onCaptchaSuccess === 'function') {{
-                try {{ window.onCaptchaSuccess(tok); fired.push('onCaptchaSuccess'); }}
-                catch(e) {{ fired.push('err:onCaptchaSuccess:' + e.message); }}
-            }}
-            return fired;
-        }})()
-        """
-
-        # Debug: log all requests during login attempt
-        def _dbg_request(req):
-            try:
-                if "VistosOnline" in req.url or "login" in req.url.lower():
-                    print(f"[session] REQ {req.method} {req.url[:80]}")
-            except Exception:
-                pass
-
-        page.on("request", _dbg_request)
-
-        login_result: dict = {}
         try:
-            with page.expect_response(
-                lambda r: "/VistosOnline/login" in r.url and r.request.method == "POST",
-                timeout=90000,
-            ) as resp_info:
-                # Fire the CAPTCHA callback — shows consent popup or fires AJAX directly
-                cb_result = page.evaluate(_CALLBACK_JS)
-                print(f"[session] recaptcha callback fired: {cb_result}")
-
-                # Wait for popup to render, then check via computed style
-                # (is_visible() returns False when the popup is covered by the image
-                # challenge overlay, even though display:block — use JS instead)
-                page.wait_for_timeout(3000)
-                popup_vis = False
-                for _attempt in range(4):
-                    try:
-                        popup_display = page.evaluate(
-                            "() => { const el = document.getElementById('consintoPopup');"
-                            " return el ? getComputedStyle(el).display : 'not-found'; }"
-                        )
-                        popup_vis = popup_display not in ("none", "not-found", "")
-                    except Exception:
-                        popup_vis = False
-                    if popup_vis:
-                        print(f"[session] consent popup display={popup_display!r}")
-                        break
-                    if _attempt < 3:
-                        page.wait_for_timeout(1000)
-
-                if popup_vis:
-                    clicked = page.evaluate(_CONSENT_JS)
-                    print(f"[session] consent+click: {clicked}")
-                else:
-                    # Debug: log what's on the page after callback
-                    try:
-                        pg_state = page.evaluate("""
-                        () => ({
-                            url: location.href,
-                            consintoPopup: document.getElementById('consintoPopup')
-                                ? getComputedStyle(document.getElementById('consintoPopup')).display
-                                : 'not-found',
-                            loginMsg: document.getElementById('loginMsg')
-                                ? getComputedStyle(document.getElementById('loginMsg')).display
-                                : 'not-found',
-                        })
-                        """)
-                        print(f"[session] page state after callback: {pg_state}")
-                    except Exception:
-                        pass
-                    print(f"[session] no consent popup — waiting for direct AJAX")
-
-            resp = resp_info.value
-            try:
-                post_data = resp.request.post_data or ""
-                cap_val = next(
-                    (p[16:36] + "..." for p in post_data.split("&") if p.startswith("captchaResponse=")),
-                    ""
-                )
-                print(f"[session] /login POST: status={resp.status}  captchaResponse={cap_val!r}")
-            except Exception:
-                print(f"[session] /login POST: status={resp.status}")
-            body = resp.body().decode("utf-8", errors="replace")
-            print(f"[session] /login body: {body[:120]!r}")
-            login_result = {"status": resp.status, "body": body}
-
+            result = page.evaluate(login_fetch_js)
         except Exception as e:
-            print(f"[session] expect_response failed: {e}")
-        finally:
+            print(f"[session] login fetch failed: {e}")
+            return {"status": 0, "body": ""}
+
+        status = result.get("status", 0)
+        body   = result.get("body", "")
+        safe_body = body[:80].encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+        print(f"[session] /login POST status={status}  body={safe_body!r}")
+
+        # Confirm success: if server response looks like success, verify page navigated to HOME_URL
+        parsed_type = None
+        if body:
             try:
-                page.remove_listener("request", _dbg_request)
+                parsed_type = _json.loads(body).get("type", "")
             except Exception:
-                pass
+                parsed_type = None  # HTML/WAF body — return as-is for WAF detection
 
-        if login_result.get("body"):
-            return login_result
+        if status == 200 and parsed_type in ("", "200", "success"):
+            page.wait_for_timeout(2000)
+            cur_url = page.url
+            at_home = cur_url == HOME_URL or cur_url.rstrip("/") == HOME_URL.rstrip("/")
+            print(f"[session] post-login url check: {cur_url}  at_home={at_home}")
+            if not at_home:
+                print(f"[session] navigating to HOME_URL to confirm session")
+                try:
+                    page.goto(HOME_URL, timeout=20000)
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                    landed  = page.url
+                    content = page.content()
+                    is_auth      = "Authentication.jsp" in landed or "/login" in landed
+                    has_challenge = "/ch/bd.js" in content
+                    if is_auth:
+                        # Portal redirected back to login — session not established
+                        print(f"[session] HOME_URL redirected to auth at {landed} — not authenticated")
+                        body = '{"type":"error","description":"no_redirect"}'
+                    elif has_challenge:
+                        # HOME_URL got WAF-challenged — session IS established,
+                        # WAF challenge on this IP is independent of login state
+                        print(f"[session] HOME_URL has WAF challenge but session was established — success")
+                        body = '{"type":"success","description":"nav_confirmed_waf"}'
+                    else:
+                        print(f"[session] HOME_URL confirmed at {landed} — success")
+                        body = '{"type":"success","description":"nav_confirmed"}'
+                except Exception as nav_err:
+                    print(f"[session] HOME_URL nav failed: {nav_err}")
+                    body = '{"type":"error","description":"no_redirect"}'
 
-        return {"status": 0, "body": ""}
+        return {"status": status, "body": body, "captcha_token": token}
 
     # ── Public interface ──────────────────────────────────────────────────────
+
+    @property
+    def client(self):
+        """The underlying primp.Client — used by session_store and batch_apply."""
+        return self._primp
 
     def _hdrs(self, extra: dict) -> dict:
         """Merge extra headers; inject Cookie header if we have one."""
@@ -1096,10 +1105,14 @@ class PlaywrightSession:
                       anticaptcha_keys: list | None = None,
                       twocaptcha_keys: list | None = None,
                       capmonster_keys: list | None = None,
-                      timeout: int = 300) -> dict:
+                      timeout: int = 300,
+                      skip_checkbox: bool = False,
+                      min_score: int = 80) -> dict:
         """
         Type credentials into the login form to build behavioral signals, click the
         reCAPTCHA checkbox, and submit. Races all solver services (ProxyLess) for token.
+        skip_checkbox=True: skip click + 25s poll, go straight to race_all() injection.
+        min_score: minimum reCAPTCHA score to accept (0=any, 80=default, 100=2captcha only).
         Returns {"status": int, "body": str}.
         """
         self._cmd_q.put({
@@ -1113,6 +1126,8 @@ class PlaywrightSession:
             "anticaptcha_keys": anticaptcha_keys or [],
             "twocaptcha_keys": twocaptcha_keys or ([twocaptcha_key] if twocaptcha_key else []),
             "capmonster_keys": capmonster_keys or [],
+            "skip_checkbox":   skip_checkbox,
+            "min_score":       min_score,
         })
         try:
             status, result = self._res_q.get(timeout=timeout)
@@ -1132,6 +1147,28 @@ class PlaywrightSession:
         if status == "err":
             raise RuntimeError(f"browser_eval failed: {result}")
         return result
+
+    def browser_nav(self, url: str, timeout: int = 60) -> str:
+        """Navigate the browser page to url and return the final URL after load."""
+        self._cmd_q.put({"action": self._CMD_NAV, "url": url, "nav_timeout": timeout * 1000})
+        try:
+            status, result = self._res_q.get(timeout=timeout + 5)
+        except queue.Empty:
+            raise RuntimeError(f"browser_nav timed out after {timeout}s")
+        if status == "err":
+            raise RuntimeError(f"browser_nav failed: {result}")
+        return result
+
+    def save_state(self, path) -> None:
+        """Export cookies + localStorage to a JSON file via Playwright storage_state."""
+        self._cmd_q.put({"action": self._CMD_SAVE_STATE, "path": str(path)})
+        try:
+            status, result = self._res_q.get(timeout=30)
+        except queue.Empty:
+            raise RuntimeError("save_state timed out after 30s")
+        if status == "err":
+            raise RuntimeError(f"save_state failed: {result}")
+        print(f"[session] session state saved → {result}")
 
     def verify_email(self, token_url: str, insert_jsp: str, verify_url: str,
                      token_input: str, token_search: str, lang: str,
@@ -1258,10 +1295,41 @@ def _parse_proxy(proxy_url: str | None) -> tuple[str | None, str | None, str | N
 
 def get_session(proxy: str | None = None,
                 inject_cookies: dict | None = None,
-                headless: bool = True) -> PlaywrightSession:
+                headless: bool = True,
+                storage_state: str | None = None,
+                fp: tuple | None = None) -> PlaywrightSession:
     """
     Launch a Chrome session. If inject_cookies is provided, the saved session
     cookies are pre-loaded before navigation — the WAF challenge is skipped.
     Pass headless=False to open a visible browser window (for manual inspection).
+    Pass storage_state=path to restore a previously saved session (cookies + localStorage).
+    Pass fp=(ua, sec_ch_ua, vp_w, vp_h, platform) to use a fixed fingerprint.
     """
-    return PlaywrightSession(proxy, inject_cookies=inject_cookies, headless=headless)
+    return PlaywrightSession(proxy, inject_cookies=inject_cookies,
+                             headless=headless, storage_state=storage_state, fp=fp)
+
+
+def get_session_from_state(state_path, headless: bool = False) -> PlaywrightSession:
+    """
+    Open a browser pre-loaded with a previously saved session state (from save_state()).
+    No proxy needed — session cookies are embedded in the state file.
+    headless=False by default so the user sees the browser window.
+    Loads <state_stem>_profile.json alongside the state file to restore the original
+    browser fingerprint (user-agent, viewport, platform) so the server sees the same
+    fingerprint as during login.
+    """
+    state_path = Path(state_path)
+    profile_path = state_path.parent / (state_path.stem + "_profile.json")
+    fp = None
+    proxy = None
+    if profile_path.exists():
+        try:
+            prof = _json.loads(profile_path.read_text(encoding="utf-8"))
+            fp    = (prof["user_agent"], prof["sec_ch_ua"],
+                     prof["viewport_w"], prof["viewport_h"], prof["platform"])
+            proxy = prof.get("proxy")
+            print(f"[session] profile loaded from {profile_path.name}  ua=...{fp[0][55:85]}")
+        except Exception as e:
+            print(f"[session] profile load failed ({e}) — using random fingerprint")
+    return PlaywrightSession(proxy=proxy, headless=headless,
+                             storage_state=str(state_path), fp=fp)

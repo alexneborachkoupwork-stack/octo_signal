@@ -46,30 +46,32 @@ SCHED_JSP   = BASE + "/VistosOnline/Schedule.jsp"
 SLOTS_URL   = BASE + "/VistosOnline/slots"
 SUBMIT_URL  = BASE + "/VistosOnline/SubmeterVistoCriaPDF"
 
-_ENV_FILE          = Path(__file__).parent / ".env"
-_ACCOUNT_FILE      = Path(__file__).parent / "data" / "accounts.csv"
-_QUEST_STEPS_FILE  = Path(__file__).parent / "data" / "quest_steps.json"
+_ENV_FILE           = Path(__file__).parent / ".env"
+_ACCOUNT_FILE       = Path(__file__).parent / "data" / "accounts.csv"
+_QUEST_STEPS_FILE   = Path(__file__).parent / "data" / "quest_steps.json"
 _FORM_DEFAULTS_FILE = Path(__file__).parent / "data" / "form_defaults.json"
 
 _csv_lock   = threading.Lock()
 _print_lock = threading.Lock()
 
+
+class SessionExpired(Exception):
+    """Raised by poll_slots_once when Vistos_sid is dead."""
+
+
 # ── JSON config loaders ────────────────────────────────────────────────────────
 
 def _load_quest_steps(nationality: str) -> list[dict]:
-    """Load questionnaire steps for the given nationality from quest_steps.json."""
     data = json.loads(_QUEST_STEPS_FILE.read_text(encoding="utf-8"))
     steps = data.get(nationality) or data.get("CPV")
     return steps
 
 def _load_form_defaults() -> dict:
-    """Load form_defaults.json once; caller merges sections."""
     return json.loads(_FORM_DEFAULTS_FILE.read_text(encoding="utf-8"))
 
 # ── Dynamic date resolver ──────────────────────────────────────────────────────
 
 def _resolve_dynamic(expr: str) -> str:
-    """Resolve dynamic date expressions: 'today+30d', 'today-3yr', 'today+5yr'."""
     today = date.today()
     m = re.fullmatch(r"today([+-])(\d+)(d|yr)", expr)
     if not m:
@@ -85,18 +87,11 @@ def _resolve_dynamic(expr: str) -> str:
 # ── Payload builder ────────────────────────────────────────────────────────────
 
 def _build_schedule_payload(acct: dict, posto_id: str, csrf: str,
-                             nationality: str) -> dict:
-    """Build the ScheduleController multipart payload from form_defaults.json + account data."""
+                             nationality: str, residence: str = "") -> dict:
     defaults = _load_form_defaults()
-
-    # 1. Start with static values
     payload: dict[str, str] = dict(defaults["static"])
-
-    # 2. Apply dynamic defaults (date expressions)
     for field, expr in defaults["dynamic"].items():
         payload[field] = _resolve_dynamic(expr)
-
-    # 3. Override with from_account values (account CSV columns win over dynamic)
     gender_raw = acct.get("gender", "M").upper()
     gender_expanded = "MALE" if gender_raw in ("M", "MALE") else "FEMALE"
     account_map = {
@@ -111,18 +106,18 @@ def _build_schedule_payload(acct: dict, posto_id: str, csrf: str,
     }
     for field, col in defaults["from_account"].items():
         val = account_map.get(col, "")
-        if val:  # non-empty account value wins over dynamic default
+        if val:
             payload[field] = val
-
-    # 4. Apply nationality overrides
     nat = nationality or acct.get("nationality", "CPV")
+    res = residence or nat
     for field, tmpl in defaults["from_nationality"].items():
-        payload[field] = tmpl.replace("{nat}", nat)
-
-    # 5. Runtime injections
+        if "pais_residencia" in field or field in ("pais_residencia",):
+            payload[field] = tmpl.replace("{nat}", res)
+        else:
+            payload[field] = tmpl.replace("{nat}", nat)
+    payload["pais_residencia"] = res
     payload["f0sf1"]                      = posto_id
     payload["__RequestVerificationToken"] = csrf
-
     return payload
 
 
@@ -172,160 +167,261 @@ def _extract_csrf(html: str) -> str | None:
     return m.group(1) if m else None
 
 
-async def apply_one(acct: dict, posto_id: str,
-                    slot_manager,  # SlotManager | None
-                    capsolver_keys: list[str], anticaptcha_keys: list[str],
-                    twocaptcha_keys: list[str], capmonster_keys: list[str],
-                    executor: ThreadPoolExecutor,
-                    nationality: str = "CPV",
-                    client=None,   # pre-warmed primp Client | None
-                    proxy: str | None = None) -> str:
-    """
-    Run the full apply workflow for one account.
-    Returns: "applied" | "no_slot" | "error" | "captcha_failed" | "session_dead"
-    """
-    username = acct["username"]
-    loop = asyncio.get_event_loop()
+# ── Steps 2-6: questionnaire → Formulario → ScheduleController → Schedule.jsp ─
 
+async def _run_steps_2_to_6(client, posto_id: str, acct: dict,
+                              nat: str, res: str,
+                              executor: ThreadPoolExecutor) -> dict:
+    """
+    Execute steps 2-6 on a live primp session.
+    Returns {"posto_pdf": str, "sched_url": str}. Raises on failure.
+    """
     import session as sess
-    import solver as solvermod
-    import session_store
+    import uuid as _uuid
 
-    # Resolve effective nationality: per-account value wins over run-level flag
-    nat = acct.get("nationality", "").strip() or nationality
+    username   = acct.get("username", "?")
+    loop       = asyncio.get_event_loop()
+    quest_key  = res if res != nat else nat
+    quest_steps = _load_quest_steps(quest_key)
 
-    # Load questionnaire steps for this nationality
-    quest_steps = _load_quest_steps(nat)
-
-    # Use pre-warmed client or create a fresh one
-    if client is None:
-        loaded = await loop.run_in_executor(executor, session_store.load, username)
-        if loaded:
-            client, proxy = loaded
-            alive = await loop.run_in_executor(executor, session_store.is_alive, client)
-            if not alive:
-                _log(username, "session expired — re-logging in")
-                client = None
-        if client is None:
-            try:
-                client = await loop.run_in_executor(executor, sess.get_session, proxy)
-            except Exception as e:
-                _log(username, f"get_session failed: {e}")
-                return "error"
-
-    def _get(url, **kw):
-        return client.get(url, headers=sess.HEADERS_NAV, timeout=20, **kw)
-
-    def _post(url, **kw):
-        return client.post(url, headers=sess.HEADERS_XHR, timeout=20, **kw)
-
-    # HAR-matched header sets for each step
-    _HDR_QUEST_NEXT = {                      # cors XHR (not navigate)
+    _HDR_QUEST_NEXT = {
         **sess.HEADERS_XHR,
-        "Accept":        "text/plain, */*; q=0.01",
-        "Referer":       QUEST_URL,
+        "Accept":         "text/plain, */*; q=0.01",
+        "Referer":        QUEST_URL,
         "Sec-Fetch-Dest": "empty",
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Site": "same-origin",
     }
-    _HDR_FORMULARIO = {                      # navigate (browser form submit)
+    _HDR_FORMULARIO = {
         **sess.HEADERS_NAV,
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "Origin":        BASE,
-        "Referer":       QUEST_URL,
+        "Content-Type":   "application/x-www-form-urlencoded; charset=UTF-8",
+        "Origin":          BASE,
+        "Referer":         QUEST_URL,
         "Sec-Fetch-Dest": "document",
         "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-Site": "same-origin",
     }
-    _HDR_SCHED_CTRL = {                      # navigate (browser form submit)
-        **sess.HEADERS_NAV,
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "Origin":        BASE,
-        "Referer":       FORMULARIO + "?copy=true",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "same-origin",
+    _HDR_SCHED_CTRL = {
+        **{k: v for k, v in sess.HEADERS_NAV.items() if k.lower() != "content-type"},
+        "Origin":                    BASE,
+        "Referer":                   FORMULARIO + "?copy=true",
+        "Sec-Fetch-Dest":            "document",
+        "Sec-Fetch-Mode":            "navigate",
+        "Sec-Fetch-Site":            "same-origin",
+        "Sec-Fetch-User":            "?1",
+        "Upgrade-Insecure-Requests": "1",
     }
 
-    try:
-        # Step 1: Verify alive
-        _log(username, "GET /VistosOnline/")
+    # Step 2
+    _log(username, "GET /Questionario")
+    await loop.run_in_executor(executor, lambda: client.get(
+        QUEST_URL, headers=sess.HEADERS_NAV, timeout=20))
+
+    # Step 3
+    base_qs = {"lang": "ENG", "nacionalidade": nat}
+    for step in quest_steps:
+        params = {**base_qs, **step}
+        await loop.run_in_executor(executor, lambda p=params: client.get(
+            QUEST_NEXT, params=p, headers=_HDR_QUEST_NEXT, timeout=20))
+    _log(username, f"questionnaire: {len(quest_steps)} steps done (nat={nat})")
+
+    # Step 4: Formulario → CSRF token
+    formulario_payload = {
+        "lang":                   "ENG",
+        "nacionalidade":          nat,
+        "pais_residencia":        res,
+        "tipo_passaporte":        "01",
+        "copia_pedido":           "",
+        "cb_pais_residencia":     res,
+        "cb_tipo_passaporte":     "01",
+        "cb_qt_dias":             "SCH",
+        "cb_trab_sazonal":        "O",
+        "cb_motivo_estada_sch":   "10",
+        "cb_viaja_reune_turismo": "FAM_N",
+        "tipo_visto":             "C",
+        "tipo_visto_desc":        "SHORT STAY VISA (SCHENGEN)",
+        "class_visto":            "SCH",
+        "cod_estada":             "10",
+        "id_visto_doc":           "36",
+    }
+    _log(username, "POST /Formulario")
+    r = await loop.run_in_executor(executor, lambda: client.post(
+        FORMULARIO, params={"copy": "true"},
+        data=formulario_payload,
+        headers=_HDR_FORMULARIO, timeout=30))
+    csrf = _extract_csrf(r.text)
+    _log(username, f"Formulario HTTP {r.status_code}  url={r.url}  len={len(r.text or '')}")
+    _log(username, f"Formulario body snippet: {(r.text or '')[:600]}")
+    if not csrf:
+        _log(username, "WARN: CSRF token not found")
+        csrf = ""
+    else:
+        _log(username, f"CSRF extracted: {csrf[:20]}...  (len={len(csrf)})")
+
+    # Step 5: ScheduleController (multipart/form-data)
+    payload = _build_schedule_payload(acct, posto_id, csrf, nat, residence=res)
+    _log(username, f"ScheduleController key fields: f0sf1={payload.get('f0sf1')}  "
+         f"f1={payload.get('f1')}  f3={payload.get('f3')}  f4={payload.get('f4')}  "
+         f"f14={payload.get('f14')}  nacionalidade={payload.get('nacionalidade')}  "
+         f"pais_residencia={payload.get('pais_residencia')}  csrf_len={len(csrf)}")
+
+    _primp_client = getattr(client, 'client', client)
+    _boundary  = "----WebKitFormBoundary" + _uuid.uuid4().hex[:16]
+    _file_names = {"foto", "file1", "file2", "file3", "file4"}
+    _mp_body = b""
+    for k, v in payload.items():
+        if k in _file_names:
+            _mp_body += (
+                f"--{_boundary}\r\n"
+                f'Content-Disposition: form-data; name="{k}"; filename=""\r\n'
+                f"Content-Type: application/octet-stream\r\n\r\n"
+            ).encode() + b"\r\n"
+        else:
+            _mp_body += (
+                f"--{_boundary}\r\n"
+                f'Content-Disposition: form-data; name="{k}"\r\n\r\n'
+                f"{v}\r\n"
+            ).encode("utf-8")
+    _mp_body += f"--{_boundary}--\r\n".encode()
+    _mp_ct = f"multipart/form-data; boundary={_boundary}"
+
+    _log(username, f"POST /ScheduleController?posto_id={posto_id} (multipart/form-data)")
+    r_raw = await loop.run_in_executor(executor, lambda: _primp_client.post(
+        SCHED_CTRL, params={"posto_id": posto_id},
+        content=_mp_body,
+        headers={**_HDR_SCHED_CTRL, "Content-Type": _mp_ct},
+        timeout=30))
+
+    class _R:
+        def __init__(self, raw):
+            self.status_code = raw.status_code
+            self.text = raw.text
+            self.url = str(raw.url)
+    r = _R(r_raw)
+    _log(username, f"ScheduleController → {r.status_code}  url={r.url}")
+    if r.status_code not in (200, 302):
+        _log(username, f"ScheduleController body (first 500): {(r.text or '')[:500]}")
+
+    # Step 6: Schedule.jsp
+    sched_jsp_url = SCHED_JSP + "?posto_id=" + posto_id
+    if "Schedule.jsp" not in r.url:
+        _log(username, f"GET /Schedule.jsp?posto_id={posto_id}")
         r = await loop.run_in_executor(executor, lambda: client.get(
-            session_store.COOKIES_URL, headers=sess.HEADERS_NAV, timeout=15, follow_redirects=False))
+            SCHED_JSP, params={"posto_id": posto_id},
+            headers={**sess.HEADERS_NAV, "Referer": SCHED_CTRL + "?posto_id=" + posto_id},
+            timeout=20))
+    _log(username, f"Schedule.jsp HTTP {r.status_code}  url={r.url}")
+    sched_html = r.text or ""
+    _log(username, f"Schedule.jsp body snippet: {sched_html[:600]}")
+
+    posto_pdf = posto_id
+    m_pdf = re.search(r"SubmeterVistoCriaPDF\?posto_id=(\d+)", sched_html)
+    if m_pdf:
+        posto_pdf = m_pdf.group(1)
+        if posto_pdf != posto_id:
+            _log(username, f"POSTO_PDF={posto_pdf} (differs from POSTO={posto_id})")
+
+    return {"posto_pdf": posto_pdf, "sched_url": sched_jsp_url}
+
+
+# ── apply_warmup: steps 1-6 + checkpoint save ─────────────────────────────────
+
+async def apply_warmup(acct: dict, posto_id: str,
+                       capsolver_keys: list[str], anticaptcha_keys: list[str],
+                       twocaptcha_keys: list[str], capmonster_keys: list[str],
+                       executor: ThreadPoolExecutor,
+                       nationality: str = "CPV",
+                       residence: str = "",
+                       client=None,
+                       proxy: str | None = None) -> dict | str:
+    """
+    Run steps 1-6 on a pre-authenticated client. Save schedule_jsp checkpoint.
+    Returns {"posto_pdf", "posto_id", "nat", "res", "sched_url"} or "session_dead" | "error".
+    client must not be None; caller is responsible for provisioning it.
+    """
+    import session as sess
+    import session_store
+
+    username = acct["username"]
+    loop     = asyncio.get_event_loop()
+    nat = acct.get("nationality", "").strip() or nationality
+    res = residence.strip() or nat
+
+    if client is None:
+        return "session_dead"
+
+    # Step 1: alive check
+    _log(username, "GET /VistosOnline/")
+    try:
+        r = await loop.run_in_executor(executor, lambda: client.get(
+            session_store.COOKIES_URL, headers=sess.HEADERS_NAV,
+            timeout=15, follow_redirects=False))
         if r.status_code == 302:
             return "session_dead"
+    except Exception as e:
+        _log(username, f"alive check failed: {e}")
+        return "session_dead"
 
-        # Step 2: Questionnaire
-        _log(username, "GET /Questionario")
-        await loop.run_in_executor(executor, lambda: _get(QUEST_URL))
+    # Steps 2-6
+    try:
+        info = await _run_steps_2_to_6(client, posto_id, acct, nat, res, executor)
+    except Exception as e:
+        _log(username, f"warmup steps 2-6 failed: {e}")
+        return "error"
 
-        # Step 3: Questionnaire steps (HAR: cors mode, Referer: /Questionario)
-        base_qs = {"lang": "ENG", "nacionalidade": nat}
-        for step in quest_steps:
-            params = {**base_qs, **step}
-            await loop.run_in_executor(executor, lambda p=params: client.get(
-                QUEST_NEXT, params=p, headers=_HDR_QUEST_NEXT, timeout=20))
-        _log(username, f"questionnaire: {len(quest_steps)} steps done (nat={nat})")
+    posto_pdf = info["posto_pdf"]
+    sched_url = info["sched_url"]
 
-        # Step 4: Formulario → get CSRF token (HAR: navigate mode, not XHR)
-        formulario_payload = {
-            "lang":                   "ENG",
-            "nacionalidade":          nat,
-            "pais_residencia":        nat,
-            "tipo_passaporte":        "01",
-            "copia_pedido":           "",
-            "cb_pais_residencia":     nat,
-            "cb_tipo_passaporte":     "01",
-            "cb_qt_dias":             "SCH",
-            "cb_trab_sazonal":        "O",
-            "cb_motivo_estada_sch":   "10",
-            "cb_viaja_reune_turismo": "FAM_N",
-            "tipo_visto":             "C",
-            "tipo_visto_desc":        "SHORT STAY VISA (SCHENGEN)",
-            "class_visto":            "SCH",
-            "cod_estada":             "10",
-            "id_visto_doc":           "36",
-        }
-        _log(username, "POST /Formulario")
-        r = await loop.run_in_executor(executor, lambda: client.post(
-            FORMULARIO, params={"copy": "true"},
-            data=formulario_payload,
-            headers=_HDR_FORMULARIO, timeout=30))
-        csrf = _extract_csrf(r.text)
-        if not csrf:
-            _log(username, f"WARN: CSRF token not found in Formulario (HTTP {r.status_code}, len={len(r.text)})")
-            _log(username, f"  first 300: {r.text[:300]}")
-            csrf = ""
-        else:
-            _log(username, f"CSRF extracted (len={len(csrf)})")
+    try:
+        _save_client = getattr(client, 'client', client)
+        _save_proxy  = getattr(client, 'proxy', None) or proxy
+        session_store.save(username, _save_client, _save_proxy,
+                           checkpoint="schedule_jsp",
+                           posto_id=posto_id,
+                           posto_pdf=posto_pdf,
+                           nationality=nat,
+                           residence=res)
+        _log(username, f"checkpoint saved: schedule_jsp  posto_id={posto_id}  "
+             f"posto_pdf={posto_pdf}  proxy={'yes' if _save_proxy else 'none'}")
+    except Exception as se:
+        _log(username, f"checkpoint save failed (non-fatal): {se}")
 
-        # Step 5: ScheduleController (HAR: navigate mode, Referer: /Formulario?copy=true)
-        payload = _build_schedule_payload(acct, posto_id, csrf, nat)
-        _log(username, f"POST /ScheduleController?posto_id={posto_id}")
-        r = await loop.run_in_executor(executor, lambda: client.post(
-            SCHED_CTRL, params={"posto_id": posto_id},
-            data=payload,
-            headers=_HDR_SCHED_CTRL,
-            timeout=30, follow_redirects=True))
-        _log(username, f"ScheduleController → {r.status_code}")
+    return {"posto_pdf": posto_pdf, "posto_id": posto_id, "nat": nat, "res": res,
+            "sched_url": sched_url}
 
-        # Step 6: Schedule.jsp (already followed by redirect above)
-        sched_jsp_url = SCHED_JSP + "?posto_id=" + posto_id
-        if "Schedule.jsp" not in r.url:
-            _log(username, f"GET /Schedule.jsp?posto_id={posto_id}")
-            r = await loop.run_in_executor(executor, lambda: client.get(
-                SCHED_JSP, params={"posto_id": posto_id},
-                headers={**sess.HEADERS_NAV, "Referer": SCHED_CTRL + "?posto_id=" + posto_id},
-                timeout=20))
-        _log(username, f"Schedule.jsp HTTP {r.status_code}")
 
-        # Step 7: POST /slots with CAPTCHA (HAR: cors mode, Referer: Schedule.jsp)
+# ── apply_book: steps 7-9 ─────────────────────────────────────────────────────
+
+async def apply_book(acct: dict, posto_id: str, posto_pdf: str,
+                     slot_manager,
+                     capsolver_keys: list[str], anticaptcha_keys: list[str],
+                     twocaptcha_keys: list[str], capmonster_keys: list[str],
+                     executor: ThreadPoolExecutor,
+                     client=None,
+                     proxy: str | None = None,
+                     nat: str = "CPV",
+                     res: str = "") -> str:
+    """
+    Run steps 7-9 on a warmed session (Schedule.jsp already reachable).
+    Returns "applied" | "no_slot" | "error" | "captcha_failed".
+    """
+    import session as sess
+    import solver as solvermod
+
+    username      = acct["username"]
+    loop          = asyncio.get_event_loop()
+    sched_jsp_url = SCHED_JSP + "?posto_id=" + posto_id
+
+    try:
+        # Step 7: CAPTCHA + /slots
         _log(username, f"CAPTCHA solve for SCHEDULE_EVISA (proxy={proxy})")
         try:
             token = await loop.run_in_executor(
-                executor, solvermod.race_all,
-                capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
-                "SCHEDULE_EVISA", proxy,
+                executor,
+                lambda: solvermod.race_all(
+                    capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
+                    "SCHEDULE_EVISA", proxy, min_score=50,
+                ),
             )
         except Exception as e:
             _log(username, f"CAPTCHA failed: {e}")
@@ -343,13 +439,27 @@ async def apply_one(acct: dict, posto_id: str,
             _log(username, f"slots: non-JSON response: {r.text[:200]}")
             return "error"
 
+        _log(username, f"slots raw: {json.dumps(slots_json)[:600]}")
+
+        if isinstance(slots_json, dict):
+            slots_data = slots_json.get("data") or {}
+            if not slots_data:
+                _log(username, "slots: empty data — no appointments available")
+                return "no_slot"
+            slots_json = [
+                {"date": d, "periods": [{"id": p} if not isinstance(p, dict) else p
+                                        for p in (ps if isinstance(ps, list) else [ps])]}
+                for d, ps in slots_data.items()
+            ]
+            _log(username, f"slots normalized: {json.dumps(slots_json)[:300]}")
+
         if not slots_json:
             _log(username, "slots: empty — no appointments available")
             return "no_slot"
 
         _log(username, f"slots: {len(slots_json)} dates available")
 
-        # Step 8: Get assigned slot from SlotManager (if coordinator provided)
+        # Step 8: Assign slot
         visible_slots = slots_json
         lease = None
         if slot_manager:
@@ -358,19 +468,30 @@ async def apply_one(acct: dict, posto_id: str,
             if not lease:
                 _log(username, "no slot assigned (all leased/taken)")
                 return "no_slot"
-            slot_date = lease.date
+            slot_date   = lease.date
             slot_period = lease.period_id
         else:
-            # No coordinator — pick first available slot
-            first = slots_json[0]
-            slot_date = first["date"]
-            slot_period = str(first["periods"][0]["id"])
+            try:
+                first = slots_json[0]
+                slot_date = first["date"]
+                periods = first.get("periods") or first.get("cmbPeriodo") or []
+                if isinstance(periods, list) and periods:
+                    p0 = periods[0]
+                    slot_period = str(p0["id"] if isinstance(p0, dict) else p0)
+                elif isinstance(periods, (str, int)):
+                    slot_period = str(periods)
+                else:
+                    _log(username, f"slot format unknown — first={first}")
+                    return "error"
+            except Exception as e:
+                _log(username, f"slot parse error: {e}")
+                return "error"
 
         _log(username, f"booking slot: date={slot_date} period={slot_period}")
 
-        # Step 9: SubmeterVistoCriaPDF (HAR: XHR cors, Referer: Schedule.jsp)
+        # Step 9: SubmeterVistoCriaPDF
         r = await loop.run_in_executor(executor, lambda: client.post(
-            SUBMIT_URL, params={"posto_id": posto_id},
+            SUBMIT_URL, params={"posto_id": posto_pdf},
             data={"lang": "ENG", "txtHuman": "", "back": "",
                   "f_date_c": slot_date, "cmbPeriodo": slot_period},
             headers={**sess.HEADERS_XHR, "Referer": sched_jsp_url}, timeout=30))
@@ -378,19 +499,49 @@ async def apply_one(acct: dict, posto_id: str,
         resp_text = r.text.strip()
         _log(username, f"SubmeterVisto → {r.status_code}  body={resp_text[:150]}")
 
-        if r.status_code == 200 and (
-            "PDF" in resp_text or "comprovativo" in resp_text.lower()
+        _known_errors = ("indisponivel", "unavailable", "erro", "error", "bd_problm")
+        _has_error_kw = any(kw in resp_text.lower() for kw in _known_errors)
+        _looks_ok = (
+            "PDF" in resp_text
+            or "comprovativo" in resp_text.lower()
             or "agendamento" in resp_text.lower()
-        ):
+            or (len(resp_text) > 100 and not _has_error_kw)
+        )
+
+        if r.status_code == 200 and _looks_ok:
             if lease:
                 slot_manager.confirm(lease)
+            pdf_saved = False
+            try:
+                pdf_url = BASE + "/VistosOnline/MostrarPdf?"
+                r_pdf = await loop.run_in_executor(executor, lambda: client.get(
+                    pdf_url,
+                    headers={**sess.HEADERS_NAV, "Referer": sched_jsp_url},
+                    timeout=30))
+                ct = (getattr(r_pdf, "headers", {}) or {}).get("content-type", "")
+                if r_pdf.status_code == 200 and (
+                    "application/pdf" in ct
+                    or (hasattr(r_pdf, "content") and len(r_pdf.content) > 1000)
+                ):
+                    pdf_dir = Path(__file__).parent / "data" / "pdfs"
+                    pdf_dir.mkdir(exist_ok=True)
+                    pdf_path = pdf_dir / f"{username}.pdf"
+                    pdf_bytes = r_pdf.content if hasattr(r_pdf, "content") else r_pdf.text.encode()
+                    pdf_path.write_bytes(pdf_bytes)
+                    _log(username, f"PDF saved → {pdf_path}  ({len(pdf_bytes)} bytes)")
+                    pdf_saved = True
+                else:
+                    _log(username, f"PDF download failed: status={r_pdf.status_code} ct={ct[:60]}")
+            except Exception as pdf_err:
+                _log(username, f"PDF download error: {pdf_err}")
+
             _csv_update(username, status="applied",
                         appointment_ref=f"{slot_date}_{slot_period}",
-                        notes=f"booked:{slot_date} period:{slot_period}")
-            _log(username, f"APPLIED  slot={slot_date} period={slot_period}")
+                        notes=f"booked:{slot_date} period:{slot_period}"
+                              + (" pdf_saved" if pdf_saved else ""))
+            _log(username, f"APPLIED  slot={slot_date} period={slot_period}  pdf={pdf_saved}")
             return "applied"
 
-        # Check if slot was already taken
         if "indisponivel" in resp_text.lower() or "unavailable" in resp_text.lower():
             if lease:
                 slot_manager.release(lease, "already_taken")
@@ -403,8 +554,143 @@ async def apply_one(acct: dict, posto_id: str,
         return "error"
 
     except Exception as e:
-        _log(username, f"EXCEPTION in apply_one: {e}")
+        _log(username, f"EXCEPTION in apply_book: {e}")
         return "error"
+
+
+# ── poll_slots_once: scout polling (lazy re-warm + /slots) ────────────────────
+
+async def poll_slots_once(client, proxy: str | None, posto_id: str,
+                          acct: dict, nat: str, res: str,
+                          capsolver_keys: list[str], anticaptcha_keys: list[str],
+                          twocaptcha_keys: list[str], capmonster_keys: list[str],
+                          executor: ThreadPoolExecutor) -> list[dict]:
+    """
+    One scout poll cycle: check alive → lazy re-warm if form state expired →
+    solve CAPTCHA → POST /slots → return normalized slot list.
+    Raises SessionExpired if Vistos_sid is dead or re-warm fails.
+    """
+    import session as sess
+    import solver as solvermod
+    import session_store
+
+    username  = acct.get("username", "?")
+    loop      = asyncio.get_event_loop()
+    sched_url = SCHED_JSP + "?posto_id=" + posto_id
+
+    # Check session alive
+    alive = await loop.run_in_executor(executor, session_store.is_alive, client)
+    if not alive:
+        raise SessionExpired(f"{username}: Vistos_sid dead")
+
+    # Lazy re-warm: form draft expires ~5-7 min after ScheduleController POST
+    try:
+        r_check = await loop.run_in_executor(executor, lambda: client.get(
+            sched_url, headers=sess.HEADERS_NAV, timeout=15, follow_redirects=False))
+        schedule_ok = r_check.status_code == 200
+    except Exception:
+        schedule_ok = False
+
+    if not schedule_ok:
+        _log(username, "poll: form state expired — re-warming steps 2-6")
+        try:
+            await _run_steps_2_to_6(client, posto_id, acct, nat, res, executor)
+        except Exception as e:
+            raise SessionExpired(f"{username}: re-warm failed: {e}")
+
+    # Solve CAPTCHA
+    try:
+        token = await loop.run_in_executor(
+            executor,
+            lambda: solvermod.race_all(
+                capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
+                "SCHEDULE_EVISA", proxy, min_score=50,
+            ),
+        )
+    except Exception as e:
+        _log(username, f"poll: CAPTCHA failed: {e}")
+        return []
+
+    # POST /slots
+    try:
+        r = await loop.run_in_executor(executor, lambda: client.post(
+            SLOTS_URL, params={"posto_id": posto_id},
+            data={"posto_id": posto_id, "captcha": token},
+            headers={**sess.HEADERS_XHR, "Referer": sched_url}, timeout=30))
+        slots_json = r.json()
+    except Exception as e:
+        _log(username, f"poll: /slots error: {e}")
+        return []
+
+    if isinstance(slots_json, dict):
+        slots_data = slots_json.get("data") or {}
+        if not slots_data:
+            return []
+        return [
+            {"date": d, "periods": [{"id": p} if not isinstance(p, dict) else p
+                                    for p in (ps if isinstance(ps, list) else [ps])]}
+            for d, ps in slots_data.items()
+        ]
+    return slots_json if isinstance(slots_json, list) else []
+
+
+# ── apply_one: thin wrapper (warmup + book) ────────────────────────────────────
+
+async def apply_one(acct: dict, posto_id: str,
+                    slot_manager,
+                    capsolver_keys: list[str], anticaptcha_keys: list[str],
+                    twocaptcha_keys: list[str], capmonster_keys: list[str],
+                    executor: ThreadPoolExecutor,
+                    nationality: str = "CPV",
+                    residence: str = "",
+                    client=None,
+                    proxy: str | None = None) -> str:
+    """
+    Run the full apply workflow for one account.
+    Returns: "applied" | "no_slot" | "error" | "captcha_failed" | "session_dead"
+    """
+    username = acct["username"]
+    nat = acct.get("nationality", "").strip() or nationality
+    res = residence.strip() or nat
+
+    import session as sess
+    import session_store
+    loop = asyncio.get_event_loop()
+
+    # Provision client if not provided
+    if client is None:
+        loaded = await loop.run_in_executor(executor, session_store.load, username)
+        if loaded:
+            client, proxy = loaded
+            alive = await loop.run_in_executor(executor, session_store.is_alive, client)
+            if not alive:
+                _log(username, "session expired — re-logging in")
+                client = None
+        if client is None:
+            try:
+                client = await loop.run_in_executor(executor, sess.get_session, proxy)
+            except Exception as e:
+                _log(username, f"get_session failed: {e}")
+                return "error"
+
+    # Steps 1-6
+    warmup = await apply_warmup(
+        acct, posto_id,
+        capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
+        executor, nationality=nat, residence=res,
+        client=client, proxy=proxy,
+    )
+    if isinstance(warmup, str):
+        return warmup
+
+    # Steps 7-9
+    return await apply_book(
+        acct, posto_id, warmup["posto_pdf"],
+        slot_manager,
+        capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
+        executor, client=client, proxy=proxy,
+        nat=warmup["nat"], res=warmup["res"],
+    )
 
 
 async def main_async(args: argparse.Namespace,
@@ -412,7 +698,8 @@ async def main_async(args: argparse.Namespace,
                      twocaptcha_keys: list[str], capmonster_keys: list[str]) -> None:
     from account_pool import AccountPool
 
-    pool = AccountPool(_ACCOUNT_FILE)
+    acct_file = Path(args.accounts_file) if getattr(args, "accounts_file", "") else _ACCOUNT_FILE
+    pool = AccountPool(acct_file)
     if args.account:
         acct = pool.get_by_username(args.account)
         if not acct:
@@ -430,9 +717,10 @@ async def main_async(args: argparse.Namespace,
 
     posto_id = args.posto
     nat      = args.nationality
+    res      = getattr(args, "residence", "") or nat
 
     print(f"\n[batch_apply] {len(accounts)} accounts  posto={posto_id}"
-          f"  nationality={nat}  concurrency={args.concurrency}")
+          f"  nationality={nat}  residence={res}  concurrency={args.concurrency}")
 
     sem      = asyncio.Semaphore(args.concurrency)
     executor = ThreadPoolExecutor(max_workers=args.concurrency + 4)
@@ -441,10 +729,11 @@ async def main_async(args: argparse.Namespace,
         async with sem:
             return await apply_one(
                 acct, posto_id,
-                None,   # no slot manager in standalone mode
+                None,
                 capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
                 executor,
                 nationality=nat,
+                residence=res,
             )
 
     results = await asyncio.gather(*[bounded(a) for a in accounts], return_exceptions=True)
@@ -471,11 +760,26 @@ def main() -> None:
     parser.add_argument("--account",      default="", help="Single account username")
     parser.add_argument("--count",        type=int, default=0)
     parser.add_argument("--concurrency",  type=int, default=5)
-    parser.add_argument("--posto",        default=env.get("POSTO_ID", "5086"),
-                        help="Consular post ID (ScheduleController + slots)")
-    parser.add_argument("--nationality",  default=env.get("NATIONALITY", "CPV"),
-                        help="ISO 3166-1 alpha-3 nationality code (default: NATIONALITY from .env)")
+    parser.add_argument("--posto",        default="",
+                        help="Consular post ID (default: driven by --mode)")
+    parser.add_argument("--nationality",  default="",
+                        help="ISO 3166-1 alpha-3 passport nationality (default: driven by --mode)")
+    parser.add_argument("--residence",    default="",
+                        help="Country of residence ISO code (default: driven by --mode)")
+    parser.add_argument("--accounts-file", default="",
+                        dest="accounts_file",
+                        help="Path to accounts CSV (default: driven by --mode)")
+    parser.add_argument("--mode", default="",
+                        help="Run mode: test or real (default: real; or MODE from .env)")
     args = parser.parse_args()
+
+    from mode_config import get_mode_cfg
+    cfg = get_mode_cfg(env, args.mode)
+    args.posto       = args.posto       or cfg["posto_id"]
+    args.nationality = args.nationality or cfg["nationality"]
+    args.residence   = args.residence   or cfg["residence"]
+    if not args.accounts_file:
+        args.accounts_file = cfg["accounts_file"]
 
     def _keys(k: str) -> list[str]:
         return [x.strip() for x in env.get(k, "").split(",") if x.strip()]

@@ -37,7 +37,9 @@ _ISP_PROXY_FILE       = Path(__file__).parent / "data" / "proxies_isp.txt"
 _SOAX_PROXY_FILE      = Path(__file__).parent / "data" / "proxies_soax.txt"
 _WEBSHARE_PROXY_FILE  = Path(__file__).parent / "data" / "proxies_webshare.txt"
 
-MAX_PROXY_RETRIES = 5  # max different proxies tried per account before marking failed
+MAX_PROXY_RETRIES  = 5  # max different proxies tried per credential set
+MAX_REGEN          = 3  # max credential regenerations per traveldoc before giving up
+MAX_VERIFY_RETRIES = 3  # max browser-verify attempts after registration succeeds
 
 _csv_lock = threading.Lock()
 _print_lock = threading.Lock()
@@ -93,6 +95,26 @@ def _load_proxies_from_file(path: Path) -> list[str]:
 # How many proxies to search per registration attempt to find one with a fresh exit IP.
 # If SOAX maps multiple session IDs to the same IP, we skip those and search further.
 _IP_SEARCH_PER_ATTEMPT = 20
+
+
+def _regen_account(acct: dict, regen_n: int) -> None:
+    """Regenerate username+password for an account that exhausted proxy retries.
+    Updates the CSV row in-place (old username → new username) and mutates acct dict."""
+    from gen_accounts import _make_username, _make_password
+    with _csv_lock:
+        from account_pool import AccountPool
+        pool = AccountPool(_ACCOUNT_FILE)
+        existing = {a["username"] for a in pool.all()}
+        old_username = acct["username"]
+        new_username = _make_username(acct["first_name"], acct["last_name"], existing)
+        new_password = _make_password()
+        pool.update(old_username,
+                    username=new_username, password=new_password,
+                    email="", email_pass="", registered_at="",
+                    status="new", notes=f"regen:{regen_n}")
+    acct["username"] = new_username
+    acct["password"] = new_password
+    acct["email"]    = ""
 
 
 async def _register_one(acct: dict, pool,  # PersistentProxyPool
@@ -155,149 +177,174 @@ async def _register_one(acct: dict, pool,  # PersistentProxyPool
         return None
 
     # ── Phase 1: browser — WAF bypass + CAPTCHA + register POST ──────────────
+    # Outer loop: regenerate credentials if all proxy attempts fail.
+    # Inner loop: up to MAX_PROXY_RETRIES proxies per credential set.
     # browser_sem limits simultaneous Chromium processes regardless of total
     # account concurrency. Browser is CLOSED immediately after registration
     # succeeds to free RAM during the email-polling gap (60-300 s).
 
-    for proxy_attempt in range(MAX_PROXY_RETRIES):
-        fresh = await _next_fresh_proxy()
-        if fresh is None:
-            _log(username, "FAIL no fresh exit IPs found within search budget")
-            break
-        proxy, exit_ip = fresh
-        if proxy_attempt > 0:
-            _log(username, f"retry proxy_attempt={proxy_attempt} exit_ip={exit_ip}")
+    proxy_success = False
 
-        async with browser_sem:
-            try:
-                s = await loop.run_in_executor(
-                    executor, lambda _p=proxy: sess.get_session(_p, headless=not headed))
-            except Exception as e:
-                _log(username, f"FAIL get_session ({exit_ip}): {e}")
-                continue
+    for regen_n in range(MAX_REGEN + 1):
+        if regen_n > 0:
+            _log(username, f"regen {regen_n}/{MAX_REGEN}: regenerating credentials for {acct['traveldoc']}")
+            _regen_account(acct, regen_n)
+            username = acct["username"]
 
-            token = None
-            try:
-                _log(username, f"CAPTCHA race-all (exit_ip={exit_ip})")
-                token = await loop.run_in_executor(
-                    executor, solvermod.race_all,
-                    capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
-                    "REGISTER_EVISA", proxy,
-                )
-            except Exception as e:
-                _log(username, f"CAPTCHA race-all failed: {e}")
-
-            if not token:
-                _log(username, "FAIL all CAPTCHA attempts failed — skipping proxy")
-                try: s.close()
-                except Exception: pass
-                continue
-
-            payload = {
-                "name":            acct.get("first_name", ""),
-                "surname":         acct.get("last_name", ""),
-                "username":        username,
-                "password":        acct["password"],
-                "valPassword":     acct["password"],
-                "gender":          acct.get("gender", "M"),
-                "bday":            acct.get("birthdate", "1985/01/01"),
-                "nationality":     acct.get("nationality", "PRT"),
-                "traveldoc":       acct.get("traveldoc", ""),
-                "email":           email_addr,
-                "language":        lang,
-                "rgpd":            "Y",
-                "captchaResponse": token,
-            }
-            try:
-                def _do_register(s=s, payload=payload):
-                    return s.post(REGISTER_URL, data=payload,
-                                  headers=sess.HEADERS_XHR, timeout=90)
-                reg_resp = await loop.run_in_executor(executor, _do_register)
-                reg_body = reg_resp.text.strip()
-                _log(username, f"register status={reg_resp.status_code} body={reg_body[:150]}")
-            except Exception as e:
-                _log(username, f"register POST exception ({type(e).__name__}) — retrying with next proxy")
-                try: s.close()
-                except Exception: pass
-                continue
-
-            try:
-                reg_result = json.loads(reg_body)
-                reg_type   = reg_result.get("type", "")
-                reg_desc   = reg_result.get("description", "")
-            except json.JSONDecodeError:
-                reg_type = ""
-                reg_desc = reg_body[:80]
-
-            if reg_type == "secblock":
-                _log(username, f"secblock on {exit_ip} — burning, trying next")
-                pool.burn_today(proxy, "secblock")
-                try: s.close()
-                except Exception: pass
-                continue
-
-            if reg_type == "ReCaptchaError":
-                _log(username, "CAPTCHA rejected (low score) — trying next proxy")
-                try: s.close()
-                except Exception: pass
-                continue
-
-            if reg_type == "error":
-                _log(username, f"type=error on {exit_ip} — burning, trying next")
-                pool.burn_today(proxy, "register:type=error")
-                try: s.close()
-                except Exception: pass
-                continue
-
-            if "already_exists" in reg_type or "already_exists" in reg_desc.lower():
-                _log(username, "INFO account already exists on server")
-                _csv_update(username, status="registered", email=email_addr,
-                            email_pass=email_pass, proxy=_proxy_host(proxy))
-                try: s.close()
-                except Exception: pass
-                return "exists"
-
-            if reg_type == "200" or reg_resp.status_code == 503:
-                reg_token_raw = reg_result.get("description", "") if reg_type == "200" else ""
-                used_proxy    = proxy
-                _log(username, f"register SUCCESS  reg_token={reg_token_raw}  exit_ip={exit_ip}")
-                _csv_update(username, status="registered", email=email_addr,
-                            email_pass=email_pass, proxy=_proxy_host(proxy))
-                # Save cookies BEFORE closing — needed to reopen browser for verification
-                saved_cookies = s.get_cookies(AUTH_URL)
-                try: s.close()   # FREE BROWSER — email poll needs no browser
-                except Exception: pass
+        for proxy_attempt in range(MAX_PROXY_RETRIES):
+            fresh = await _next_fresh_proxy()
+            if fresh is None:
+                _log(username, "no fresh exit IPs found within search budget")
                 break
+            proxy, exit_ip = fresh
+            if proxy_attempt > 0:
+                _log(username, f"retry proxy_attempt={proxy_attempt} exit_ip={exit_ip}")
 
-            if reg_resp.status_code == 403:
-                _log(username, f"403 WAF on {exit_ip} — proxy burned, aborting")
-                pool.burn_today(proxy, "register:403waf")
+            async with browser_sem:
+                try:
+                    s = await loop.run_in_executor(
+                        executor, lambda _p=proxy: sess.get_session(_p, headless=not headed))
+                except Exception as e:
+                    _log(username, f"FAIL get_session ({exit_ip}): {e}")
+                    continue
+
+                token = None
+                try:
+                    _log(username, f"CAPTCHA race-all (exit_ip={exit_ip})")
+                    token = await loop.run_in_executor(
+                        executor, solvermod.race_all,
+                        capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
+                        "REGISTER_EVISA", proxy,
+                    )
+                except Exception as e:
+                    _log(username, f"CAPTCHA race-all failed: {e}")
+
+                if not token:
+                    _log(username, "FAIL all CAPTCHA attempts failed — skipping proxy")
+                    try: s.close()
+                    except Exception: pass
+                    continue
+
+                payload = {
+                    "name":            acct.get("first_name", ""),
+                    "surname":         acct.get("last_name", ""),
+                    "username":        username,
+                    "password":        acct["password"],
+                    "valPassword":     acct["password"],
+                    "gender":          acct.get("gender", "M"),
+                    "bday":            acct.get("birthdate", "1985/01/01"),
+                    "nationality":     acct.get("nationality", "PRT"),
+                    "traveldoc":       acct.get("traveldoc", ""),
+                    "email":           email_addr,
+                    "language":        lang,
+                    "rgpd":            "Y",
+                    "captchaResponse": token,
+                }
+                try:
+                    def _do_register(s=s, payload=payload):
+                        return s.post(REGISTER_URL, data=payload,
+                                      headers=sess.HEADERS_XHR, timeout=90)
+                    reg_resp = await loop.run_in_executor(executor, _do_register)
+                    reg_body = reg_resp.text.strip()
+                    _log(username, f"register status={reg_resp.status_code} body={reg_body[:150]}")
+                except Exception as e:
+                    _log(username, f"register POST exception ({type(e).__name__}) — retrying with next proxy")
+                    try: s.close()
+                    except Exception: pass
+                    continue
+
+                try:
+                    reg_result = json.loads(reg_body)
+                    reg_type   = reg_result.get("type", "")
+                    reg_desc   = reg_result.get("description", "")
+                except json.JSONDecodeError:
+                    reg_type = ""
+                    reg_desc = reg_body[:80]
+
+                if reg_type == "secblock":
+                    _log(username, f"secblock on {exit_ip} — burning, trying next")
+                    pool.burn_today(proxy, "secblock")
+                    try: s.close()
+                    except Exception: pass
+                    continue
+
+                if reg_type == "ReCaptchaError":
+                    _log(username, "CAPTCHA rejected (low score) — trying next proxy")
+                    try: s.close()
+                    except Exception: pass
+                    continue
+
+                if reg_type == "error":
+                    _log(username, f"type=error on {exit_ip} — burning, trying next")
+                    pool.burn_today(proxy, "register:type=error")
+                    try: s.close()
+                    except Exception: pass
+                    continue
+
+                if "already_exists" in reg_type or "already_exists" in reg_desc.lower():
+                    _log(username, "INFO account already exists on server")
+                    _csv_update(username, status="registered", email=email_addr,
+                                email_pass=email_pass, proxy=_proxy_host(proxy))
+                    try: s.close()
+                    except Exception: pass
+                    return "exists"
+
+                if reg_type == "200" or reg_resp.status_code == 503:
+                    reg_token_raw = reg_result.get("description", "") if reg_type == "200" else ""
+                    used_proxy    = proxy
+                    _log(username, f"register SUCCESS  reg_token={reg_token_raw}  exit_ip={exit_ip}")
+                    _csv_update(username, status="registered", email=email_addr,
+                                email_pass=email_pass, proxy=_proxy_host(proxy))
+                    # Save cookies BEFORE closing — needed to reopen browser for verification
+                    saved_cookies = s.get_cookies(AUTH_URL)
+                    try: s.close()   # FREE BROWSER — email poll needs no browser
+                    except Exception: pass
+                    proxy_success = True
+                    break
+
+                if reg_resp.status_code == 403:
+                    _log(username, f"403 WAF on {exit_ip} — proxy burned, aborting")
+                    pool.burn_today(proxy, "register:403waf")
+                    try: s.close()
+                    except Exception: pass
+                    _csv_update(username, status="failed", notes="403 WAF block")
+                    return "failed"
+
+                _log(username, f"WARN unexpected response HTTP {reg_resp.status_code}: {reg_desc[:80]}")
                 try: s.close()
                 except Exception: pass
-                _csv_update(username, status="failed", notes="403 WAF block")
-                return "failed"
+                continue
 
-            _log(username, f"WARN unexpected response HTTP {reg_resp.status_code}: {reg_desc[:80]}")
-            try: s.close()
-            except Exception: pass
-            continue
+        if proxy_success:
+            break   # proceed to email verification below
+
+        # All proxy attempts exhausted (or no fresh IPs found) — check if pool is dry
+        if pool.used_count >= pool.total:
+            _log(username, "proxy pool fully exhausted — add fresh proxies or reset")
+            print(
+                "\n[batch] proxy pool exhausted.\n"
+                "  Add fresh IPs to the proxy file, then re-run.\n"
+                "  Or reset used-IP tracking:\n"
+                "    uv run python -c \"from proxy_pool import PersistentProxyPool; "
+                "PersistentProxyPool('data/proxies_soax.txt').reset()\""
+            )
+            return "pool_exhausted"
 
     else:
-        _log(username, f"FAIL exhausted {MAX_PROXY_RETRIES} registration attempts")
+        # Outer regen loop exhausted all regeneration attempts
+        _log(username, f"FAIL exhausted {MAX_REGEN} credential regenerations for traveldoc={acct['traveldoc']}")
         _csv_update(username, status="failed",
-                    notes=f"exhausted {MAX_PROXY_RETRIES} registration attempts")
+                    notes=f"max_regen_exceeded:{acct['traveldoc']}")
         return "failed"
 
-    # ── Verification — browser stays alive until verify is done ─────────────────
-    # The browser session (Playwright) is needed for email verification because
-    # the server ties the challenge-bypass session to the browser TLS fingerprint.
-    # primp alone would receive the bot challenge page on the token URL.
+    # ── Verification — poll email then retry browser verify up to MAX_VERIFY_RETRIES ──
     tokens = await mail.async_poll_for_tokens(email_jwt, timeout=300, interval=5)
     if not tokens:
-        _log(username, "WARN no email tokens received — staying registered")
+        _log(username, "FAIL no email tokens received — marking failed")
         try: s.close()
         except Exception: pass
-        return "registered"
+        _csv_update(username, status="failed", notes="verify_email_timeout")
+        return "failed"
 
     link_token = tokens.get("link") or ""
     code_token = tokens.get("code") or ""
@@ -312,59 +359,78 @@ async def _register_one(acct: dict, pool,  # PersistentProxyPool
     )
     _log(username, f"email tokens: link={link_token}  code={code_token}")
 
-    # ── Phase 2: reopen browser for email verification ────────────────────────
-    # The registration browser was already closed. Reopen with saved_cookies so
-    # the WAF challenge is skipped (server sees a valid Vistos_sid immediately).
+    # ── Phase 2: reopen browser for email verification (with retries) ─────────
+    # Attempt 0: reuse saved_cookies + used_proxy (fast path, avoids new CAPTCHA).
+    # Subsequent attempts: fresh proxy + no injected cookies (full WAF bypass).
     token_page = f"{AUTH_URL}?token={token_search}"
-    async with browser_sem:
-        try:
-            def _open_verify_session(p=used_proxy, ck=saved_cookies):
-                return sess.get_session(p, inject_cookies=ck, headless=not headed)
-            sv = await loop.run_in_executor(executor, _open_verify_session)
-        except Exception as e:
-            _log(username, f"FAIL reopen session for verify: {e}")
-            return "registered"
-
-        try:
-            def _do_verify(sv=sv):
-                return sv.verify_email(
-                    token_url=token_page,
-                    insert_jsp=INSERT_TOKEN_JSP,
-                    verify_url=VERIFY_URL,
-                    token_input=token_input,
-                    token_search=token_search,
-                    lang=lang,
-                    timeout=90,
-                )
-            vr_dict   = await loop.run_in_executor(executor, _do_verify)
-            vr_status = vr_dict.get("status", 0)
-            vr_body   = vr_dict.get("body", "").strip()
-            _log(username, f"verify status={vr_status}  body={vr_body[:150]}")
-        except Exception as e:
-            _log(username, f"FAIL verify request: {e}")
-            return "registered"
-        finally:
-            try: sv.close()
-            except Exception: pass
-
-    verified = False
-    if vr_status == 200:
-        try:
-            vres  = json.loads(vr_body)
-            if vres.get("type", "") != "error":
-                verified = True
-                _log(username, f"VERIFIED: {vres.get('description', '')}")
+    verified   = False
+    for verify_attempt in range(MAX_VERIFY_RETRIES):
+        if verify_attempt == 0:
+            verify_proxy = used_proxy
+            inject       = saved_cookies
+        else:
+            _fresh = await _next_fresh_proxy()
+            if _fresh is None:
+                _log(username, f"WARN no fresh proxy for verify attempt {verify_attempt+1} — using last")
+                verify_proxy = used_proxy
             else:
-                _log(username, f"WARN verify type=error: {vres.get('description', '')}")
-        except json.JSONDecodeError:
-            # Server returned HTML (redirect to main page after successful verify)
-            if "/ch/bd.js" not in vr_body:
-                verified = True
-                _log(username, "VERIFIED (HTML redirect response — no challenge)")
+                verify_proxy, _ = _fresh
+            inject = {}
+
+        async with browser_sem:
+            sv = None
+            try:
+                def _open_verify_session(p=verify_proxy, ck=inject):
+                    return sess.get_session(p, inject_cookies=ck, headless=not headed)
+                sv = await loop.run_in_executor(executor, _open_verify_session)
+            except Exception as e:
+                _log(username, f"FAIL reopen session for verify (attempt {verify_attempt+1}): {e}")
+                continue
+
+            try:
+                def _do_verify(sv=sv):
+                    return sv.verify_email(
+                        token_url=token_page,
+                        insert_jsp=INSERT_TOKEN_JSP,
+                        verify_url=VERIFY_URL,
+                        token_input=token_input,
+                        token_search=token_search,
+                        lang=lang,
+                        timeout=90,
+                    )
+                vr_dict   = await loop.run_in_executor(executor, _do_verify)
+                vr_status = vr_dict.get("status", 0)
+                vr_body   = vr_dict.get("body", "").strip()
+                _log(username, f"verify status={vr_status}  body={vr_body[:150]}")
+            except Exception as e:
+                _log(username, f"FAIL verify request (attempt {verify_attempt+1}): {e}")
+                continue
+            finally:
+                if sv:
+                    try: sv.close()
+                    except Exception: pass
+
+        if vr_status == 200:
+            try:
+                vres = json.loads(vr_body)
+                if vres.get("type", "") != "error":
+                    verified = True
+                    _log(username, f"VERIFIED: {vres.get('description', '')}")
+                else:
+                    _log(username, f"WARN verify type=error: {vres.get('description', '')}")
+            except json.JSONDecodeError:
+                if "/ch/bd.js" not in vr_body:
+                    verified = True
+                    _log(username, "VERIFIED (HTML redirect response — no challenge)")
+
+        if verified:
+            break
+        _log(username, f"WARN verify attempt {verify_attempt + 1}/{MAX_VERIFY_RETRIES} failed — retrying")
 
     if not verified:
-        _log(username, "WARN verify returned unexpected response — staying registered")
-        return "registered"
+        _log(username, f"FAIL verify exhausted {MAX_VERIFY_RETRIES} attempts — marking failed")
+        _csv_update(username, status="failed", notes="verify_failed")
+        return "failed"
 
     _csv_update(username, status="verified")
     return "verified"
@@ -376,8 +442,8 @@ async def _verify_one(acct: dict, pool,  # PersistentProxyPool
                       headed: bool = False) -> str:
     """
     Email-verify an already-registered account whose inbox may still hold the token.
-    Polls the CF Worker (or mail.tm) once, then uses a browser session to submit.
-    Returns "verified" or "registered" (unchanged on any failure).
+    Polls the inbox once, then retries browser verify up to MAX_VERIFY_RETRIES times.
+    Returns "verified" or "failed" (never leaves account in "registered" state).
     """
     username   = acct["username"]
     email      = acct.get("email", "")
@@ -386,8 +452,9 @@ async def _verify_one(acct: dict, pool,  # PersistentProxyPool
     import session as sess
 
     if not email:
-        _log(username, "SKIP no email stored — cannot verify")
-        return "registered"
+        _log(username, "SKIP no email stored — marking failed")
+        _csv_update(username, status="failed", notes="verify_no_email")
+        return "failed"
 
     # ── Poll inbox for tokens ──────────────────────────────────────────────────
     if email_pass:
@@ -396,8 +463,9 @@ async def _verify_one(acct: dict, pool,  # PersistentProxyPool
         try:
             email_jwt = await loop.run_in_executor(executor, mail.token, email, email_pass)
         except Exception as e:
-            _log(username, f"FAIL mail.tm re-auth: {e}")
-            return "registered"
+            _log(username, f"FAIL mail.tm re-auth: {e} — marking failed")
+            _csv_update(username, status="failed", notes="verify_email_auth_fail")
+            return "failed"
         tokens = await mail.async_poll_for_tokens(email_jwt, timeout=60, interval=5)
     else:
         from email_pool import load_cf_mail_from_env
@@ -405,8 +473,9 @@ async def _verify_one(acct: dict, pool,  # PersistentProxyPool
         tokens = await cf.async_poll_for_tokens(email, timeout=60, interval=5)
 
     if not tokens or (not tokens.get("link") and not tokens.get("code")):
-        _log(username, "WARN no tokens in inbox — cannot verify")
-        return "registered"
+        _log(username, "WARN no tokens in inbox — marking failed (email link expired)")
+        _csv_update(username, status="failed", notes="verify_email_timeout")
+        return "failed"
 
     link_token = tokens.get("link") or ""
     code_token = tokens.get("code") or ""
@@ -419,56 +488,64 @@ async def _verify_one(acct: dict, pool,  # PersistentProxyPool
     )
     _log(username, f"tokens: link={link_token}  code={code_token}")
 
-    # ── Browser verify ─────────────────────────────────────────────────────────
+    # ── Browser verify with retries ────────────────────────────────────────────
     token_page = f"{AUTH_URL}?token={token_search}"
-    proxy = pool.advance()
-    async with browser_sem:
-        try:
-            s = await loop.run_in_executor(
-                executor, lambda _p=proxy: sess.get_session(_p, headless=not headed))
-        except Exception as e:
-            _log(username, f"FAIL get_session ({_proxy_host(proxy)}): {e}")
-            return "registered"
+    verified   = False
+    for verify_attempt in range(MAX_VERIFY_RETRIES):
+        proxy = pool.advance()
+        async with browser_sem:
+            s = None
+            try:
+                s = await loop.run_in_executor(
+                    executor, lambda _p=proxy: sess.get_session(_p, headless=not headed))
+            except Exception as e:
+                _log(username, f"FAIL get_session attempt {verify_attempt+1} ({_proxy_host(proxy)}): {e}")
+                continue
 
-        try:
-            def _do_verify(s=s):
-                return s.verify_email(
-                    token_url=token_page,
-                    insert_jsp=INSERT_TOKEN_JSP,
-                    verify_url=VERIFY_URL,
-                    token_input=token_input,
-                    token_search=token_search,
-                    lang=lang,
-                    timeout=90,
-                )
-            vr_dict   = await loop.run_in_executor(executor, _do_verify)
-            vr_status = vr_dict.get("status", 0)
-            vr_body   = vr_dict.get("body", "").strip()
-            _log(username, f"verify status={vr_status}  body={vr_body[:150]}")
-        except Exception as e:
-            _log(username, f"FAIL verify: {e}")
-            return "registered"
-        finally:
-            try: s.close()
-            except Exception: pass
+            try:
+                def _do_verify(s=s):
+                    return s.verify_email(
+                        token_url=token_page,
+                        insert_jsp=INSERT_TOKEN_JSP,
+                        verify_url=VERIFY_URL,
+                        token_input=token_input,
+                        token_search=token_search,
+                        lang=lang,
+                        timeout=90,
+                    )
+                vr_dict   = await loop.run_in_executor(executor, _do_verify)
+                vr_status = vr_dict.get("status", 0)
+                vr_body   = vr_dict.get("body", "").strip()
+                _log(username, f"verify status={vr_status}  body={vr_body[:150]}")
+            except Exception as e:
+                _log(username, f"FAIL verify attempt {verify_attempt+1}: {e}")
+                continue
+            finally:
+                if s:
+                    try: s.close()
+                    except Exception: pass
 
-    verified = False
-    if vr_status == 200:
-        try:
-            vres = json.loads(vr_body)
-            if vres.get("type", "") != "error":
-                verified = True
-                _log(username, f"VERIFIED: {vres.get('description', '')}")
-            else:
-                _log(username, f"WARN verify type=error: {vres.get('description', '')}")
-        except json.JSONDecodeError:
-            if "/ch/bd.js" not in vr_body:
-                verified = True
-                _log(username, "VERIFIED (HTML redirect — no challenge)")
+        if vr_status == 200:
+            try:
+                vres = json.loads(vr_body)
+                if vres.get("type", "") != "error":
+                    verified = True
+                    _log(username, f"VERIFIED: {vres.get('description', '')}")
+                else:
+                    _log(username, f"WARN verify type=error: {vres.get('description', '')}")
+            except json.JSONDecodeError:
+                if "/ch/bd.js" not in vr_body:
+                    verified = True
+                    _log(username, "VERIFIED (HTML redirect — no challenge)")
+
+        if verified:
+            break
+        _log(username, f"WARN verify attempt {verify_attempt+1}/{MAX_VERIFY_RETRIES} failed — retrying")
 
     if not verified:
-        _log(username, "WARN verify returned unexpected response — staying registered")
-        return "registered"
+        _log(username, f"FAIL verify exhausted {MAX_VERIFY_RETRIES} attempts — marking failed")
+        _csv_update(username, status="failed", notes="verify_failed")
+        return "failed"
 
     _csv_update(username, status="verified")
     return "verified"
@@ -621,7 +698,11 @@ async def main_async(args: argparse.Namespace,
     print("\n" + "="*50)
     print("[batch] SUMMARY")
     for k, v in sorted(counts.items()):
-        print(f"  {k:<12}: {v}")
+        print(f"  {k:<16}: {v}")
+    if counts.get("pool_exhausted", 0):
+        print("\n  [!] proxy pool exhausted — add fresh proxies or reset:")
+        print("      uv run python -c \"from proxy_pool import PersistentProxyPool; "
+              "PersistentProxyPool('data/proxies_soax.txt').reset()\"")
     print("="*50)
 
 
@@ -663,8 +744,18 @@ def main() -> None:
                         help="Filter: only process fake or real accounts")
     parser.add_argument("--headed", action="store_true",
                         help="Open visible browser windows (for manual inspection)")
+    parser.add_argument("--accounts-file", default="",
+                        dest="accounts_file",
+                        help="Path to accounts CSV (default: driven by --mode)")
+    parser.add_argument("--mode", default="",
+                        help="Run mode: test or real (default: real; or MODE from .env)")
 
     args = parser.parse_args()
+
+    from mode_config import get_mode_cfg
+    cfg = get_mode_cfg(env, args.mode)
+    global _ACCOUNT_FILE
+    _ACCOUNT_FILE = Path(args.accounts_file) if args.accounts_file else Path(cfg["accounts_file"])
 
     def _keys(env_key: str) -> list[str]:
         return [k.strip() for k in env.get(env_key, "").split(",") if k.strip()]

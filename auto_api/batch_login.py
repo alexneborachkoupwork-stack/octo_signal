@@ -7,7 +7,7 @@ attempts login for each, and updates status to active on success.
 Usage:
   python batch_login.py                         # all verified accounts, 10 concurrent
   python batch_login.py --count 20 --concurrency 5
-  python batch_login.py --proxy-type soax       # use SOAX rotating proxies
+  python batch_login.py                         # always uses ISP proxies
   python batch_login.py --account paucun9244    # single account test
   python batch_login.py --dry-run
 """
@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 BASE       = "https://pedidodevistos.mne.gov.pt"
+HOME_URL   = BASE + "/VistosOnline/"
 LOGIN_URL  = BASE + "/VistosOnline/login"
 AUTH_URL   = BASE + "/VistosOnline/Authentication.jsp"
 WAF_VERIFY = BASE + "/ch/v"
@@ -54,6 +55,62 @@ _print_lock = threading.Lock()
 
 def _is_waf_challenge(text: str) -> bool:
     return "/ch/bd.js" in text
+
+
+def _screen_proxy(proxy_url: str, timeout: int = 8) -> bool:
+    """
+    Fast pre-screen: fetch AUTH_URL via primp. Returns False (skip proxy) if:
+    - Response body contains WAF challenge HTML
+    On 403 (raw HTTP blocked by IP), falls back to a headless Playwright check —
+    SOAX/residential IPs are blocked to raw primp but pass fine via stealth browser.
+    """
+    try:
+        import primp
+        c = primp.Client(proxy=proxy_url, verify=False,
+                         follow_redirects=True, timeout=timeout)
+        r = c.get(AUTH_URL)
+        body = r.text or ""
+        if r.status_code == 403:
+            # Raw HTTP blocked — IP may still work via browser; check properly
+            return _screen_proxy_browser(proxy_url)
+        if _is_waf_challenge(body):
+            print(f"[screen] WAF on AUTH_URL ({_proxy_host(proxy_url)}) — skip")
+            return False
+        print(f"[screen] pass ({_proxy_host(proxy_url)}) status={r.status_code}")
+        return True
+    except Exception as e:
+        print(f"[screen] error ({_proxy_host(proxy_url)}): {e} — skip")
+        return False
+
+
+def _screen_proxy_browser(proxy_url: str) -> bool:
+    """
+    Headless Playwright fallback screen. Opens a stealth browser, navigates to
+    HOME_URL, then checks the final URL. If the browser lands on the real site
+    (not a /ch/ challenge page), the proxy is usable for login.
+    """
+    host = _proxy_host(proxy_url)
+    print(f"[screen] 403 raw — browser check ({host})")
+    try:
+        import session as sess
+        s = sess.get_session(proxy_url, headless=True)
+        try:
+            url = s.browser_eval("() => location.href", timeout=10)
+            html = s.browser_eval("() => document.documentElement.innerHTML", timeout=10)
+            if url and "/ch/" in url:
+                print(f"[screen] WAF (browser) ({host}) final_url={url} — skip")
+                return False
+            if html and _is_waf_challenge(html):
+                print(f"[screen] WAF (browser) ({host}) — skip")
+                return False
+            print(f"[screen] pass (browser) ({host}) final_url={url}")
+            return True
+        finally:
+            try: s.close()
+            except Exception: pass
+    except Exception as e:
+        print(f"[screen] browser error ({host}): {e} — skip")
+        return False
 
 
 def _parse_waf_challenge(html: str) -> dict | None:
@@ -121,7 +178,19 @@ def _waf_bypass(session, html: str, label: str) -> bool:
             print(f"[waf] {label}: HOME_URL fetch failed: {e}")
 
     if not challenge:
-        print(f"[waf] {label}: could not parse challenge params from any source")
+        # Last resort: navigate the browser to HOME_URL — browser's JS engine
+        # executes HbcZ/bd.js automatically and auto-submits the PoW.
+        # If the browser lands on HOME_URL without WAF, the bypass cookie is set.
+        print(f"[waf] {label}: parse failed on all fetches — trying browser nav to HOME_URL")
+        try:
+            landed = session.browser_nav(HOME_URL, timeout=45)
+            if "Authentication.jsp" not in landed and "/ch/" not in landed:
+                print(f"[waf] {label}: browser nav landed at {landed} — bypass cookie set")
+                return True
+            else:
+                print(f"[waf] {label}: browser nav landed at {landed} — WAF not bypassed")
+        except Exception as nav_err:
+            print(f"[waf] {label}: browser nav failed: {nav_err}")
         return False
 
     nonce, token, difficulty = challenge["nonce"], challenge["token"], challenge["difficulty"]
@@ -233,7 +302,9 @@ async def _login_account(acct: dict, pool,  # PersistentProxyPool
                           twocaptcha_keys: list[str], capmonster_keys: list[str],
                           lang: str, executor: ThreadPoolExecutor,
                           stop_event: asyncio.Event,
-                          headed: bool = False) -> str:
+                          headed: bool = False,
+                          save_state: bool = False,
+                          skip_checkbox: bool = False) -> str:
     """
     Login flow for one verified account. One attempt per account — no proxy retry.
     Returns: "active", "unverified", "error"
@@ -250,10 +321,14 @@ async def _login_account(acct: dict, pool,  # PersistentProxyPool
         _log(username, "pool exhausted — skipping")
         return "error"
 
-    # Find one fresh proxy
+    # Find one fresh proxy that also passes the WAF pre-screen
     fresh = None
     for _ in range(_IP_SEARCH_LIMIT):
         candidate = pool.advance()
+        # Fast WAF screen before claiming the proxy or touching the account
+        screen_ok = await loop.run_in_executor(executor, _screen_proxy, candidate)
+        if not screen_ok:
+            continue
         ip = await loop.run_in_executor(
             executor, pool.verify_and_claim, candidate, username,
         )
@@ -263,7 +338,14 @@ async def _login_account(acct: dict, pool,  # PersistentProxyPool
         _log(username, f"IP already used or dead on {_proxy_host(candidate)} — skipping")
 
     if fresh is None:
-        _log(username, "FAIL no fresh exit IPs — pool exhausted, stopping batch")
+        _log(username, "FAIL ISP proxy pool exhausted — stopping batch")
+        print(
+            "\n[batch_login] ISP proxy pool exhausted.\n"
+            "  Add fresh IPs to data/proxies_isp.txt, then re-run.\n"
+            "  Or reset used-IP tracking:\n"
+            "    uv run python -c \"from proxy_pool import PersistentProxyPool; "
+            "PersistentProxyPool('data/proxies_isp.txt').reset()\""
+        )
         stop_event.set()
         return "error"
 
@@ -277,16 +359,16 @@ async def _login_account(acct: dict, pool,  # PersistentProxyPool
         _log(username, f"FAIL get_session ({exit_ip}): {e}")
         return "error"
 
-    # Step 2: full browser login — types credentials (builds reCAPTCHA behavioral signals),
-    # clicks the checkbox, handles consent popup, and fires doLogin() AJAX from within
-    # the real browser context.  Falls back to external CapSolver token if auto-solve fails.
-    # This produces shorter, higher-quality tokens vs race_all() + browser_fetch.
-    solver_key        = capsolver_keys[0]   if capsolver_keys   else ""
-    twocaptcha_key    = twocaptcha_keys[0]  if twocaptcha_keys  else ""
+    # Step 2: login — two modes selectable via CLI flags:
+    #   default:          browser_login()  — full form interaction + checkbox + race_best
+    #   --skip-checkbox:  browser_login(skip_checkbox=True)  — skip click, race_all inject
+    solver_key     = capsolver_keys[0]   if capsolver_keys   else ""
+    twocaptcha_key = twocaptcha_keys[0]  if twocaptcha_keys  else ""
     body = ""
     status = 0
     try:
-        _log(username, f"browser_login: typing creds + clicking checkbox (exit_ip={exit_ip})")
+        mode_label = "skip_checkbox+race_all" if skip_checkbox else "checkbox+race_best"
+        _log(username, f"browser_login: {mode_label} (exit_ip={exit_ip})")
         result = await loop.run_in_executor(
             executor,
             lambda: s.browser_login(username, password, lang=lang,
@@ -296,14 +378,16 @@ async def _login_account(acct: dict, pool,  # PersistentProxyPool
                                     anticaptcha_keys=anticaptcha_keys,
                                     twocaptcha_keys=twocaptcha_keys,
                                     capmonster_keys=capmonster_keys,
-                                    timeout=360),
+                                    timeout=360,
+                                    skip_checkbox=skip_checkbox),
         )
         body   = (result.get("body") or "").strip()
         status = result.get("status", 0)
         _log(username, f"login status={status}  waf={_is_waf_challenge(body)}  resp={body[:200]}")
     except Exception as e:
-        _log(username, f"FAIL browser_login: {e}")
-        _csv_update(username, status="login_failed", notes=f"browser_login error: {e}")
+        label = "browser_login"
+        _log(username, f"FAIL {label}: {e}")
+        _csv_update(username, status="login_failed", notes=f"{label} error: {e}")
         try: s.close()
         except Exception: pass
         return "error"
@@ -328,9 +412,9 @@ async def _login_account(acct: dict, pool,  # PersistentProxyPool
         try:
             retry_token = await loop.run_in_executor(
                 executor,
-                lambda: solvermod.race_best(
+                lambda: solvermod.race_all(
                     capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
-                    "LOGIN_EVISA", proxy=None, n_races=3, min_score=85,
+                    "LOGIN_EVISA", proxy=None, min_score=80,
                 ),
             )
         except Exception as e:
@@ -354,10 +438,9 @@ async def _login_account(acct: dict, pool,  # PersistentProxyPool
             except Exception: pass
             return "error"
 
-    try: s.close()
-    except Exception: pass
-
     if not body:
+        try: s.close()
+        except Exception: pass
         _log(username, f"FAIL empty response body  status={status}")
         _csv_update(username, status="login_failed", notes=f"empty body status={status}")
         return "error"
@@ -366,6 +449,8 @@ async def _login_account(acct: dict, pool,  # PersistentProxyPool
         resp  = json.loads(body)
         rtype = resp.get("type", "__missing__")
     except json.JSONDecodeError:
+        try: s.close()
+        except Exception: pass
         _log(username, f"FAIL non-JSON response (WAF/HTML?): {body[:120]}")
         _csv_update(username, status="login_failed", notes="non-JSON response")
         return "error"
@@ -376,7 +461,31 @@ async def _login_account(acct: dict, pool,  # PersistentProxyPool
         _log(username, f"LOGIN OK  exit_ip={exit_ip}")
         _csv_update(username, status="active", last_login=_now(),
                     proxy=_proxy_host(proxy))
+        if save_state:
+            import session_store
+            from pathlib import Path as _Path
+            _state_dir = _Path(__file__).parent / "sessions"
+            _state_dir.mkdir(exist_ok=True)
+            _state_path = _state_dir / f"{username}.playwright.json"
+            try:
+                s.save_state(_state_path)
+                session_store.save(username, s.client, proxy)
+                _log(username, f"session state saved → {_state_path.name}")
+            except Exception as _e:
+                _log(username, f"WARN save_state failed: {_e}")
+        if headed:
+            import time
+            print(f"[{username}] headed mode — browser open for 10 min (Ctrl+C to close early)...")
+            try:
+                time.sleep(600)
+            except KeyboardInterrupt:
+                pass
+        try: s.close()
+        except Exception: pass
         return "active"
+
+    try: s.close()
+    except Exception: pass
 
     if rtype == "EmailSend":
         _log(username, "FAIL account not verified server-side (EmailSend)")
@@ -398,19 +507,16 @@ async def main_async(args: argparse.Namespace,
 
     acc_pool = AccountPool(_ACCOUNT_FILE)
 
-    # Build persistent proxy pool (cursor + used IPs persist across runs)
+    _proxy_file_map = {
+        "isp":      _ISP_PROXY_FILE,
+        "soax":     _SOAX_PROXY_FILE,
+        "webshare": _WEBSHARE_PROXY_FILE,
+    }
+    _proxy_file = _proxy_file_map.get(args.proxy_type, _ISP_PROXY_FILE)
     try:
-        if args.proxy_type == "soax":
-            pool = PersistentProxyPool(_SOAX_PROXY_FILE)
-        elif args.proxy_type == "isp":
-            pool = PersistentProxyPool(_ISP_PROXY_FILE)
-        elif args.proxy_type == "webshare":
-            pool = PersistentProxyPool(_WEBSHARE_PROXY_FILE)
-        else:
-            print("[batch_login] ERROR: specify --proxy-type soax|isp|webshare")
-            return
+        pool = PersistentProxyPool(_proxy_file)
     except Exception as e:
-        print(f"[batch_login] ERROR building proxy pool: {e}")
+        print(f"[batch_login] ERROR building proxy pool ({args.proxy_type}): {e}")
         return
 
     # Pick accounts
@@ -433,7 +539,7 @@ async def main_async(args: argparse.Namespace,
         return
 
     print(f"\n[batch_login] {len(accounts)} accounts  concurrency={args.concurrency}  "
-          f"proxy-type={args.proxy_type}  pool: cursor={pool.cursor}  used={pool.used_count}/{pool.total}")
+          f"proxy={args.proxy_type}  pool: cursor={pool.cursor}  used={pool.used_count}/{pool.total}")
 
     if args.dry_run:
         print("\n[dry-run] Would login:")
@@ -456,7 +562,9 @@ async def main_async(args: argparse.Namespace,
                                          twocaptcha_keys, capmonster_keys,
                                          args.lang, executor,
                                          stop_event,
-                                         headed=args.headed)
+                                         headed=args.headed,
+                                         save_state=args.save_state,
+                                         skip_checkbox=args.skip_checkbox)
 
     tasks   = [bounded(acct) for acct in accounts]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -473,9 +581,11 @@ async def main_async(args: argparse.Namespace,
     print("="*50)
 
     if args.headed:
+        import time
+        print("\n[batch_login] Browser is open — keeping alive for 10 minutes (Ctrl+C to close early)...")
         try:
-            input("\n[batch_login] Browser is open — press Enter to close and exit...")
-        except (KeyboardInterrupt, EOFError):
+            time.sleep(600)
+        except KeyboardInterrupt:
             pass
 
 
@@ -493,8 +603,7 @@ def main() -> None:
                         help="Max accounts to login (0=all verified)")
     parser.add_argument("--concurrency", type=int, default=10,
                         help="Max simultaneous workers (default: 10)")
-    parser.add_argument("--proxy-type", choices=("isp", "soax", "webshare", "stored"), default="stored",
-                        help="isp=data/proxies_isp.txt, soax=data/proxies_soax.txt, webshare=data/proxies_webshare.txt, stored=per-account proxy from CSV")
+    # Login always uses ISP proxies — no proxy-type selection
     parser.add_argument("--lang", default=env.get("SITE_LANGUAGE", "PT"),
                         help="Language (default: PT)")
     parser.add_argument("--include-active", action="store_true",
@@ -503,8 +612,25 @@ def main() -> None:
                         help="Print plan without executing")
     parser.add_argument("--headed", action="store_true",
                         help="Open a visible browser window (for manual inspection)")
+    parser.add_argument("--save-state", action="store_true", dest="save_state",
+                        help="Save Playwright session state + primp cookies after successful login")
+    parser.add_argument("--proxy-type", default="isp", dest="proxy_type",
+                        choices=("isp", "soax", "webshare"),
+                        help="Proxy pool to use: isp (default), soax, webshare")
+    parser.add_argument("--skip-checkbox", action="store_true", dest="skip_checkbox",
+                        help="Skip reCAPTCHA checkbox click; inject token silently via race_all()")
+    parser.add_argument("--accounts-file", default="",
+                        dest="accounts_file",
+                        help="Path to accounts CSV (default: driven by --mode)")
+    parser.add_argument("--mode", default="",
+                        help="Run mode: test or real (default: real; or MODE from .env)")
 
     args = parser.parse_args()
+
+    from mode_config import get_mode_cfg
+    cfg = get_mode_cfg(env, args.mode)
+    global _ACCOUNT_FILE
+    _ACCOUNT_FILE = Path(args.accounts_file) if args.accounts_file else Path(cfg["accounts_file"])
 
     def _keys(k: str) -> list[str]:
         return [x.strip() for x in env.get(k, "").split(",") if x.strip()]
@@ -520,7 +646,7 @@ def main() -> None:
 
     print(f"[batch_login] solvers: capsolver={len(capsolver_keys)} anticaptcha={len(anticaptcha_keys)} "
           f"2captcha={len(twocaptcha_keys)} capmonster={len(capmonster_keys)}")
-    print(f"[batch_login] proxy-type: {args.proxy_type}")
+    print(f"[batch_login] proxy=isp (ISP only)")
     asyncio.run(main_async(args, capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys))
 
 

@@ -44,11 +44,19 @@ log = logging.getLogger("slot_detector")
 
 
 class SlotDetector:
-    def __init__(self, slot_manager: "SlotManager", coordinator):
-        self._sm          = slot_manager
-        self._coord       = coordinator   # has .sessions: dict[str, WorkerState]
-        self._posto_id    = ""
-        self._event       = asyncio.Event()
+    def __init__(self, slot_manager: "SlotManager", coordinator,
+                 capsolver_keys=None, anticaptcha_keys=None,
+                 twocaptcha_keys=None, capmonster_keys=None,
+                 executor=None):
+        self._sm               = slot_manager
+        self._coord            = coordinator
+        self._capsolver_keys   = capsolver_keys   or []
+        self._anticaptcha_keys = anticaptcha_keys or []
+        self._twocaptcha_keys  = twocaptcha_keys  or []
+        self._capmonster_keys  = capmonster_keys  or []
+        self._executor         = executor
+        self._posto_id         = ""
+        self._event            = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
 
     async def start(self, posto_id: str) -> None:
@@ -67,23 +75,37 @@ class SlotDetector:
         self._event.set()
 
     async def _poll_loop(self) -> None:
+        from batch_apply import poll_slots_once, SessionExpired
+
         while not self._event.is_set():
-            session = self._coord.pick_detector_session()
-            if session is None:
+            ws = self._coord.pick_detector_session()
+            if ws is None:
                 log.warning("[detector] no detector session available, waiting...")
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
 
             try:
-                slots = await session.poll_slots_once(self._posto_id)
+                slots = await poll_slots_once(
+                    ws.client, ws.proxy, self._posto_id,
+                    ws.acct,
+                    ws.nat or "CPV",
+                    ws.res or ws.nat or "CPV",
+                    self._capsolver_keys, self._anticaptcha_keys,
+                    self._twocaptcha_keys, self._capmonster_keys,
+                    self._executor,
+                )
+                ws.last_probe = asyncio.get_event_loop().time()
                 if slots:
-                    log.info(f"[detector] found {len(slots)} slot entries via {session.username}")
+                    log.info(f"[detector] found {len(slots)} slot entries via {ws.username}")
                     self.signal_slots(slots)
                     return
-                log.debug(f"[detector] no slots yet (session={session.username})")
+                log.debug(f"[detector] no slots yet (session={ws.username})")
+            except SessionExpired as e:
+                log.warning(f"[detector] session expired ({ws.username}): {e}")
+                self._coord.mark_detector_failed(ws.username)
             except Exception as e:
-                log.warning(f"[detector] poll failed ({session.username}): {e}")
-                self._coord.mark_detector_failed(session.username)
+                log.warning(f"[detector] poll failed ({ws.username}): {e}")
+                self._coord.mark_detector_failed(ws.username)
 
             await asyncio.sleep(POLL_INTERVAL)
 

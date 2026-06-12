@@ -16,10 +16,16 @@ import requests
 
 SITE_KEY   = "6LdOB9crAAAAADT4RFruc5sPmzLKIgvJVfL830d4"
 AUTH_URL   = "https://pedidodevistos.mne.gov.pt/VistosOnline/Authentication.jsp"
+SCHED_URL  = "https://pedidodevistos.mne.gov.pt/VistosOnline/Schedule.jsp"
 POLL_DELAY = 3
 MAX_POLLS  = 40  # ~2 minutes
 
 _V3_ACTIONS: frozenset[str] = frozenset()  # all actions use ReCaptchaV2Enterprise
+
+# reCAPTCHA tokens are bound to the page URL — each action must use the correct page
+_ACTION_URL: dict[str, str] = {
+    "SCHEDULE_EVISA": SCHED_URL,
+}
 
 
 def _parse_proxy(proxy_url: str | None) -> dict | None:
@@ -105,15 +111,18 @@ def race_best(
 def race_all(capsolver_keys: list[str], anticaptcha_keys: list[str],
              twocaptcha_keys: list[str], capmonster_keys: list[str],
              action: str, proxy: str | None = None,
-             session_cookies: dict | None = None) -> str:
+             session_cookies: dict | None = None,
+             min_score: int = 0) -> str:
     """
-    Race all configured solvers in parallel — first token wins.
-    Mirrors the extension's _raceSolvers() with CAPTCHA_SOLVER_PARALLEL=true.
-    Each service gets its first key; all start simultaneously.
+    Race all configured solvers in parallel.
+
+    min_score=0 (default): first token wins, all others stopped immediately.
+    min_score>0: don't stop other threads until a token with score >= min_score
+    arrives, OR all threads have finished. Returns the highest-scoring token
+    collected. Prevents fast-but-low-quality solvers (e.g. capmonster) from
+    starving slower-but-better solvers (e.g. 2captcha) before they finish.
 
     session_cookies: dict of cookies from the primp session (e.g. Vistos_sid).
-    Passed to solvers that support a cookies field so the CAPTCHA token is
-    generated inside the same server session as the subsequent POST.
     """
     proxy_info = _parse_proxy(proxy)
 
@@ -130,48 +139,39 @@ def race_all(capsolver_keys: list[str], anticaptcha_keys: list[str],
     if not tasks:
         raise RuntimeError("race_all: no solver keys configured")
 
-    result: list[str | None] = [None]
-    errors: list[str] = []
-    done = threading.Event()
-    lock = threading.Lock()
     total = len(tasks)
-
-    def _run(label: str, fn: callable, key: str) -> None:
-        try:
-            print(f"[solver] race:{label} starting")
-            token = fn(key, action, proxy_info)
-            with lock:
-                if result[0] is None:
-                    result[0] = token
-                    print(f"[solver] race:{label} WON  token_len={len(token)}")
-                    done.set()
-        except Exception as e:
-            with lock:
-                errors.append(f"{label}: {e}")
-                print(f"[solver] race:{label} failed: {e}")
-                if len(errors) == total:
-                    done.set()
-
-    stop = threading.Event()  # signals losing threads to exit early
+    results: list[tuple[str, int]] = []  # (token, score) pairs as they arrive
+    errors:  list[str] = []
+    finished = [0]
+    lock = threading.Lock()
+    done = threading.Event()
+    stop = threading.Event()  # signals threads to stop polling
 
     def _run_guarded(label: str, fn: callable, key: str) -> None:
         try:
             print(f"[solver] race:{label} starting")
             token = fn(key, action, proxy_info, session_cookies)
+            s = score_token(token)
             with lock:
-                if not stop.is_set() and result[0] is None:
-                    result[0] = token
-                    print(f"[solver] race:{label} WON  token_len={len(token)}")
+                results.append((token, s))
+                finished[0] += 1
+                print(f"[solver] race:{label} done  token_len={len(token)}  score={s}")
+                if s >= min_score:
+                    # Good enough — stop all remaining threads
+                    print(f"[solver] race:{label} WON (score={s}>={min_score})")
                     stop.set()
+                    done.set()
+                elif finished[0] == total:
+                    # All threads done, no score met threshold — take best available
                     done.set()
         except Exception as e:
             with lock:
                 errors.append(f"{label}: {e}")
+                finished[0] += 1
                 print(f"[solver] race:{label} failed: {e}")
-                if len(errors) == total:
+                if finished[0] == total:
                     done.set()
 
-    # Monkey-patch _poll to check stop flag between polls
     import solver as _self_mod
     _orig_poll = _self_mod._poll
 
@@ -205,8 +205,11 @@ def race_all(capsolver_keys: list[str], anticaptcha_keys: list[str],
     done.wait(timeout=180)
     _self_mod._poll = _orig_poll  # restore
 
-    if result[0]:
-        return result[0]
+    if results:
+        best_token, best_score = max(results, key=lambda x: x[1])
+        print(f"[solver] race_all: best score={best_score}  token_len={len(best_token)}  "
+              f"collected={len(results)}/{total}")
+        return best_token
     raise RuntimeError(f"race_all — all {total} solvers failed: {' | '.join(errors)}")
 
 
@@ -240,10 +243,11 @@ def solve(service: str, keys: list[str], action: str = "LOGIN_EVISA",
 
 def _capsolver(api_key: str, action: str, proxy_info: dict | None,
                session_cookies: dict | None = None) -> str:
+    page_url = _ACTION_URL.get(action, AUTH_URL)
     if action in _V3_ACTIONS:
         task = {
             "type":        "ReCaptchaV3TaskProxyLess",
-            "websiteURL":  AUTH_URL,
+            "websiteURL":  page_url,
             "websiteKey":  SITE_KEY,
             "pageAction":  action,
             "isEnterprise": True,
@@ -251,7 +255,7 @@ def _capsolver(api_key: str, action: str, proxy_info: dict | None,
     else:
         task = {
             "type":       "ReCaptchaV2EnterpriseTaskProxyLess",
-            "websiteURL": AUTH_URL,
+            "websiteURL": page_url,
             "websiteKey": SITE_KEY,
         }
 
@@ -278,9 +282,10 @@ _AC_USER_AGENT = (
 
 def _anticaptcha(api_key: str, action: str, proxy_info: dict | None,
                  session_cookies: dict | None = None) -> str:
+    page_url = _ACTION_URL.get(action, AUTH_URL)
     if action in _V3_ACTIONS:
         task = {
-            "websiteURL":   AUTH_URL,
+            "websiteURL":   page_url,
             "websiteKey":   SITE_KEY,
             "minScore":     0.3,
             "pageAction":   action,
@@ -290,7 +295,7 @@ def _anticaptcha(api_key: str, action: str, proxy_info: dict | None,
     else:
         task = {
             "type":       "RecaptchaV2EnterpriseTaskProxyless",
-            "websiteURL": AUTH_URL,
+            "websiteURL": page_url,
             "websiteKey": SITE_KEY,
         }
     task["userAgent"] = _AC_USER_AGENT
@@ -313,10 +318,11 @@ def _anticaptcha(api_key: str, action: str, proxy_info: dict | None,
 
 def _twocaptcha(api_key: str, action: str, proxy_info: dict | None,
                 session_cookies: dict | None = None) -> str:
+    page_url = _ACTION_URL.get(action, AUTH_URL)
     if action in _V3_ACTIONS:
         task = {
             "type":         "RecaptchaV3TaskProxyless",
-            "websiteURL":   AUTH_URL,
+            "websiteURL":   page_url,
             "websiteKey":   SITE_KEY,
             "minScore":     0.3,
             "pageAction":   action,
@@ -325,7 +331,7 @@ def _twocaptcha(api_key: str, action: str, proxy_info: dict | None,
     else:
         task = {
             "type":       "RecaptchaV2EnterpriseTaskProxyless",
-            "websiteURL": AUTH_URL,
+            "websiteURL": page_url,
             "websiteKey": SITE_KEY,
         }
 
@@ -345,10 +351,11 @@ def _twocaptcha(api_key: str, action: str, proxy_info: dict | None,
 
 def _capmonster(api_key: str, action: str, proxy_info: dict | None,
                 session_cookies: dict | None = None) -> str:
+    page_url = _ACTION_URL.get(action, AUTH_URL)
     if action in _V3_ACTIONS:
         task = {
             "type":         "RecaptchaV3TaskProxyless",
-            "websiteURL":   AUTH_URL,
+            "websiteURL":   page_url,
             "websiteKey":   SITE_KEY,
             "minScore":     0.3,
             "pageAction":   action,
@@ -357,7 +364,7 @@ def _capmonster(api_key: str, action: str, proxy_info: dict | None,
     else:
         task = {
             "type":       "RecaptchaV2EnterpriseTaskProxyless",
-            "websiteURL": AUTH_URL,
+            "websiteURL": page_url,
             "websiteKey": SITE_KEY,
         }
 

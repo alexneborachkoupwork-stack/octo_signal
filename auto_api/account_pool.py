@@ -105,16 +105,17 @@ class AccountPool:
                 return deepcopy(a)
         return None
 
-    def update(self, username: str, **fields) -> None:
+    def update(self, _key: str, **fields) -> None:
         """
         Update one or more fields for the account and persist to CSV.
         Common calls:
           pool.update(username, status="registered", email="x@y.z", proxy="1.2.3.4:6666")
           pool.update(username, status="blocked", notes="secblock on login")
           pool.update(username, status="applied",  appointment_ref="REF123")
+          pool.update(old_username, username=new_username, ...)  # rename the username itself
         """
         for a in self._accounts:
-            if a["username"] == username:
+            if a["username"] == _key:
                 for k, v in fields.items():
                     if k in _FIELDS:
                         a[k] = v
@@ -122,7 +123,7 @@ class AccountPool:
                         raise KeyError(f"Unknown field '{k}'. Valid: {_FIELDS}")
                 self._save()
                 return
-        raise ValueError(f"Account '{username}' not found")
+        raise ValueError(f"Account '{_key}' not found")
 
     def mark_registered(self, username: str, email: str = "", email_pass: str = "",
                         proxy: str = "", proxy_idx: int | str = "") -> None:

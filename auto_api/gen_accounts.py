@@ -16,6 +16,7 @@ from pathlib import Path
 
 _ACCOUNT_FILE  = Path(__file__).parent / "data" / "accounts.csv"
 _DEFAULT_INPUT = Path(__file__).parent / "data" / "paria_new_unique.txt"
+_DEFAULT_ACCOUNT_TYPE = "real"
 
 FIELDNAMES = [
     "id", "username", "password", "status", "account_type",
@@ -147,7 +148,8 @@ def load_existing(path: Path) -> tuple[set[str], set[str], int]:
 
 
 def generate_rows(entries: list[dict], existing_traveldocs: set[str],
-                  existing_usernames: set[str], start_id: int) -> list[dict]:
+                  existing_usernames: set[str], start_id: int,
+                  account_type: str = "real") -> list[dict]:
     rows = []
     next_id = start_id + 1
 
@@ -170,7 +172,7 @@ def generate_rows(entries: list[dict], existing_traveldocs: set[str],
             "username":        _make_username(first, last, existing_usernames),
             "password":        _make_password(),
             "status":          "new",
-            "account_type":    "real",
+            "account_type":    account_type,
             "first_name":      first,
             "last_name":       last,
             "gender":          e.get("gender", "").strip(),
@@ -193,9 +195,22 @@ def generate_rows(entries: list[dict], existing_traveldocs: set[str],
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--file",    default=str(_DEFAULT_INPUT))
+    parser.add_argument("--file",         default=str(_DEFAULT_INPUT))
+    parser.add_argument("--out",          default="",
+                        help="Output CSV file (default: driven by --mode)")
+    parser.add_argument("--account-type", default="",
+                        choices=["real", "test", ""],
+                        help="account_type written to CSV (default: driven by --mode)")
+    parser.add_argument("--mode",         default="",
+                        help="Run mode: test or real (default: real; or MODE from .env)")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+
+    from mode_config import get_mode_cfg
+    cfg = get_mode_cfg({}, args.mode)
+
+    out_file     = Path(args.out) if args.out else Path(cfg["accounts_file"])
+    account_type = args.account_type or cfg["account_type"]
 
     src = Path(args.file)
     if not src.exists():
@@ -205,10 +220,11 @@ def main() -> None:
     entries = _parse_entries(src.read_text(encoding="utf-8"))
     print(f"[gen] parsed {len(entries)} entries from {src.name}")
 
-    existing_traveldocs, existing_usernames, max_id = load_existing(_ACCOUNT_FILE)
+    existing_traveldocs, existing_usernames, max_id = load_existing(out_file)
     print(f"[gen] existing accounts: {len(existing_traveldocs)}  (max id={max_id})")
 
-    rows = generate_rows(entries, existing_traveldocs, existing_usernames, max_id)
+    rows = generate_rows(entries, existing_traveldocs, existing_usernames, max_id,
+                         account_type=account_type)
     flagged = [r for r in rows if r["notes"]]
     print(f"[gen] new rows: {len(rows)}  ({len(flagged)} with flags)")
 
@@ -231,14 +247,14 @@ def main() -> None:
         print("[gen] nothing to add — all traveldocs already in CSV")
         return
 
-    write_header = not _ACCOUNT_FILE.exists()
-    with _ACCOUNT_FILE.open("a", newline="", encoding="utf-8") as f:
+    write_header = not out_file.exists()
+    with out_file.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
         if write_header:
             writer.writeheader()
         writer.writerows(rows)
 
-    print(f"[gen] wrote {len(rows)} rows → {_ACCOUNT_FILE}")
+    print(f"[gen] wrote {len(rows)} rows -> {out_file}")
     if flagged:
         print(f"\n[gen] flagged entries (review before registration):")
         for r in flagged:
