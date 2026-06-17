@@ -1,8 +1,8 @@
-"""
+﻿"""
 Cookie persistence for logged-in primp sessions.
 
 Saves/loads {cookies, proxy} per account to auto_api/sessions/<username>.json.
-Critical: Vistos_sid has Path=/VistosOnline/ — must probe with the full path URL.
+Critical: Vistos_sid has Path=/VistosOnline/ -- must probe with the full path URL.
 """
 
 import json
@@ -75,25 +75,42 @@ def load_meta(username: str) -> dict:
 def probe_session(client: Client) -> str:
     """
     Probe /VistosOnline/ and return a three-way status:
-      'alive' — 200 + session indicator in body (Questionario / logout link)
-      'dead'  — 302 redirect (Vistos_sid expired)
-      'down'  — connection error, timeout, or 5xx (portal unreachable)
+      'alive' -- 200 + session-specific content in body (logout link or Questionario form)
+      'dead'  -- 302/redirect to auth, or 200 but no session content (public landing page)
+      'down'  -- connection error, timeout, or 5xx (portal unreachable)
     """
     try:
         r = client.get(
             COOKIES_URL,
             headers={**sess.HEADERS_NAV, "Sec-Fetch-Site": "same-origin"},
             timeout=15,
-            follow_redirects=False,
+            follow_redirects=True,
         )
-        if r.status_code == 302:
-            return "dead"
         if r.status_code >= 500:
             return "down"
-        alive = r.status_code == 200 and (
-            "Questionario" in r.text or "logout" in r.text.lower()
+        # Check final URL -- dead if redirected to auth
+        final_url = str(getattr(r, "url", ""))
+        at_auth = (
+            "Authentication.jsp" in final_url
+            or "/login" in final_url
+            or (r.status_code == 302)
         )
-        return "alive" if alive else "dead"
+        if at_auth:
+            return "dead"
+        if r.status_code != 200:
+            return "dead"
+        # Body check: HOME_URL returns 200 even for unauthenticated visitors.
+        # A logged-in session shows session-specific content; public page does not.
+        body = r.text
+        logged_in = (
+            "logout" in body.lower()
+            or "Questionario" in body
+            or "terminar" in body.lower()   # Portuguese "end session"
+            or "sair" in body.lower()        # Portuguese "exit/logout"
+        )
+        if not logged_in:
+            return "dead"
+        return "alive"
     except Exception:
         return "down"
 

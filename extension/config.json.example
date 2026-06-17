@@ -1,6 +1,0 @@
-{
-  "managerWsUrl": "ws://localhost:9000",
-  "cfMailDomain": "mail.yourdomain.com",
-  "cfWorkerUrl": "https://your-worker.workers.dev",
-  "cfWorkerSecret": "your-shared-secret"
-}

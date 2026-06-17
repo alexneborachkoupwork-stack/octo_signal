@@ -14,3 +14,4 @@ check_*.py
 extension/config.json
 /manager/node_modules
 /logs
+/auto_api/screenshots

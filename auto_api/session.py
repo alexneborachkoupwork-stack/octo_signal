@@ -1,4 +1,4 @@
-"""
+﻿"""
 HTTP session for the E-VISA portal.
 
 Architecture (revised):
@@ -8,7 +8,7 @@ Architecture (revised):
   2. Once the challenge is bypassed, cookies are extracted and injected into
      a lightweight primp.Client (same proxy) via explicit Cookie header.
      The BROWSER STAYS ALIVE to handle verification (which requires the same
-     browser session/TLS fingerprint — primp alone hits the challenge again).
+     browser session/TLS fingerprint - primp alone hits the challenge again).
   3. All .get()/.post() calls use the primp client directly (fast, low overhead).
   4. Call verify_email(token_url) to use the browser for email verification.
      The browser is then closed automatically.
@@ -32,9 +32,11 @@ import threading
 import time
 from pathlib import Path
 
+_SCREENSHOTS_DIR = Path(__file__).parent / "screenshots"
+
 IMPERSONATE = None   # None = primp built-in default; no "does not exist" warning
 
-# ── Fingerprint pool ──────────────────────────────────────────────────────────
+# -- Fingerprint pool ----------------------------------------------------------
 # (user_agent, sec_ch_ua, viewport_w, viewport_h, platform)
 _FP_POOL = [
     (
@@ -96,7 +98,7 @@ def _get_proxy_timezone(proxy_url: str | None) -> str:
                 return tz
         except Exception as _e:
             pass
-    print(f"[session] tz lookup failed — using {_DEFAULT}")
+    print(f"[session] tz lookup failed - using {_DEFAULT}")
     return _DEFAULT
 
 
@@ -181,7 +183,7 @@ Object.defineProperty(screen,'colorDepth',{{get:()=>24}});
 Object.defineProperty(screen,'width',{{get:()=>{vp_w}}});
 Object.defineProperty(screen,'height',{{get:()=>{vp_h}}});
 
-// Canvas fingerprint randomization (unique per session — prevents fingerprint tracking)
+// Canvas fingerprint randomization (unique per session - prevents fingerprint tracking)
 (function(){{
   const _noise = {_noise};
   const _oTDU = HTMLCanvasElement.prototype.toDataURL;
@@ -232,7 +234,7 @@ Object.defineProperty(screen,'height',{{get:()=>{vp_h}}});
 """
 
 
-# ── Fake response (matches primp.Response interface) ─────────────────────────
+# -- Fake response (matches primp.Response interface) -------------------------
 
 class _FakeResponse:
     def __init__(self, status_code: int, text: str, url: str):
@@ -245,7 +247,7 @@ class _FakeResponse:
         return _json.loads(self.text)
 
 
-# ── PlaywrightSession ─────────────────────────────────────────────────────────
+# -- PlaywrightSession ---------------------------------------------------------
 
 class PlaywrightSession:
     """
@@ -262,25 +264,30 @@ class PlaywrightSession:
     close() enqueues a shutdown job and waits for the worker to exit.
     """
 
-    _CMD_VERIFY     = "verify"
-    _CMD_FETCH      = "fetch"
-    _CMD_LOGIN      = "login"
-    _CMD_EVAL       = "eval"
-    _CMD_NAV        = "nav"
-    _CMD_SAVE_STATE = "save_state"
-    _CMD_CLOSE      = "close"
+    _CMD_VERIFY          = "verify"
+    _CMD_FETCH           = "fetch"
+    _CMD_LOGIN           = "login"
+    _CMD_EVAL            = "eval"
+    _CMD_NAV             = "nav"
+    _CMD_SAVE_STATE      = "save_state"
+    _CMD_SCREENSHOT           = "screenshot"
+    _CMD_NAV_SCREENSHOT       = "nav_screenshot"
+    _CMD_CLOSE_BROWSER        = "close_browser"   # full shutdown after login; primp lives on
+    _CMD_FORM_POST            = "form_post"        # DOM form.submit() -- real page nav, bypasses DataDome
+    _CMD_SUBMIT_PAGE_FORM     = "submit_page_form"  # submit existing on-page form (no new form injected)
+    _CMD_CLOSE           = "close"
 
     def __init__(self, proxy: str | None, inject_cookies: dict | None = None,
                  headless: bool = True, storage_state: str | None = None,
                  fp: tuple | None = None):
-        self.proxy           = proxy          # original URL — used by primp + CapSolver
-        self._inject_cookies = inject_cookies or {}   # pre-load cookies → skip WAF challenge
+        self.proxy           = proxy          # original URL - used by primp + CapSolver
+        self._inject_cookies = inject_cookies or {}   # pre-load cookies -> skip WAF challenge
         self._headless       = headless
         self._storage_state  = storage_state  # Playwright storage_state path for session restore
         self._fp_override    = fp             # fixed fingerprint tuple for session restoration
         self._fp: tuple | None = None         # set by _worker once fingerprint is chosen
         # Chromium cannot authenticate with SOCKS5 user:pass; route via a local
-        # HTTP→SOCKS5 bridge. primp handles socks5:// natively and needs no bridge.
+        # HTTP->SOCKS5 bridge. primp handles socks5:// natively and needs no bridge.
         if proxy and proxy.startswith('socks5://'):
             from proxy_bridge import start_bridge
             self._playwright_proxy = start_bridge(proxy)
@@ -299,7 +306,16 @@ class PlaywrightSession:
         if self._error:
             raise self._error
 
-    # ── Worker thread (owns Playwright) ──────────────────────────────────────
+    def __del__(self):
+        # GC fallback: if close() was never called, signal the worker thread to exit.
+        # Timing is non-deterministic but prevents indefinitely orphaned processes.
+        try:
+            if self._thread.is_alive():
+                self._cmd_q.put({"action": self._CMD_CLOSE})
+        except Exception:
+            pass
+
+    # -- Worker thread (owns Playwright) --------------------------------------
 
     def _worker(self):
         from playwright.sync_api import sync_playwright
@@ -371,7 +387,7 @@ class PlaywrightSession:
                 Stealth().apply_stealth_sync(page)
                 print("[session] playwright-stealth applied")
             except ImportError:
-                print("[session] playwright-stealth not installed — using fallback script only")
+                print("[session] playwright-stealth not installed - using fallback script only")
             except Exception as _se:
                 print(f"[session] playwright-stealth warning: {_se}")
 
@@ -390,9 +406,9 @@ class PlaywrightSession:
             print(f"[session] challenge={challenge}  cookies={cookie_names}")
 
             if challenge:
-                raise RuntimeError("Bot challenge not bypassed — proxy IP flagged")
+                raise RuntimeError("Bot challenge not bypassed - proxy IP flagged")
 
-            # ── Set up primp client with cookies ──────────────────────────────
+            # -- Set up primp client with cookies ------------------------------
             import primp
             primp_client = primp.Client(
                 impersonate=IMPERSONATE,
@@ -416,7 +432,7 @@ class PlaywrightSession:
             print(f"[session] primp client ready  (browser alive for verify)")
             self._ready.set()
 
-            # ── Event loop: wait for verify or close commands ─────────────────
+            # -- Event loop: wait for verify or close commands -----------------
             while True:
                 cmd = self._cmd_q.get()
                 if cmd is None or cmd.get("action") == self._CMD_CLOSE:
@@ -452,14 +468,197 @@ class PlaywrightSession:
 
                 elif cmd.get("action") == self._CMD_NAV:
                     try:
+                        # Sync primp cookies -> browser before navigating so the browser
+                        # carries any session-cookie updates that primp acquired since login.
+                        # SKIP this sync when the caller sets skip_cookie_sync=True — used for
+                        # Questionario navigation to preserve the browser's post-login session
+                        # (primp's alive-check GET may produce different cookies than the browser's).
+                        if self._primp is not None and not cmd.get("skip_cookie_sync"):
+                            try:
+                                raw_c = self._primp.get_cookies(cmd["url"]) or {}
+                                if raw_c:
+                                    print(f"[session] nav cookie-sync: {list(raw_c.keys())}")
+                                    ctx.add_cookies([
+                                        {"name": k, "value": v, "url": cmd["url"]}
+                                        for k, v in raw_c.items()
+                                    ])
+                                else:
+                                    print(f"[session] nav cookie-sync: no cookies for {cmd['url'].split('/')[-1]}")
+                            except Exception as _ce:
+                                print(f"[session] nav cookie-sync error: {_ce}")
+                        elif cmd.get("skip_cookie_sync"):
+                            print(f"[session] nav cookie-sync: skipped (skip_cookie_sync=True) for {cmd['url'].split('/')[-1]}")
                         page.goto(cmd["url"], timeout=cmd.get("nav_timeout", 30000))
                         page.wait_for_load_state("networkidle", timeout=15000)
+                        if not cmd.get("fast_nav"):
+                            # DataDome's JS challenge fires asynchronously after networkidle.
+                            # Wait for it to complete and the real page to load.
+                            page.wait_for_timeout(4000)
+                            # If DataDome is still showing (bd.js present), wait more.
+                            if "/ch/bd.js" in (page.content() or ""):
+                                page.wait_for_load_state("networkidle", timeout=10000)
+                                page.wait_for_timeout(3000)
                         self._res_q.put(("ok", page.url))
                     except Exception as exc:
                         try:
                             self._res_q.put(("ok", page.url))
                         except Exception:
                             self._res_q.put(("err", str(exc)))
+
+                elif cmd.get("action") == self._CMD_SCREENSHOT:
+                    try:
+                        _SCREENSHOTS_DIR.mkdir(exist_ok=True)
+                        page.screenshot(path=cmd["path"], full_page=True)
+                        self._res_q.put(("ok", cmd["path"]))
+                    except Exception as exc:
+                        self._res_q.put(("err", str(exc)))
+
+                elif cmd.get("action") == self._CMD_NAV_SCREENSHOT:
+                    try:
+                        page.goto(cmd["url"], timeout=20000)
+                        page.wait_for_load_state("networkidle", timeout=10000)
+                        page.wait_for_timeout(2000)
+                        _SCREENSHOTS_DIR.mkdir(exist_ok=True)
+                        page.screenshot(path=cmd["path"], full_page=True)
+                        self._res_q.put(("ok", cmd["path"]))
+                    except Exception as exc:
+                        self._res_q.put(("err", str(exc)))
+
+                elif cmd.get("action") == self._CMD_FORM_POST:
+                    # Real browser form POST via DOM form.submit(). Causes a genuine
+                    # page navigation (not fetch()), so DataDome auto-solves the challenge.
+                    try:
+                        post_url  = cmd["url"]
+                        post_data = cmd.get("data", {})
+                        # Log the browser's current cookiesession1 (for diagnostics).
+                        # DO NOT overwrite browser cookies with primp's — the browser session
+                        # accumulated questionnaire state via XHR calls and primp's stale
+                        # cookiesession1 would reset it to a session with no questionnaire state.
+                        try:
+                            _br_cookies = {c["name"]: c["value"] for c in ctx.cookies()}
+                            _br_csid = _br_cookies.get("cookiesession1", "")[:12]
+                            print(f"[session] form_post browser-csid={_br_csid}...  "
+                                  f"cookies={list(_br_cookies.keys())}")
+                            # Reverse-sync: update primp to match browser's current session.
+                            if self._primp is not None and _br_cookies:
+                                try:
+                                    self._primp.set_cookies(post_url, _br_cookies)
+                                except Exception:
+                                    pass
+                        except Exception as _ce:
+                            print(f"[session] form_post browser-cookie read error: {_ce}")
+                        fields_js = _json.dumps(post_data)
+                        url_js    = _json.dumps(post_url)
+                        with page.expect_navigation(wait_until="networkidle", timeout=45000):
+                            page.evaluate(f"""() => {{
+                                const f = document.createElement('form');
+                                f.method = 'POST';
+                                f.action = {url_js};
+                                f.enctype = 'application/x-www-form-urlencoded';
+                                const fields = {fields_js};
+                                for (const [k, v] of Object.entries(fields)) {{
+                                    const i = document.createElement('input');
+                                    i.type = 'hidden'; i.name = k; i.value = String(v);
+                                    f.appendChild(i);
+                                }}
+                                document.body.appendChild(f);
+                                f.submit();
+                            }}""")
+                        _content = ""
+                        for _ci in range(6):
+                            try:
+                                page.wait_for_timeout(1500)
+                                _content = page.content() or ""
+                                break
+                            except Exception:
+                                try:
+                                    page.wait_for_load_state("networkidle", timeout=10000)
+                                except Exception:
+                                    pass
+                        if "/ch/bd.js" in _content:
+                            page.wait_for_load_state("networkidle", timeout=10000)
+                            page.wait_for_timeout(3000)
+                            _content = page.content() or ""
+                        html = _content
+                        print(f"[session] form_post -> {page.url}  len={len(html)}")
+                        self._res_q.put(("ok", page.url, html))
+                    except Exception as exc:
+                        self._res_q.put(("err", str(exc), ""))
+
+                elif cmd.get("action") == self._CMD_SUBMIT_PAGE_FORM:
+                    # Submit an existing form already on the page (set up by questionnaire XHR steps).
+                    # Does NOT inject a new form — uses whatever form action/fields the page has.
+                    try:
+                        target_action = cmd.get("action_contains", "Formulario")
+                        # Log current form state for diagnostics
+                        _diag_js = f"""(() => {{
+                            const forms = Array.from(document.querySelectorAll('form'));
+                            return forms.map(f => {{
+                                const fd = new FormData(f);
+                                const fields = {{}};
+                                for (const [k, v] of fd.entries()) {{ fields[k] = v; }}
+                                return {{action: f.action, method: f.method, nfields: Object.keys(fields).length, fieldNames: Object.keys(fields)}};
+                            }});
+                        }})()"""
+                        _form_info = page.evaluate(_diag_js)
+                        print(f"[session] submit_page_form: found {len(_form_info or [])} forms: {_form_info}")
+                        # Find the form targeting Formulario (or first form if none found)
+                        _submit_js = f"""(() => {{
+                            const forms = Array.from(document.querySelectorAll('form'));
+                            const f = forms.find(x => x.action && x.action.includes({_json.dumps(target_action)})) || forms[0];
+                            if (!f) return 'no_form';
+                            f.submit();
+                            return 'submitted:' + f.action;
+                        }})()"""
+                        # Check form exists before starting expect_navigation
+                        _check_js = f"""(() => {{
+                            const forms = Array.from(document.querySelectorAll('form'));
+                            const f = forms.find(x => x.action && x.action.includes({_json.dumps(target_action)})) || forms[0];
+                            return f ? f.action : null;
+                        }})()"""
+                        _form_action = page.evaluate(_check_js)
+                        print(f"[session] submit_page_form: target form action={_form_action}")
+                        if not _form_action:
+                            self._res_q.put(("err", "no_form_found", ""))
+                        else:
+                            with page.expect_navigation(wait_until="networkidle", timeout=45000):
+                                _submit_result = page.evaluate(_submit_js)
+                            print(f"[session] submit_page_form submitted: {_submit_result}")
+                            _content = ""
+                            for _ci in range(6):
+                                try:
+                                    page.wait_for_timeout(1500)
+                                    _content = page.content() or ""
+                                    break
+                                except Exception:
+                                    try:
+                                        page.wait_for_load_state("networkidle", timeout=10000)
+                                    except Exception:
+                                        pass
+                            if "/ch/bd.js" in _content:
+                                page.wait_for_load_state("networkidle", timeout=10000)
+                                page.wait_for_timeout(3000)
+                                _content = page.content() or ""
+                            html = _content
+                            print(f"[session] submit_page_form -> {page.url}  len={len(html)}")
+                            self._res_q.put(("ok", page.url, html))
+                    except Exception as exc:
+                        self._res_q.put(("err", str(exc), ""))
+
+                elif cmd.get("action") == self._CMD_CLOSE_BROWSER:
+                    # Full browser shutdown after login - primp carries the session forward.
+                    # The _run_loop exits; the outer finally block closes the browser.
+                    self._res_q.put(("ok", None))
+                    # Drain any commands queued after CLOSE_BROWSER so their callers
+                    # don't block indefinitely waiting for a result that will never come.
+                    while True:
+                        try:
+                            _leftover = self._cmd_q.get_nowait()
+                            _lr = _leftover.get("_reply") or self._res_q
+                            _lr.put(("err", "browser_closed"))
+                        except queue.Empty:
+                            break
+                    break
 
                 elif cmd.get("action") == self._CMD_SAVE_STATE:
                     try:
@@ -500,6 +699,17 @@ class PlaywrightSession:
                 pass
             print(f"[session] browser closed")
 
+    def _take_screenshot(self, page, username: str, stage: str) -> None:
+        """Save a screenshot from within the browser worker thread (no queue)."""
+        try:
+            _SCREENSHOTS_DIR.mkdir(exist_ok=True)
+            ts   = int(time.time())
+            path = _SCREENSHOTS_DIR / f"{username}_{stage}_{ts}.png"
+            page.screenshot(path=str(path), full_page=True)
+            print(f"[session] screenshot: {path.name}")
+        except Exception as e:
+            print(f"[session] screenshot failed ({stage}): {e}")
+
     def _do_browser_verify(self, page, ctx, cmd: dict) -> dict:
         """Navigate to the token URL and submit the verification form in the browser."""
         token_url      = cmd["token_url"]
@@ -515,7 +725,7 @@ class PlaywrightSession:
         content = page.content()
         has_challenge = "/ch/bd.js" in content
         if has_challenge:
-            raise RuntimeError("token URL returned challenge — cookie expired?")
+            raise RuntimeError("token URL returned challenge - cookie expired?")
 
         # Submit the verification via fetch() from within the browser context
         js = f"""
@@ -543,40 +753,93 @@ class PlaywrightSession:
         return result
 
     def _do_browser_fetch(self, page, cmd: dict) -> dict:
-        """Execute a fetch() from the browser context. Useful for login and other
-        endpoints that require the browser session/TLS fingerprint."""
-        url     = cmd["url"]
-        method  = cmd.get("method", "POST")
-        data    = cmd.get("data", {})
-        headers = cmd.get("headers", {})
-
-        headers_js = _json.dumps(headers)
-        body_js    = _json.dumps(data)
-        method_js  = _json.dumps(method)
-        url_js     = _json.dumps(url)
-
-        js = f"""
-        async () => {{
-            const fields = {body_js};
-            const resp = await fetch({url_js}, {{
-                method: {method_js},
-                headers: {{
-                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Accept": "*/*",
-                    ...{headers_js},
-                }},
-                body: new URLSearchParams(fields).toString(),
-            }});
-            const text = await resp.text();
-            return {{ status: resp.status, body: text }};
-        }}
+        """Execute a fetch() from the browser context - passes DataDome TLS check.
+        encode='form'      -> URLSearchParams (default, login/slots/formulario)
+        encode='multipart' -> FormData with empty blobs for file_fields (ScheduleController)
+        encode='none'      -> no body (GET requests)
         """
+        url         = cmd["url"]
+        method      = cmd.get("method", "POST")
+        data        = cmd.get("data", {})
+        headers     = cmd.get("headers", {})
+        encode      = cmd.get("encode", "form")
+        file_fields = cmd.get("file_fields", [])
+        params      = cmd.get("params", {})
+
+        if params:
+            qs = "&".join(f"{k}={v}" for k, v in params.items())
+            url = url + ("&" if "?" in url else "?") + qs
+
+        headers_js    = _json.dumps(headers)
+        data_js       = _json.dumps(data)
+        method_js     = _json.dumps(method)
+        url_js        = _json.dumps(url)
+        file_fields_js = _json.dumps(file_fields)
+
+        if encode == "multipart":
+            js = f"""
+            async () => {{
+                const fields = {data_js};
+                const fileFields = {file_fields_js};
+                const fd = new FormData();
+                for (const [k, v] of Object.entries(fields)) {{
+                    fd.append(k, v);
+                }}
+                for (const k of fileFields) {{
+                    fd.append(k, new Blob([]), '');
+                }}
+                const extraHdrs = {headers_js};
+                const hdrs = {{}};
+                for (const [k, v] of Object.entries(extraHdrs)) {{
+                    if (k.toLowerCase() !== 'content-type') hdrs[k] = v;
+                }}
+                const resp = await fetch({url_js}, {{
+                    method: {method_js},
+                    headers: hdrs,
+                    body: fd,
+                }});
+                const text = await resp.text();
+                return {{ status: resp.status, body: text }};
+            }}
+            """
+        elif encode == "none" or method.upper() == "GET":
+            js = f"""
+            async () => {{
+                const resp = await fetch({url_js}, {{
+                    method: {method_js},
+                    headers: {{
+                        "Accept": "text/html,application/xhtml+xml,*/*",
+                        ...{headers_js},
+                    }},
+                }});
+                const text = await resp.text();
+                return {{ status: resp.status, body: text }};
+            }}
+            """
+        else:
+            js = f"""
+            async () => {{
+                const fields = {data_js};
+                const resp = await fetch({url_js}, {{
+                    method: {method_js},
+                    headers: {{
+                        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Accept": "*/*",
+                        ...{headers_js},
+                    }},
+                    body: new URLSearchParams(fields).toString(),
+                }});
+                const text = await resp.text();
+                return {{ status: resp.status, body: text }};
+            }}
+            """
+
         result = page.evaluate(js)
         body = result.get("body", "")
         safe_body = body[:80].encode("utf-8", errors="replace").decode("utf-8", errors="replace")
         print(f"[session] browser_fetch {method} {url.split('?')[0].split('/')[-1]} "
-              f"status={result.get('status')}  body={safe_body}")
+              f"status={result.get('status')}  body={safe_body!r}")
         return {"status": result.get("status", 0), "body": body}
 
     def _solve_audio_challenge(self, page, twocaptcha_key: str) -> str:
@@ -644,7 +907,7 @@ class PlaywrightSession:
 
             # Submit to 2captcha audio solver
             if not twocaptcha_key:
-                print(f"[session] audio_challenge: no 2captcha key — cannot solve audio")
+                print(f"[session] audio_challenge: no 2captcha key - cannot solve audio")
                 return ""
             import base64, requests as _req
             audio_b64 = base64.b64encode(audio_bytes).decode()
@@ -731,8 +994,11 @@ class PlaywrightSession:
         skip_checkbox     = cmd.get("skip_checkbox", False)
         min_score         = cmd.get("min_score", 80)
 
-        # Navigate to auth page — reuse existing page if already there (avoids WAF retrigger),
-        # otherwise go HOME_URL → AUTH_URL to match session init pattern.
+        _proxy_short = (self.proxy or "none")[:60]
+        print(f"[session] browser_login: user={username}  proxy={_proxy_short}")
+
+        # Navigate to auth page - reuse existing page if already there (avoids WAF retrigger),
+        # otherwise go HOME_URL -> AUTH_URL to match session init pattern.
         try:
             cur_url = page.url
         except Exception:
@@ -747,13 +1013,13 @@ class PlaywrightSession:
                 pass
             if form_ready:
                 try:
-                    # Challenge iframe overlay blocks field clicks — must navigate fresh
+                    # Challenge iframe overlay blocks field clicks - must navigate fresh
                     ch_vis = page.locator(
                         'iframe[title*="recaptcha challenge"], iframe[src*="bframe"]'
                     ).is_visible(timeout=500)
                     if ch_vis:
                         form_ready = False
-                        print(f"[session] browser_login: challenge overlay visible — navigating fresh")
+                        print(f"[session] browser_login: challenge overlay visible - navigating fresh")
                 except Exception:
                     pass
         if form_ready:
@@ -777,7 +1043,7 @@ class PlaywrightSession:
                 info.widgets = Array.from(divs).map(el => ({
                     tag: el.tagName, id: el.id,
                     dataAction: el.getAttribute('data-action'),
-                    dataSitekey: el.getAttribute('data-sitekey') ? el.getAttribute('data-sitekey').slice(0,12)+'...' : null,
+                    dataSitekey: el.getAttribute('data-sitekey') || null,
                     dataCallback: el.getAttribute('data-callback'),
                 }));
                 // Look for grecaptcha render args in script content
@@ -798,14 +1064,16 @@ class PlaywrightSession:
         except Exception as e:
             print(f"[session] rcaptcha_info error: {e}")
 
-        # Type credentials into form fields — keystrokes build reCAPTCHA Enterprise
+        # Type credentials into form fields - keystrokes build reCAPTCHA Enterprise
         # behavioral score (same pattern that makes registration CAPTCHA pass).
+        # fill("") clears any residual value from previous retry before typing.
         try:
             uf = page.locator(
                 'input[name="username"], input#username, '
                 'input[autocomplete="username"], input[type="text"]:visible'
             ).first
             uf.click(timeout=5000)
+            uf.fill("")
             time.sleep(random.uniform(0.4, 0.8))
             uf.type(username, delay=random.randint(70, 150))
             time.sleep(random.uniform(0.4, 0.9))
@@ -817,6 +1085,7 @@ class PlaywrightSession:
                 'input[name="password"], input#password, input[type="password"]:visible'
             ).first
             pf.click(timeout=5000)
+            pf.fill("")
             time.sleep(random.uniform(0.3, 0.7))
             pf.type(password, delay=random.randint(70, 150))
             time.sleep(random.uniform(0.8, 1.5))
@@ -840,10 +1109,10 @@ class PlaywrightSession:
         challenge_detected = False
 
         if skip_checkbox:
-            # Skip checkbox click and 25s polling — go straight to external solver.
+            # Skip checkbox click and 25s polling - go straight to external solver.
             # race_all() (single parallel race) is faster than race_best() (3 sequential
             # races) and produces the same token quality for LOGIN_EVISA.
-            print(f"[session] browser_login: skip_checkbox=True — silent token injection")
+            print(f"[session] browser_login: skip_checkbox=True - silent token injection")
         else:
             # Click the reCAPTCHA checkbox
             print(f"[session] browser_login: clicking checkbox")
@@ -882,7 +1151,7 @@ class PlaywrightSession:
                 except Exception:
                     pass
 
-        # External solver — race all available services (ProxyLess).
+        # External solver - race all available services (ProxyLess).
         # Audio challenge is intentionally skipped: clicking the audio button and
         # downloading .mp3 files through the proxy are known bot signals that degrade
         # the IP's reCAPTCHA trust score. External ProxyLess tokens work without it.
@@ -891,7 +1160,7 @@ class PlaywrightSession:
             if any_keys:
                 import solver as _solver
                 if skip_checkbox:
-                    print(f"[session] race_all (min_score={min_score}, skip_checkbox mode)")
+                    print(f"[session] race_all (min_score={min_score}, skip_checkbox mode, proxyless)")
                     try:
                         token = _solver.race_all(
                             capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
@@ -901,7 +1170,7 @@ class PlaywrightSession:
                     except Exception as e:
                         print(f"[session] race_all failed: {e}")
                 else:
-                    print(f"[session] no audio token — race_best x3 external solvers (proxyless)")
+                    print(f"[session] no audio token - race_best x3 external solvers (proxyless)")
                     try:
                         token = _solver.race_best(
                             capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
@@ -965,91 +1234,359 @@ class PlaywrightSession:
         """)
         print(f"[session] grecaptcha.getResponse patched to return injected token")
 
-        # POST login credentials directly via browser fetch() — uses the browser's
-        # session cookies and TLS fingerprint without any page interaction.
+        # Call onCaptchaSuccess(token) — the portal's callback that may set server-side session state.
+        # Without this, the server may reject the login because it never received the pre-validation call.
+        try:
+            _cb_src = page.evaluate(f"""
+            (() => {{
+                const _tok = {tok_js};
+                const src = typeof window.onCaptchaSuccess === 'function'
+                    ? window.onCaptchaSuccess.toString().slice(0, 300) : 'not defined';
+                if (typeof window.onCaptchaSuccess === 'function') {{
+                    window.onCaptchaSuccess(_tok);
+                }}
+                return src;
+            }})()
+            """)
+            print(f"[session] onCaptchaSuccess called: {_cb_src!r:.300}")
+            page.wait_for_timeout(1500)
+        except Exception as _cbe:
+            print(f"[session] onCaptchaSuccess call failed: {_cbe}")
+
+        # Diagnostic: dump actual Authentication.jsp form fields before synthetic form submission.
+        # This reveals any CSRF tokens or extra hidden fields we might be missing.
+        try:
+            _form_diag = page.evaluate("""
+            (() => {
+                const forms = Array.from(document.querySelectorAll('form'));
+                return forms.map(f => {
+                    const inputs = Array.from(f.elements).map(e => ({
+                        name: e.name, type: e.type, value: e.value ? e.value.slice(0, 80) : ''
+                    })).filter(e => e.name);
+                    return {action: f.action, method: f.method, id: f.id, inputs};
+                });
+            })()
+            """)
+            print(f"[session] auth-page forms before submit: {_json.dumps(_form_diag)[:1200]}")
+        except Exception as _fde:
+            print(f"[session] form diag error: {_fde}")
+
+        # Submit login via real DOM form.submit() — DataDome blocks fetch()/XHR POSTs
+        # to /login even from within the browser, but treats real page navigations
+        # (form.submit()) differently. After submission the browser lands at HOME_URL
+        # (success) or Authentication.jsp (failure), so we read page.url directly.
         uname_js   = _json.dumps(username)
         passwd_js  = _json.dumps(password)
         lang_js    = _json.dumps(lang)
         login_url  = BASE + "/VistosOnline/login"
         login_url_js = _json.dumps(login_url)
 
-        login_fetch_js = f"""
-        async () => {{
-            const resp = await fetch({login_url_js}, {{
-                method: "POST",
-                headers: {{
-                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Accept": "*/*",
-                }},
-                body: new URLSearchParams({{
-                    "username":        {uname_js},
-                    "password":        {passwd_js},
-                    "language":        {lang_js},
-                    "rgpd":            "Y",
-                    "captchaResponse": {tok_js},
-                }}).toString(),
-            }});
-            const text = await resp.text();
-            return {{ status: resp.status, body: text }};
+        login_form_js = f"""
+        () => {{
+            const f = document.createElement('form');
+            f.method = 'POST'; f.action = {login_url_js};
+            f.enctype = 'application/x-www-form-urlencoded';
+            for (const [k, v] of Object.entries({{
+                'username': {uname_js}, 'password': {passwd_js},
+                'language': {lang_js}, 'rgpd': 'Y', 'captchaResponse': {tok_js},
+            }})) {{
+                const i = document.createElement('input');
+                i.type = 'hidden'; i.name = k; i.value = v;
+                f.appendChild(i);
+            }}
+            document.body.appendChild(f);
+            f.submit();
         }}
         """
         try:
-            result = page.evaluate(login_fetch_js)
-        except Exception as e:
-            print(f"[session] login fetch failed: {e}")
-            return {"status": 0, "body": ""}
-
-        status = result.get("status", 0)
-        body   = result.get("body", "")
-        safe_body = body[:80].encode("utf-8", errors="replace").decode("utf-8", errors="replace")
-        print(f"[session] /login POST status={status}  body={safe_body!r}")
-
-        # Confirm success: if server response looks like success, verify page navigated to HOME_URL
-        parsed_type = None
-        if body:
-            try:
-                parsed_type = _json.loads(body).get("type", "")
-            except Exception:
-                parsed_type = None  # HTML/WAF body — return as-is for WAF detection
-
-        if status == 200 and parsed_type in ("", "200", "success"):
-            page.wait_for_timeout(2000)
-            cur_url = page.url
-            at_home = cur_url == HOME_URL or cur_url.rstrip("/") == HOME_URL.rstrip("/")
-            print(f"[session] post-login url check: {cur_url}  at_home={at_home}")
-            if not at_home:
-                print(f"[session] navigating to HOME_URL to confirm session")
+            with page.expect_navigation(wait_until="networkidle", timeout=45000):
+                page.evaluate(login_form_js)
+            # A second JS-triggered redirect may start after networkidle; retry content() until stable.
+            _login_content = ""
+            for _ci in range(6):
                 try:
-                    page.goto(HOME_URL, timeout=20000)
-                    page.wait_for_load_state("networkidle", timeout=10000)
-                    landed  = page.url
-                    content = page.content()
-                    is_auth      = "Authentication.jsp" in landed or "/login" in landed
-                    has_challenge = "/ch/bd.js" in content
-                    if is_auth:
-                        # Portal redirected back to login — session not established
-                        print(f"[session] HOME_URL redirected to auth at {landed} — not authenticated")
-                        body = '{"type":"error","description":"no_redirect"}'
-                    elif has_challenge:
-                        # HOME_URL got WAF-challenged — session IS established,
-                        # WAF challenge on this IP is independent of login state
-                        print(f"[session] HOME_URL has WAF challenge but session was established — success")
-                        body = '{"type":"success","description":"nav_confirmed_waf"}'
-                    else:
-                        print(f"[session] HOME_URL confirmed at {landed} — success")
-                        body = '{"type":"success","description":"nav_confirmed"}'
-                except Exception as nav_err:
-                    print(f"[session] HOME_URL nav failed: {nav_err}")
-                    body = '{"type":"error","description":"no_redirect"}'
+                    page.wait_for_timeout(1500)
+                    _login_content = page.content() or ""
+                    break
+                except Exception:
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=10000)
+                    except Exception:
+                        pass
+            if "/ch/bd.js" in _login_content:
+                page.wait_for_load_state("networkidle", timeout=25000)
+                page.wait_for_timeout(3000)
+                _login_content = page.content() or ""
+        except Exception as e:
+            print(f"[session] login form submit failed: {e}")
+            return {"status": 0, "body": "", "captcha_token": token}
+        final_url    = page.url
+        html_content = _login_content
+        has_challenge = "/ch/bd.js" in html_content
+
+        # HAR-confirmed: POST /login -> 200 text/plain (68 bytes) on success, browser stays at
+        # /VistosOnline/login. On failure the server 302s back to Authentication.jsp.
+        # If we landed at /login with no challenge, navigate to AUTH_URL to complete the
+        # redirect chain: Authentication.jsp -> 302 -> /VistosOnline -> /VistosOnline/
+        _at_login_endpoint = final_url.rstrip("/").endswith("/VistosOnline/login")
+        if _at_login_endpoint and not has_challenge and len(html_content) < 500:
+            print(f"[session] /login 200 ok ({len(html_content)}b) — navigating to AUTH_URL to complete redirect")
+            try:
+                page.goto(AUTH_URL, timeout=20000)
+                page.wait_for_load_state("networkidle", timeout=15000)
+                page.wait_for_timeout(2000)
+                final_url    = page.url
+                html_content = page.content() or ""
+                has_challenge = "/ch/bd.js" in html_content
+            except Exception as _nav_e:
+                print(f"[session] AUTH_URL nav after login failed: {_nav_e}")
+
+        at_auth      = "Authentication.jsp" in final_url
+        at_home      = final_url.rstrip("/") == HOME_URL.rstrip("/")
+        status = 200
+        print(f"[session] /login form POST -> {final_url}  at_home={at_home}  at_auth={at_auth}  challenge={has_challenge}  html_len={len(html_content)}")
+
+        if at_home and not has_challenge:
+            body = '{"type":"success","description":"form_nav_confirmed"}'
+            self._take_screenshot(page, username, "login")
+        elif has_challenge:
+            _dd_result = self._try_datadome_bypass(
+                page, html_content, final_url,
+                capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
+                skip_checkbox, min_score, username, password, lang,
+            )
+            if _dd_result:
+                return _dd_result
+            body = '{"type":"error","description":"datadome_challenge_on_post"}'
+        elif at_auth:
+            # Extract the actual error message from Authentication.jsp
+            try:
+                _auth_error = page.evaluate("""
+                () => {
+                    const els = [...document.querySelectorAll('.alert,.error,.errorMessage,#errorMessage,.text-danger,.msg-error,[class*="error"],[id*="error"],td.text-center.font-weight-bold')];
+                    for (const el of els) {
+                        const t = el.textContent.trim();
+                        if (t) return t.slice(0, 300);
+                    }
+                    const ps = document.querySelectorAll('p');
+                    for (const p of ps) {
+                        const t = p.textContent.trim();
+                        if (t && t.length > 5) return t.slice(0, 300);
+                    }
+                    return null;
+                }
+                """)
+                if _auth_error:
+                    print(f"[session] auth-redirect error: {_auth_error!r:.300}")
+                else:
+                    _auth_snip = html_content[3500:4000].replace('\n', ' ').replace('\r', '')
+                    print(f"[session] auth-redirect body@3500: {_auth_snip!r:.300}")
+            except Exception as _ae:
+                _auth_snip = html_content[3500:4000].replace('\n', ' ').replace('\r', '')
+                print(f"[session] auth-redirect body@3500: {_auth_snip!r:.300}")
+            body = '{"type":"error","description":"login_failed_auth_redirect"}'
+        else:
+            safe_url = final_url[:80].replace('"', '')
+            body = f'{{"type":"error","description":"unexpected_redirect_{safe_url}"}}'
+
+        if body.startswith('{"type":"success'):
+            # Sync browser cookies -> primp so keepalive GETs use the authenticated session.
+            try:
+                _post_cookies = {c["name"]: c["value"] for c in page.context.cookies()}
+                if _post_cookies and self._primp is not None:
+                    self._primp.set_cookies(AUTH_URL, _post_cookies)
+                    print(f"[session] post-login primp sync: {list(_post_cookies.keys())}")
+            except Exception as _se:
+                print(f"[session] post-login primp sync failed: {_se}")
 
         return {"status": status, "body": body, "captcha_token": token}
 
-    # ── Public interface ──────────────────────────────────────────────────────
+    def _try_datadome_bypass(
+        self, page, html_content: str, website_url: str,
+        capsolver_keys: list, anticaptcha_keys: list,
+        twocaptcha_keys: list, capmonster_keys: list,
+        skip_checkbox: bool, min_score: int,
+        username: str, password: str, lang: str,
+    ):
+        """
+        Called when DataDome challenges the login POST.
+        Extracts the challenge URL, solves it via capsolver DatadomeSliderTask,
+        injects the datadome cookie, then retries the login form once.
+        Returns a result dict on success or None if bypass fails.
+        """
+        import re as _re
+        import solver as _solver
+
+        # Extract the captcha-delivery URL — bd.js creates an iframe after running
+        captcha_url = None
+        try:
+            captcha_url = page.evaluate(
+                "document.querySelector('iframe[src*=\"captcha-delivery.com\"]')?.src || null"
+            )
+        except Exception as _ee:
+            print(f"[session] datadome: DOM extract failed: {_ee}")
+
+        if not captcha_url:
+            m = _re.search(
+                r'https://geo\.captcha-delivery\.com/captcha/\?[^"\'<\s]+',
+                html_content,
+            )
+            captcha_url = m.group(0) if m else None
+
+        if not captcha_url:
+            # Log page diagnostics to understand the challenge structure
+            try:
+                _iframes = page.evaluate("""
+                () => Array.from(document.querySelectorAll('iframe')).map(f => f.src || f.srcdoc?.slice(0,80) || '(no-src)').slice(0,10)
+                """)
+                print(f"[session] datadome: iframes on page: {_iframes}")
+                _scripts = page.evaluate("""
+                () => Array.from(document.querySelectorAll('script[src]')).map(s => s.src).slice(0,10)
+                """)
+                print(f"[session] datadome: scripts on page: {_scripts}")
+                print(f"[session] datadome: page.url={page.url}")
+                print(f"[session] datadome: html snippet: {html_content[:500]!r}")
+            except Exception as _de:
+                print(f"[session] datadome: diag failed: {_de}")
+            print("[session] datadome: captchaUrl not found — cannot bypass")
+            return None
+
+        print(f"[session] datadome: captchaUrl len={len(captcha_url)}")
+
+        try:
+            user_agent = page.evaluate("navigator.userAgent") or ""
+        except Exception:
+            user_agent = ""
+
+        cookie_str = _solver.solve_datadome_capsolver(
+            capsolver_keys, captcha_url, website_url, user_agent, self.proxy
+        )
+        if not cookie_str:
+            print("[session] datadome: solver returned no cookie")
+            return None
+
+        dd_value = cookie_str.removeprefix("datadome=")
+        print(f"[session] datadome: injecting cookie  len={len(dd_value)}")
+        try:
+            page.context.add_cookies([{
+                "name":   "datadome",
+                "value":  dd_value,
+                "domain": ".pedidodevistos.mne.gov.pt",
+                "path":   "/",
+            }])
+        except Exception as _ce:
+            print(f"[session] datadome: cookie inject failed: {_ce}")
+            return None
+
+        # Navigate to AUTH_URL so the form is available for the retry
+        try:
+            page.goto(AUTH_URL, timeout=30000)
+            page.wait_for_load_state("networkidle", timeout=20000)
+            page.wait_for_timeout(2000)
+        except Exception as _ne:
+            print(f"[session] datadome: AUTH_URL nav failed: {_ne}")
+            return None
+
+        # Fresh CAPTCHA token (previous one is consumed / expired)
+        retry_token = ""
+        print(f"[session] datadome: retry race_all (min_score={min_score})")
+        try:
+            retry_token = _solver.race_all(
+                capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
+                "LOGIN_EVISA", proxy=None, min_score=min_score,
+            )
+            print(f"[session] datadome: retry token len={len(retry_token)}  score={_solver.score_token(retry_token)}")
+        except Exception as _te:
+            print(f"[session] datadome: retry race_all failed: {_te}")
+            return None
+
+        if not retry_token:
+            return None
+
+        # Resubmit login form with the new token
+        _tok_js    = _json.dumps(retry_token)
+        _uname_js  = _json.dumps(username)
+        _passwd_js = _json.dumps(password)
+        _lang_js   = _json.dumps(lang)
+        _lurl_js   = _json.dumps(BASE + "/VistosOnline/login")
+
+        _retry_form_js = f"""
+        () => {{
+            const f = document.createElement('form');
+            f.method = 'POST'; f.action = {_lurl_js};
+            f.enctype = 'application/x-www-form-urlencoded';
+            for (const [k, v] of Object.entries({{
+                'username': {_uname_js}, 'password': {_passwd_js},
+                'language': {_lang_js}, 'rgpd': 'Y', 'captchaResponse': {_tok_js},
+            }})) {{
+                const i = document.createElement('input');
+                i.type = 'hidden'; i.name = k; i.value = v;
+                f.appendChild(i);
+            }}
+            document.body.appendChild(f);
+            f.submit();
+        }}
+        """
+        print("[session] datadome: retry login form submit")
+        try:
+            with page.expect_navigation(wait_until="networkidle", timeout=45000):
+                page.evaluate(_retry_form_js)
+            _retry_content = ""
+            for _ci in range(6):
+                try:
+                    page.wait_for_timeout(1500)
+                    _retry_content = page.content() or ""
+                    break
+                except Exception:
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=10000)
+                    except Exception:
+                        pass
+            if "/ch/bd.js" in _retry_content:
+                page.wait_for_load_state("networkidle", timeout=25000)
+                page.wait_for_timeout(3000)
+                _retry_content = page.content() or ""
+        except Exception as _se:
+            print(f"[session] datadome: retry form submit failed: {_se}")
+            return None
+
+        final_url2   = page.url
+        html2        = _retry_content
+        challenge2   = "/ch/bd.js" in html2
+
+        _at_login2 = final_url2.rstrip("/").endswith("/VistosOnline/login")
+        if _at_login2 and not challenge2 and len(html2) < 500:
+            try:
+                page.goto(AUTH_URL, timeout=20000)
+                page.wait_for_load_state("networkidle", timeout=15000)
+                page.wait_for_timeout(2000)
+                final_url2 = page.url
+                html2      = page.content() or ""
+                challenge2 = "/ch/bd.js" in html2
+            except Exception:
+                pass
+
+        at_home2 = final_url2.rstrip("/") == HOME_URL.rstrip("/")
+        at_auth2 = "Authentication.jsp" in final_url2
+        print(f"[session] datadome retry: {final_url2}  at_home={at_home2}  at_auth={at_auth2}  challenge={challenge2}  html_len={len(html2)}")
+
+        if at_home2 and not challenge2:
+            try:
+                _post_cookies = {c["name"]: c["value"] for c in page.context.cookies()}
+                if _post_cookies and self._primp is not None:
+                    self._primp.set_cookies(AUTH_URL, _post_cookies)
+                    print(f"[session] datadome: post-login primp sync: {list(_post_cookies.keys())}")
+            except Exception as _se2:
+                print(f"[session] datadome: primp sync failed: {_se2}")
+            return {"status": 200, "body": '{"type":"success","description":"form_nav_confirmed"}', "captcha_token": retry_token}
+
+        return None
+
+    # -- Public interface ------------------------------------------------------
 
     @property
     def client(self):
-        """The underlying primp.Client — used by session_store and batch_apply."""
+        """The underlying primp.Client - used by session_store and batch_apply."""
         return self._primp
 
     def _hdrs(self, extra: dict) -> dict:
@@ -1065,7 +1602,8 @@ class PlaywrightSession:
         if self._primp is None:
             raise RuntimeError("Session not ready")
         r = self._primp.get(url, headers=self._hdrs(headers or {}),
-                            params=params, timeout=timeout)
+                            params=params, timeout=timeout,
+                            follow_redirects=follow_redirects)
         return _FakeResponse(r.status_code, r.text, str(r.url))
 
     def post(self, url: str, data: dict | None = None,
@@ -1074,22 +1612,32 @@ class PlaywrightSession:
         if self._primp is None:
             raise RuntimeError("Session not ready")
         r = self._primp.post(url, data=data, headers=self._hdrs(headers or {}),
-                             params=params, timeout=timeout)
+                             params=params, timeout=timeout,
+                             follow_redirects=follow_redirects)
         return _FakeResponse(r.status_code, r.text, str(r.url))
 
     def browser_fetch(self, url: str, data: dict, method: str = "POST",
-                      headers: dict | None = None, timeout: int = 30) -> dict:
+                      headers: dict | None = None, timeout: int = 30,
+                      params: dict | None = None,
+                      encode: str = "form",
+                      file_fields: list | None = None) -> dict:
         """
-        Execute a fetch() from the live browser context.
-        Useful for endpoints (login, apply) that require the browser TLS fingerprint.
+        Execute a fetch() from the live browser context - bypasses DataDome TLS check.
+        encode='form'      -> URLSearchParams body (default)
+        encode='multipart' -> FormData body; pass file_fields=['foto','file1',...] for empty blobs
+        encode='none'      -> no body (use for GET)
+        params             -> appended to URL as query string
         Returns {"status": int, "body": str}.
         """
         self._cmd_q.put({
-            "action":  self._CMD_FETCH,
-            "url":     url,
-            "method":  method,
-            "data":    data,
-            "headers": headers or {},
+            "action":      self._CMD_FETCH,
+            "url":         url,
+            "method":      method,
+            "data":        data,
+            "headers":     headers or {},
+            "params":      params or {},
+            "encode":      encode,
+            "file_fields": file_fields or [],
         })
         try:
             status, result = self._res_q.get(timeout=timeout)
@@ -1148,9 +1696,15 @@ class PlaywrightSession:
             raise RuntimeError(f"browser_eval failed: {result}")
         return result
 
-    def browser_nav(self, url: str, timeout: int = 60) -> str:
-        """Navigate the browser page to url and return the final URL after load."""
-        self._cmd_q.put({"action": self._CMD_NAV, "url": url, "nav_timeout": timeout * 1000})
+    def browser_nav(self, url: str, timeout: int = 60, fast_nav: bool = False,
+                    skip_cookie_sync: bool = False) -> str:
+        """Navigate the browser page to url and return the final URL after load.
+        fast_nav=True skips the DataDome 4-second post-load wait (safe for non-DataDome URLs).
+        skip_cookie_sync=True preserves the browser's current cookies instead of overwriting with primp's.
+        """
+        self._cmd_q.put({"action": self._CMD_NAV, "url": url,
+                         "nav_timeout": timeout * 1000, "fast_nav": fast_nav,
+                         "skip_cookie_sync": skip_cookie_sync})
         try:
             status, result = self._res_q.get(timeout=timeout + 5)
         except queue.Empty:
@@ -1158,6 +1712,61 @@ class PlaywrightSession:
         if status == "err":
             raise RuntimeError(f"browser_nav failed: {result}")
         return result
+
+    def browser_form_post(self, url: str, data: dict,
+                          timeout: int = 55) -> tuple[str, str]:
+        """Submit a form POST via browser DOM (form.submit()), causing a real page navigation.
+        Syncs primp cookies first. Returns (final_url, html)."""
+        self._cmd_q.put({"action": self._CMD_FORM_POST, "url": url, "data": data})
+        try:
+            result = self._res_q.get(timeout=timeout)
+            if result[0] == "ok":
+                _, final_url, html = result
+                return final_url, html
+            else:
+                raise RuntimeError(f"browser_form_post failed: {result[1]}")
+        except queue.Empty:
+            raise RuntimeError(f"browser_form_post timed out after {timeout}s")
+
+    def submit_page_form(self, action_contains: str = "Formulario",
+                         timeout: int = 55) -> tuple[str, str]:
+        """Submit the existing on-page form (populated by questionnaire XHR steps).
+        Does NOT inject a new form. Returns (final_url, html)."""
+        self._cmd_q.put({"action": self._CMD_SUBMIT_PAGE_FORM, "action_contains": action_contains})
+        try:
+            result = self._res_q.get(timeout=timeout)
+            if result[0] == "ok":
+                _, final_url, html = result
+                return final_url, html
+            else:
+                raise RuntimeError(f"submit_page_form failed: {result[1]}")
+        except queue.Empty:
+            raise RuntimeError(f"submit_page_form timed out after {timeout}s")
+
+    def screenshot(self, username: str, stage: str, timeout: int = 15) -> str | None:
+        """Take a screenshot during the login flow (browser still open). Returns path or None."""
+        _SCREENSHOTS_DIR.mkdir(exist_ok=True)
+        ts   = int(time.time())
+        path = str(_SCREENSHOTS_DIR / f"{username}_{stage}_{ts}.png")
+        self._cmd_q.put({"action": self._CMD_SCREENSHOT, "path": path})
+        try:
+            status, result = self._res_q.get(timeout=timeout)
+            if status == "ok":
+                print(f"[session] screenshot: {Path(result).name}")
+                return result
+            print(f"[session] screenshot failed ({stage}): {result}")
+        except queue.Empty:
+            print(f"[session] screenshot timed out ({stage})")
+        return None
+
+    def close_browser(self, timeout: int = 10) -> None:
+        """Shut down the Playwright browser after login. primp carries the session forward."""
+        self._cmd_q.put({"action": self._CMD_CLOSE_BROWSER})
+        try:
+            self._res_q.get(timeout=timeout)
+        except queue.Empty:
+            pass
+        print("[session] browser closed - primp session active")
 
     def save_state(self, path) -> None:
         """Export cookies + localStorage to a JSON file via Playwright storage_state."""
@@ -1168,7 +1777,7 @@ class PlaywrightSession:
             raise RuntimeError("save_state timed out after 30s")
         if status == "err":
             raise RuntimeError(f"save_state failed: {result}")
-        print(f"[session] session state saved → {result}")
+        print(f"[session] session state saved -> {result}")
 
     def verify_email(self, token_url: str, insert_jsp: str, verify_url: str,
                      token_input: str, token_search: str, lang: str,
@@ -1212,7 +1821,7 @@ class PlaywrightSession:
             pass
 
 
-# ── External CAPTCHA solver (synchronous, for browser fallback) ───────────────
+# -- External CAPTCHA solver (synchronous, for browser fallback) ---------------
 
 def _capsolver_token_sync(api_key: str, sitekey: str, page_url: str,
                           proxy: str | None = None, timeout: int = 120,
@@ -1225,7 +1834,7 @@ def _capsolver_token_sync(api_key: str, sitekey: str, page_url: str,
 
     cookies: browser cookie header string (e.g. "Vistos_sid=abc; cookiesession1=xyz").
              Passed to CapSolver so the token is generated inside the same server
-             session — the Enterprise reCAPTCHA token will carry the session signals.
+             session - the Enterprise reCAPTCHA token will carry the session signals.
     """
     import urllib.request as _req
     import json as _j
@@ -1276,7 +1885,7 @@ def _capsolver_token_sync(api_key: str, sitekey: str, page_url: str,
     raise RuntimeError("CapSolver: timed out waiting for result")
 
 
-# ── Proxy URL parser ──────────────────────────────────────────────────────────
+# -- Proxy URL parser ----------------------------------------------------------
 
 def _parse_proxy(proxy_url: str | None) -> tuple[str | None, str | None, str | None]:
     """Split proxy URL into (server, username, password) for Playwright."""
@@ -1291,7 +1900,7 @@ def _parse_proxy(proxy_url: str | None) -> tuple[str | None, str | None, str | N
         return proxy_url, None, None
 
 
-# ── Public entry point ────────────────────────────────────────────────────────
+# -- Public entry point --------------------------------------------------------
 
 def get_session(proxy: str | None = None,
                 inject_cookies: dict | None = None,
@@ -1300,7 +1909,7 @@ def get_session(proxy: str | None = None,
                 fp: tuple | None = None) -> PlaywrightSession:
     """
     Launch a Chrome session. If inject_cookies is provided, the saved session
-    cookies are pre-loaded before navigation — the WAF challenge is skipped.
+    cookies are pre-loaded before navigation - the WAF challenge is skipped.
     Pass headless=False to open a visible browser window (for manual inspection).
     Pass storage_state=path to restore a previously saved session (cookies + localStorage).
     Pass fp=(ua, sec_ch_ua, vp_w, vp_h, platform) to use a fixed fingerprint.
@@ -1312,7 +1921,7 @@ def get_session(proxy: str | None = None,
 def get_session_from_state(state_path, headless: bool = False) -> PlaywrightSession:
     """
     Open a browser pre-loaded with a previously saved session state (from save_state()).
-    No proxy needed — session cookies are embedded in the state file.
+    No proxy needed - session cookies are embedded in the state file.
     headless=False by default so the user sees the browser window.
     Loads <state_stem>_profile.json alongside the state file to restore the original
     browser fingerprint (user-agent, viewport, platform) so the server sees the same
@@ -1330,6 +1939,6 @@ def get_session_from_state(state_path, headless: bool = False) -> PlaywrightSess
             proxy = prof.get("proxy")
             print(f"[session] profile loaded from {profile_path.name}  ua=...{fp[0][55:85]}")
         except Exception as e:
-            print(f"[session] profile load failed ({e}) — using random fingerprint")
+            print(f"[session] profile load failed ({e}) - using random fingerprint")
     return PlaywrightSession(proxy=proxy, headless=headless,
                              storage_state=str(state_path), fp=fp)

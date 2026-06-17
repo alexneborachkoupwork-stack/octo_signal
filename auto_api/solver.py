@@ -1,4 +1,4 @@
-"""
+﻿"""
 reCAPTCHA Enterprise solver wrapper.
 Supports: CapSolver, Anti-Captcha, 2Captcha, CapMonster.
 
@@ -14,15 +14,19 @@ import time
 import threading
 import requests
 
+# Per-thread stop event -- set by race_all so _poll can abort polling when another solver wins.
+# Thread-local avoids the module-level monkey-patch race condition with concurrent race_all calls.
+_thread_stop: threading.local = threading.local()
+
 SITE_KEY   = "6LdOB9crAAAAADT4RFruc5sPmzLKIgvJVfL830d4"
 AUTH_URL   = "https://pedidodevistos.mne.gov.pt/VistosOnline/Authentication.jsp"
 SCHED_URL  = "https://pedidodevistos.mne.gov.pt/VistosOnline/Schedule.jsp"
 POLL_DELAY = 3
-MAX_POLLS  = 40  # ~2 minutes
+MAX_POLLS  = 60  # ~3 minutes
 
 _V3_ACTIONS: frozenset[str] = frozenset()  # all actions use ReCaptchaV2Enterprise
 
-# reCAPTCHA tokens are bound to the page URL — each action must use the correct page
+# reCAPTCHA tokens are bound to the page URL -- each action must use the correct page
 _ACTION_URL: dict[str, str] = {
     "SCHEDULE_EVISA": SCHED_URL,
 }
@@ -30,7 +34,7 @@ _ACTION_URL: dict[str, str] = {
 
 def _parse_proxy(proxy_url: str | None) -> dict | None:
     """
-    Parse http://user:pass@host:port → {proxyType, proxyAddress, proxyPort,
+    Parse http://user:pass@host:port -> {proxyType, proxyAddress, proxyPort,
     proxyLogin, proxyPassword} for CAPTCHA service APIs.
     Returns None if proxy_url is None/empty.
     """
@@ -58,7 +62,7 @@ def score_token(token: str) -> int:
     Returns 0-100; higher is better.
     """
     n = len(token)
-    if n < 2320:  return 100  # auto-pass — no image challenge, highest score
+    if n < 2320:  return 100  # auto-pass -- no image challenge, highest score
     if n < 2380:  return 85
     if n < 2430:  return 70
     if n < 2470:  return 55   # confirmed working at this length (neupir2449: len=2446)
@@ -97,7 +101,7 @@ def race_best(
                 best_score = score
                 best_token = token
             if score >= min_score:
-                print(f"[solver] race_best: threshold met ({score}>={min_score}) — stopping early")
+                print(f"[solver] race_best: threshold met ({score}>={min_score}) -- stopping early")
                 break
         except Exception as e:
             print(f"[solver] race_best: race {i+1} failed: {e}")
@@ -148,6 +152,7 @@ def race_all(capsolver_keys: list[str], anticaptcha_keys: list[str],
     stop = threading.Event()  # signals threads to stop polling
 
     def _run_guarded(label: str, fn: callable, key: str) -> None:
+        _thread_stop.stop = stop  # bind this thread's stop event for _poll to check
         try:
             print(f"[solver] race:{label} starting")
             token = fn(key, action, proxy_info, session_cookies)
@@ -157,12 +162,12 @@ def race_all(capsolver_keys: list[str], anticaptcha_keys: list[str],
                 finished[0] += 1
                 print(f"[solver] race:{label} done  token_len={len(token)}  score={s}")
                 if s >= min_score:
-                    # Good enough — stop all remaining threads
+                    # Good enough -- stop all remaining threads
                     print(f"[solver] race:{label} WON (score={s}>={min_score})")
                     stop.set()
                     done.set()
                 elif finished[0] == total:
-                    # All threads done, no score met threshold — take best available
+                    # All threads done, no score met threshold -- take best available
                     done.set()
         except Exception as e:
             with lock:
@@ -172,29 +177,6 @@ def race_all(capsolver_keys: list[str], anticaptcha_keys: list[str],
                 if finished[0] == total:
                     done.set()
 
-    import solver as _self_mod
-    _orig_poll = _self_mod._poll
-
-    def _stoppable_poll(url: str, api_key: str, task_id: str) -> str:
-        for i in range(MAX_POLLS):
-            if stop.is_set():
-                raise RuntimeError("race: stopped (another solver won)")
-            time.sleep(POLL_DELAY)
-            if stop.is_set():
-                raise RuntimeError("race: stopped (another solver won)")
-            r = requests.post(url, json={"clientKey": api_key, "taskId": task_id}, timeout=30)
-            data = r.json()
-            if data.get("errorId", 0) != 0:
-                raise RuntimeError(f"poll error: {data}")
-            if data.get("status") == "ready":
-                token = data["solution"]["gRecaptchaResponse"]
-                print(f"[solver] ready in ~{(i+1)*POLL_DELAY}s  token_len={len(token)}")
-                return token
-            print(f"[solver] poll {i+1}/{MAX_POLLS}: {data.get('status', '?')}")
-        raise RuntimeError(f"Solver timeout after {MAX_POLLS * POLL_DELAY}s")
-
-    _self_mod._poll = _stoppable_poll
-
     threads = [
         threading.Thread(target=_run_guarded, args=(label, fn, key), daemon=True)
         for label, fn, key in tasks
@@ -203,14 +185,13 @@ def race_all(capsolver_keys: list[str], anticaptcha_keys: list[str],
         t.start()
 
     done.wait(timeout=180)
-    _self_mod._poll = _orig_poll  # restore
 
     if results:
         best_token, best_score = max(results, key=lambda x: x[1])
         print(f"[solver] race_all: best score={best_score}  token_len={len(best_token)}  "
               f"collected={len(results)}/{total}")
         return best_token
-    raise RuntimeError(f"race_all — all {total} solvers failed: {' | '.join(errors)}")
+    raise RuntimeError(f"race_all -- all {total} solvers failed: {' | '.join(errors)}")
 
 
 def solve(service: str, keys: list[str], action: str = "LOGIN_EVISA",
@@ -225,7 +206,7 @@ def solve(service: str, keys: list[str], action: str = "LOGIN_EVISA",
     Raises RuntimeError if all keys fail.
     """
     proxy_info = _parse_proxy(proxy)
-    print(f"[solver] proxyless mode (solver-service IPs — higher Enterprise score)")
+    print(f"[solver] proxyless mode (solver-service IPs -- higher Enterprise score)")
 
     last_err = None
     for i, key in enumerate(keys):
@@ -239,14 +220,14 @@ def solve(service: str, keys: list[str], action: str = "LOGIN_EVISA",
     raise RuntimeError(f"All {len(keys)} keys failed for {service}. Last: {last_err}")
 
 
-# ── CapSolver ─────────────────────────────────────────────────────────────────
+# -- CapSolver -----------------------------------------------------------------
 
 def _capsolver(api_key: str, action: str, proxy_info: dict | None,
                session_cookies: dict | None = None) -> str:
     page_url = _ACTION_URL.get(action, AUTH_URL)
     if action in _V3_ACTIONS:
         task = {
-            "type":        "ReCaptchaV3TaskProxyLess",
+            "type":        "ReCaptchaV3Task" if proxy_info else "ReCaptchaV3TaskProxyLess",
             "websiteURL":  page_url,
             "websiteKey":  SITE_KEY,
             "pageAction":  action,
@@ -271,7 +252,7 @@ def _capsolver(api_key: str, action: str, proxy_info: dict | None,
     return _poll("https://api.capsolver.com/getTaskResult", api_key, task_id)
 
 
-# ── Anti-Captcha ──────────────────────────────────────────────────────────────
+# -- Anti-Captcha --------------------------------------------------------------
 
 _AC_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -291,7 +272,7 @@ def _anticaptcha(api_key: str, action: str, proxy_info: dict | None,
             "pageAction":   action,
             "isEnterprise": True,
         }
-        task["type"] = "RecaptchaV3TaskProxyless"
+        task["type"] = "RecaptchaV3Task" if proxy_info else "RecaptchaV3TaskProxyless"
     else:
         task = {
             "type":       "RecaptchaV2EnterpriseTaskProxyless",
@@ -314,7 +295,7 @@ def _anticaptcha(api_key: str, action: str, proxy_info: dict | None,
     return _poll("https://api.anti-captcha.com/getTaskResult", api_key, task_id)
 
 
-# ── 2Captcha ──────────────────────────────────────────────────────────────────
+# -- 2Captcha ------------------------------------------------------------------
 
 def _twocaptcha(api_key: str, action: str, proxy_info: dict | None,
                 session_cookies: dict | None = None) -> str:
@@ -347,7 +328,7 @@ def _twocaptcha(api_key: str, action: str, proxy_info: dict | None,
     return _poll("https://api.2captcha.com/getTaskResult", api_key, task_id)
 
 
-# ── CapMonster ────────────────────────────────────────────────────────────────
+# -- CapMonster ----------------------------------------------------------------
 
 def _capmonster(api_key: str, action: str, proxy_info: dict | None,
                 session_cookies: dict | None = None) -> str:
@@ -380,11 +361,16 @@ def _capmonster(api_key: str, action: str, proxy_info: dict | None,
     return _poll("https://api.capmonster.cloud/getTaskResult", api_key, task_id)
 
 
-# ── Shared poll ───────────────────────────────────────────────────────────────
+# -- Shared poll ---------------------------------------------------------------
 
 def _poll(url: str, api_key: str, task_id: str) -> str:
+    stop: threading.Event | None = getattr(_thread_stop, "stop", None)
     for i in range(MAX_POLLS):
+        if stop and stop.is_set():
+            raise RuntimeError("race: stopped (another solver won)")
         time.sleep(POLL_DELAY)
+        if stop and stop.is_set():
+            raise RuntimeError("race: stopped (another solver won)")
         r = requests.post(url, json={"clientKey": api_key, "taskId": task_id}, timeout=30)
         data = r.json()
         if data.get("errorId", 0) != 0:
@@ -398,7 +384,7 @@ def _poll(url: str, api_key: str, task_id: str) -> str:
 
 
 def _playwright_solver(api_key: str, action: str, proxy_info: dict | None) -> str:
-    """Uses real Chromium to solve the CAPTCHA — highest reCAPTCHA Enterprise score.
+    """Uses real Chromium to solve the CAPTCHA -- highest reCAPTCHA Enterprise score.
     api_key is PLAYWRIGHT_KEYS value ("pw" = dummy). Falls back to CAPSOLVER_KEYS
     for ReCaptchaV2Classification when image grid challenges appear."""
     from captcha_pw import solve_captcha
@@ -440,3 +426,100 @@ _SOLVERS = {
     "capmonster":  _capmonster,
     "playwright":  _playwright_solver,
 }
+
+
+def solve_datadome_capsolver(
+    capsolver_keys: list[str],
+    captcha_url: str,
+    website_url: str,
+    user_agent: str,
+    proxy: str | None,
+    timeout: int = 120,
+) -> str | None:
+    """
+    Solve a DataDome slider challenge via capsolver DatadomeSliderTask.
+
+    captcha_url: the geo.captcha-delivery.com/captcha/?... URL from the challenge iframe.
+    proxy:       MUST be the same proxy the browser session uses (cookie is IP-bound).
+
+    Returns the raw cookie string e.g. 'datadome=XXXXXX', or None on failure.
+    """
+    if not capsolver_keys or not captcha_url:
+        return None
+
+    proxy_info = _parse_proxy(proxy)
+    if not proxy_info:
+        print("[datadome] DatadomeSliderTask requires a proxy — skipping")
+        return None
+
+    proxy_str = (
+        f"{proxy_info['proxyType']}://"
+        f"{proxy_info['proxyLogin']}:{proxy_info['proxyPassword']}"
+        f"@{proxy_info['proxyAddress']}:{proxy_info['proxyPort']}"
+    )
+
+    api_key = capsolver_keys[0]
+    try:
+        resp = requests.post(
+            "https://api.capsolver.com/createTask",
+            json={
+                "clientKey": api_key,
+                "task": {
+                    "type":       "DatadomeSliderTask",
+                    "websiteURL": website_url,
+                    "captchaUrl": captcha_url,
+                    "userAgent":  user_agent,
+                    "proxy":      proxy_str,
+                },
+            },
+            timeout=30,
+        )
+        data = resp.json()
+    except Exception as e:
+        print(f"[datadome] createTask request failed: {e}")
+        return None
+
+    if data.get("errorId"):
+        print(f"[datadome] createTask error: {data}")
+        return None
+
+    task_id = data.get("taskId")
+    if not task_id:
+        print(f"[datadome] no taskId in response: {data}")
+        return None
+
+    print(f"[datadome] taskId={task_id} — polling")
+    deadline = time.time() + timeout
+    poll_n = 0
+    while time.time() < deadline:
+        time.sleep(5)
+        poll_n += 1
+        try:
+            poll = requests.post(
+                "https://api.capsolver.com/getTaskResult",
+                json={"clientKey": api_key, "taskId": task_id},
+                timeout=30,
+            ).json()
+        except Exception as e:
+            print(f"[datadome] poll {poll_n} request failed: {e}")
+            continue
+
+        status = poll.get("status")
+        if status == "ready":
+            cookie = poll.get("solution", {}).get("cookie", "")
+            if cookie:
+                print(f"[datadome] solved (poll {poll_n})  cookie_len={len(cookie)}")
+                return cookie
+            print(f"[datadome] ready but no cookie in solution: {poll}")
+            return None
+        elif status == "processing":
+            print(f"[datadome] poll {poll_n}: processing")
+        elif poll.get("errorId"):
+            print(f"[datadome] poll {poll_n} error: {poll}")
+            return None
+        else:
+            print(f"[datadome] poll {poll_n} unexpected: {poll}")
+            return None
+
+    print(f"[datadome] timeout after {timeout}s")
+    return None

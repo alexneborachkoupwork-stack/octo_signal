@@ -1,14 +1,14 @@
-"""
+﻿"""
 Per-account full apply workflow.
 
 Step sequence (confirmed from HAR manual_full_trace_realdevice.har):
   1. GET  /VistosOnline/                          verify session alive
   2. GET  /VistosOnline/Questionario
-  3. GET  /VistosOnline/QuestNextQuestion × N     (steps loaded from data/quest_steps.json)
-  4. POST /VistosOnline/Formulario?copy=true      → returns HTML with __RequestVerificationToken
+  3. GET  /VistosOnline/QuestNextQuestion x N     (steps loaded from data/quest_steps.json)
+  4. POST /VistosOnline/Formulario?copy=true      -> returns HTML with __RequestVerificationToken
   5. POST /VistosOnline/ScheduleController?posto_id=POSTO   multipart f1-f46 + token
   6. GET  /VistosOnline/Schedule.jsp?posto_id=POSTO          (follow redirect from step 5)
-  7. POST /VistosOnline/slots?posto_id=POSTO      captcha → JSON list of available slots
+  7. POST /VistosOnline/slots?posto_id=POSTO      captcha -> JSON list of available slots
   8. [wait for SlotManager.request_slot()]
   9. POST /VistosOnline/SubmeterVistoCriaPDF?posto_id=POSTO_PDF
          f_date_c=<date>&cmbPeriodo=<period_id>
@@ -29,17 +29,24 @@ Usage:
 import argparse
 import asyncio
 import csv
+import json as _json_mod
 import json
 import re
 import sys
 import threading
+import time as _time
+import urllib.parse as _urllib_parse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from pathlib import Path
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 BASE = "https://pedidodevistos.mne.gov.pt"
 QUEST_URL   = BASE + "/VistosOnline/Questionario"
 QUEST_NEXT  = BASE + "/VistosOnline/QuestNextQuestion"
+PROFILE_URL = BASE + "/VistosOnline/profile.jsp"
 FORMULARIO  = BASE + "/VistosOnline/Formulario"
 SCHED_CTRL  = BASE + "/VistosOnline/ScheduleController"
 SCHED_JSP   = BASE + "/VistosOnline/Schedule.jsp"
@@ -50,16 +57,32 @@ _ENV_FILE           = Path(__file__).parent / ".env"
 _ACCOUNT_FILE       = Path(__file__).parent / "data" / "accounts.csv"
 _QUEST_STEPS_FILE   = Path(__file__).parent / "data" / "quest_steps.json"
 _FORM_DEFAULTS_FILE = Path(__file__).parent / "data" / "form_defaults.json"
+_SOAX_FILE          = Path(__file__).parent / "data" / "proxies_soax.txt"
 
 _csv_lock   = threading.Lock()
 _print_lock = threading.Lock()
+
+# Singleton proxy pool used for /slots proxy rotation (separate cursor from login pool)
+_slots_proxy_pool = None
+_slots_pool_lock  = threading.Lock()
+_SLOTS_PROXY_RETRIES = 5  # max proxy rotations per /slots attempt
+
+
+def _next_slots_proxy() -> str:
+    global _slots_proxy_pool
+    with _slots_pool_lock:
+        if _slots_proxy_pool is None:
+            from proxy_pool import PersistentProxyPool
+            _slots_state_file = _SOAX_FILE.with_name(_SOAX_FILE.stem + "_slots.proxy_state.json")
+            _slots_proxy_pool = PersistentProxyPool(_SOAX_FILE, state_file=_slots_state_file)
+        return _slots_proxy_pool.advance()
 
 
 class SessionExpired(Exception):
     """Raised by poll_slots_once when Vistos_sid is dead."""
 
 
-# ── JSON config loaders ────────────────────────────────────────────────────────
+# -- JSON config loaders --------------------------------------------------------
 
 def _load_quest_steps(nationality: str) -> list[dict]:
     data = json.loads(_QUEST_STEPS_FILE.read_text(encoding="utf-8"))
@@ -69,7 +92,7 @@ def _load_quest_steps(nationality: str) -> list[dict]:
 def _load_form_defaults() -> dict:
     return json.loads(_FORM_DEFAULTS_FILE.read_text(encoding="utf-8"))
 
-# ── Dynamic date resolver ──────────────────────────────────────────────────────
+# -- Dynamic date resolver ------------------------------------------------------
 
 def _resolve_dynamic(expr: str) -> str:
     today = date.today()
@@ -84,7 +107,7 @@ def _resolve_dynamic(expr: str) -> str:
     result = today + delta if sign == "+" else today - delta
     return result.strftime("%Y/%m/%d")
 
-# ── Payload builder ────────────────────────────────────────────────────────────
+# -- Payload builder ------------------------------------------------------------
 
 def _build_schedule_payload(acct: dict, posto_id: str, csrf: str,
                              nationality: str, residence: str = "") -> dict:
@@ -167,7 +190,7 @@ def _extract_csrf(html: str) -> str | None:
     return m.group(1) if m else None
 
 
-# ── Steps 2-6: questionnaire → Formulario → ScheduleController → Schedule.jsp ─
+# -- Steps 2-6: questionnaire -> Formulario -> ScheduleController -> Schedule.jsp -
 
 async def _run_steps_2_to_6(client, posto_id: str, acct: dict,
                               nat: str, res: str,
@@ -204,7 +227,7 @@ async def _run_steps_2_to_6(client, posto_id: str, acct: dict,
     _HDR_SCHED_CTRL = {
         **{k: v for k, v in sess.HEADERS_NAV.items() if k.lower() != "content-type"},
         "Origin":                    BASE,
-        "Referer":                   FORMULARIO + "?copy=true",
+        "Referer":                   FORMULARIO,
         "Sec-Fetch-Dest":            "document",
         "Sec-Fetch-Mode":            "navigate",
         "Sec-Fetch-Site":            "same-origin",
@@ -212,26 +235,144 @@ async def _run_steps_2_to_6(client, posto_id: str, acct: dict,
         "Upgrade-Insecure-Requests": "1",
     }
 
-    # Step 2
-    _log(username, "GET /Questionario")
-    await loop.run_in_executor(executor, lambda: client.get(
-        QUEST_URL, headers=sess.HEADERS_NAV, timeout=20))
+    _has_browser = hasattr(client, "browser_nav")
+    _t0 = _time.time()
+    def _elapsed(label: str) -> None:
+        _log(username, f"  [t+{_time.time()-_t0:.1f}s] {label}")
 
-    # Step 3
-    base_qs = {"lang": "ENG", "nacionalidade": nat}
-    for step in quest_steps:
-        params = {**base_qs, **step}
-        await loop.run_in_executor(executor, lambda p=params: client.get(
-            QUEST_NEXT, params=p, headers=_HDR_QUEST_NEXT, timeout=20))
-    _log(username, f"questionnaire: {len(quest_steps)} steps done (nat={nat})")
+    # Steps 2-3: questionnaire.
+    base_qs = {"lang": "PT", "nacionalidade": nat}
+    if _has_browser:
+        # Inject primp's authenticated cookies into the browser (post-login primp sync gives
+        # primp the valid session; HOME nav propagates those cookies into the browser context).
+        # This is necessary because the browser login may land back at Authentication.jsp on
+        # certain proxies, leaving the browser unauthenticated.
+        _home_url = BASE + "/VistosOnline/"
+        _log(username, "GET /VistosOnline/ (browser_nav, WITH cookie-sync) — authenticate browser via primp cookies")
+        try:
+            _home_nav_url = await loop.run_in_executor(executor, lambda: client.browser_nav(_home_url, timeout=30))
+            _log(username, f"HOME nav: final_url={_home_nav_url}")
+            # Dump the authenticated HOME dashboard content
+            _home_diag_js = """(() => {
+                // 1. Page visible text (what user sees)
+                const bodyText = document.body.innerText.replace(/\s+/g, ' ').trim().slice(0, 1000);
+                // 2. All anchor tags with hrefs (internal only)
+                const anchors = Array.from(document.querySelectorAll('a[href]'))
+                    .filter(a => a.href && (a.href.includes('pedidodevistos') || a.href.startsWith('/')))
+                    .map(a => a.href.replace('https://pedidodevistos.mne.gov.pt','') + ' [' + a.textContent.trim().replace(/\s+/g,' ').slice(0,40) + ']');
+                // 3. All forms and their actions
+                const forms = Array.from(document.querySelectorAll('form')).map(f => ({
+                    action: f.action.replace('https://pedidodevistos.mne.gov.pt',''),
+                    method: f.method,
+                    id: f.id,
+                    fields: Array.from(f.elements).map(e => e.name).filter(Boolean).slice(0,10)
+                }));
+                // 4. All buttons/inputs with onclick
+                const btns = Array.from(document.querySelectorAll('button,input[type=button],input[type=submit],a'))
+                    .filter(e => e.getAttribute('onclick') || e.getAttribute('href'))
+                    .map(e => ({tag:e.tagName, text:e.textContent.trim().slice(0,40), onclick:e.getAttribute('onclick')||'', href:(e.getAttribute('href')||'')}))
+                    .slice(0, 20);
+                return {bodyText, anchors: anchors.slice(0,30), forms, btns};
+            })()"""
+            _home_diag = await loop.run_in_executor(executor, lambda: client.browser_eval(_home_diag_js))
+            _log(username, f"HOME dashboard diagnostic: {_home_diag}")
+        except Exception as _he:
+            _log(username, f"HOME nav failed (non-fatal): {_he}")
 
-    # Step 4: Formulario → CSRF token
+        # HAR-confirmed page_2 transition: POST /VistosOnline/ with lang=ENG&lang=PT
+        # This is mandatory — it moves the server into application-workflow state.
+        # Without it, Formulario returns "Session lost" (1905 bytes) regardless of auth state.
+        _log(username, "POST /VistosOnline/ (lang transition, page_2)")
+        try:
+            _lang_post_js = """(async () => {
+                const r = await fetch('https://pedidodevistos.mne.gov.pt/VistosOnline/', {
+                    method: 'POST', credentials: 'include',
+                    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                    body: 'lang=ENG&lang=PT'
+                });
+                return {status: r.status, url: r.url, len: (await r.text()).length};
+            })()"""
+            _lang_result = await loop.run_in_executor(executor, lambda: client.browser_eval(_lang_post_js))
+            _log(username, f"lang POST result: {_lang_result}")
+        except Exception as _lpe:
+            _log(username, f"lang POST failed (non-fatal): {_lpe}")
+
+        _log(username, "GET /Questionario (browser_nav, skip_cookie_sync)")
+        _q0_url = await loop.run_in_executor(executor, lambda: client.browser_nav(QUEST_URL, timeout=35, skip_cookie_sync=True))
+        _elapsed("Questionario nav done")
+        _log(username, f"Questionario: final_url={_q0_url}")
+        _last_quest_fields: dict = {}
+        for _bi, _bstep in enumerate(quest_steps):
+            _bparams = {**base_qs, **_bstep}
+            _burl = QUEST_NEXT + "?" + _urllib_parse.urlencode(_bparams)
+            _burl_js = _json_mod.dumps(_burl)
+            _quest_url_js = _json_mod.dumps(QUEST_URL)
+            _fetch_js = (
+                f"(async () => {{"
+                f"  const r = await fetch({_burl_js}, {{"
+                f"    method: 'GET', credentials: 'include',"
+                f"    headers: {{"
+                f"      'Accept': 'text/plain, */*; q=0.01',"
+                f"      'X-Requested-With': 'XMLHttpRequest',"
+                f"      'Sec-Fetch-Mode': 'cors',"
+                f"      'Sec-Fetch-Dest': 'empty',"
+                f"      'Sec-Fetch-Site': 'same-origin',"
+                f"      'Referer': {_quest_url_js}"
+                f"    }}"
+                f"  }});"
+                f"  const body = await r.text();"
+                f"  const isLast = {_json_mod.dumps(_bi == len(quest_steps) - 1)};"
+                f"  if (isLast) {{"
+                f"    const _tmp = document.createElement('div'); _tmp.innerHTML = body;"
+                f"    const _flds = {{}};"
+                f"    _tmp.querySelectorAll('input').forEach(function(inp) {{ if(inp.name) _flds[inp.name] = inp.value; }});"
+                f"    return {{status: r.status, len: body.length, snippet: body.substring(0, 1200), fields: _flds}};"
+                f"  }}"
+                f"  return {{status: r.status, len: body.length, snippet: body.substring(0, 60)}};"
+                f"}})()"
+            )
+            try:
+                _step_result = await loop.run_in_executor(executor, lambda j=_fetch_js: client.browser_eval(j))
+                _log(username, f"  quest step {_bi+1}/{len(quest_steps)} id={_bstep.get('id_pergunta')} "
+                     f"-> status={_step_result.get('status')} len={_step_result.get('len')} "
+                     f"snippet={str(_step_result.get('snippet',''))[:60]}")
+                if _bi == len(quest_steps) - 1 and isinstance(_step_result, dict):
+                    _last_quest_fields = _step_result.get('fields') or {}
+                    _log(username, f"  last quest fields ({len(_last_quest_fields)}): {list(_last_quest_fields.keys())}")
+            except Exception as _qe:
+                _log(username, f"  quest step {_bi+1} failed: {_qe}")
+                raise RuntimeError(f"quest step {_bi+1} failed: {_qe}") from _qe
+        _elapsed(f"quest {len(quest_steps)} steps done")
+        _log(username, f"questionnaire: {len(quest_steps)} steps done (nat={nat}) [browser_eval XHR]")
+        # Log browser's current session cookie after quest steps (diagnostic)
+        try:
+            _diag_cookie = await loop.run_in_executor(executor, lambda: client.browser_eval("document.cookie"))
+            _log(username, f"  browser cookies after quest: {str(_diag_cookie)[:200]}")
+        except Exception:
+            pass
+    else:
+        _log(username, "GET /Questionario")
+        await loop.run_in_executor(executor, lambda: client.get(
+            QUEST_URL, headers=sess.HEADERS_NAV, timeout=20))
+        for step in quest_steps:
+            params = {**base_qs, **step}
+            await loop.run_in_executor(executor, lambda p=params: client.get(
+                QUEST_NEXT, params=p, headers=_HDR_QUEST_NEXT, timeout=20))
+        _log(username, f"questionnaire: {len(quest_steps)} steps done (nat={nat})")
+        _last_quest_fields: dict = {}
+
+
+    # Steps 4-5: primp handles Formulario POST + ScheduleController POST.
+    # These create the server-side form state (tied to Vistos_sid).
+    # Step 6: browser page.goto() for Schedule.jsp -- bypasses DataDome while
+    # the server sees the same Vistos_sid that primp used for steps 4-5.
     formulario_payload = {
-        "lang":                   "ENG",
+        "lang":                   "ENG",  # DOM form hidden field value (page renders in English)
         "nacionalidade":          nat,
         "pais_residencia":        res,
         "tipo_passaporte":        "01",
         "copia_pedido":           "",
+        "cb_paises":              nat,    # nationality select (name=cb_paises from HAR HTML)
         "cb_pais_residencia":     res,
         "cb_tipo_passaporte":     "01",
         "cb_qt_dias":             "SCH",
@@ -239,38 +380,171 @@ async def _run_steps_2_to_6(client, posto_id: str, acct: dict,
         "cb_motivo_estada_sch":   "10",
         "cb_viaja_reune_turismo": "FAM_N",
         "tipo_visto":             "C",
-        "tipo_visto_desc":        "SHORT STAY VISA (SCHENGEN)",
+        "tipo_visto_desc":        "VISTO DE CURTA DURAÇÃO",
         "class_visto":            "SCH",
         "cod_estada":             "10",
         "id_visto_doc":           "36",
     }
-    _log(username, "POST /Formulario")
-    r = await loop.run_in_executor(executor, lambda: client.post(
-        FORMULARIO, params={"copy": "true"},
-        data=formulario_payload,
-        headers=_HDR_FORMULARIO, timeout=30))
-    csrf = _extract_csrf(r.text)
-    _log(username, f"Formulario HTTP {r.status_code}  url={r.url}  len={len(r.text or '')}")
-    _log(username, f"Formulario body snippet: {(r.text or '')[:600]}")
-    if not csrf:
-        _log(username, "WARN: CSRF token not found")
-        csrf = ""
-    else:
-        _log(username, f"CSRF extracted: {csrf[:20]}...  (len={len(csrf)})")
 
-    # Step 5: ScheduleController (multipart/form-data)
+    # Step 4: Formulario — POST with server-derived fields from last quest step.
+    # The last QuestNextQuestion response (id=16) returns HTML with hidden <input>
+    # elements containing the exact payload the server expects at /Formulario.
+    # We extract those fields via DOMParser in the browser context (JS injected during
+    # quest step), then submit them via DOM form.submit() to bypass DataDome.
+    _log(username, f"formulario_payload (fallback): {_urllib_parse.urlencode(formulario_payload)}")
+    _log(username, f"last quest fields ({len(_last_quest_fields)}): {list(_last_quest_fields.keys())}")
+    csrf = ""
+    _form_html = ""
+    # Merge: formulario_payload (base with lang=PT + account fields) + quest-derived overrides
+    _merged_payload = {**formulario_payload, **_last_quest_fields}
+
+    # Extract the actual Formulario POST URL from the Questionario page DOM.
+    # The form action is server-rendered: may be /Formulario?copy=true or /Formulario
+    # depending on whether this is a fresh application or a copy of a previous one.
+    _formulario_post_url = FORMULARIO + "?copy=true"  # default fallback
+    if _has_browser:
+        try:
+            _action_js = """(() => {
+                const forms = Array.from(document.querySelectorAll('form'));
+                const f = forms.find(x => x.action && x.action.toLowerCase().includes('formulario'));
+                return f ? f.action : null;
+            })()"""
+            _extracted = await loop.run_in_executor(executor, lambda: client.browser_eval(_action_js))
+            if _extracted and 'formulario' in _extracted.lower():
+                _formulario_post_url = _extracted
+                _log(username, f"Formulario action extracted from Questionario DOM: {_formulario_post_url}")
+            else:
+                _log(username, f"Formulario action not found in DOM, using default: {_formulario_post_url}")
+        except Exception as _ax:
+            _log(username, f"Formulario action extraction failed: {_ax} — using default")
+
+    if _has_browser:
+        # Primary: browser_form_post with full merged payload (all 16+ fields, HAR-confirmed).
+        # DOM form (submit_page_form) only has 6 fields with default/wrong values because
+        # the XHR quest steps update server session state but not the DOM form.
+        _log(username, f"POST {_formulario_post_url} (browser_form_post, merged payload={list(_merged_payload.keys())})")
+        try:
+            _form_final_url, _form_html = await loop.run_in_executor(
+                executor, lambda: client.browser_form_post(_formulario_post_url, _merged_payload, timeout=55))
+            _elapsed(f"Formulario POST done (len={len(_form_html)})")
+            _log(username, f"Formulario browser_form_post -> {_form_final_url}  len={len(_form_html)}")
+            _form_snip = _form_html[:2000].encode('ascii', 'replace').decode()
+            _log(username, f"Formulario POST snippet: {_form_snip}")
+            csrf = _extract_csrf(_form_html) or ""
+            if csrf:
+                _log(username, f"CSRF extracted (browser_form_post): {csrf[:20]}...  (len={len(csrf)})")
+            else:
+                _log(username, f"Formulario browser_form_post: no CSRF (len={len(_form_html)})")
+        except Exception as _be:
+            _log(username, f"Formulario browser_form_post failed: {_be}")
+    if not csrf and _has_browser:
+        # Retry with the alternate Formulario URL variant (toggle ?copy=true)
+        _alt_formulario = FORMULARIO if "copy=true" in _formulario_post_url else FORMULARIO + "?copy=true"
+        _log(username, f"POST {_alt_formulario} (browser_form_post alternate variant)")
+        try:
+            _form_final_url, _form_html = await loop.run_in_executor(
+                executor, lambda: client.browser_form_post(_alt_formulario, _merged_payload, timeout=55))
+            _elapsed(f"Formulario POST (no copy) done (len={len(_form_html)})")
+            _log(username, f"Formulario browser_form_post (no copy) -> {_form_final_url}  len={len(_form_html)}")
+            _form_snip = _form_html[:2000].encode('ascii', 'replace').decode()
+            _log(username, f"Formulario no-copy snippet: {_form_snip}")
+            csrf = _extract_csrf(_form_html) or ""
+            if csrf:
+                _log(username, f"CSRF extracted (no-copy POST): {csrf[:20]}...  (len={len(csrf)})")
+            else:
+                _log(username, f"Formulario no-copy POST: no CSRF (len={len(_form_html)})")
+        except Exception as _be:
+            _log(username, f"Formulario no-copy browser_form_post failed: {_be}")
+    _has_submit_page_form = hasattr(client, "submit_page_form")
+    if not csrf and _has_browser and _has_submit_page_form:
+        # Fallback: submit the existing DOM form on the Questionario page.
+        _log(username, "POST /Formulario (submit_page_form fallback — existing Questionario form)")
+        try:
+            _form_final_url, _form_html = await loop.run_in_executor(
+                executor, lambda: client.submit_page_form(action_contains="Formulario", timeout=55))
+            _elapsed(f"Formulario submit_page_form done (len={len(_form_html)})")
+            _log(username, f"Formulario submit_page_form -> {_form_final_url}  len={len(_form_html)}")
+            _form_snip = _form_html[:2000].encode('ascii', 'replace').decode()
+            _log(username, f"Formulario submit_page_form snippet: {_form_snip}")
+            csrf = _extract_csrf(_form_html) or ""
+            if csrf:
+                _log(username, f"CSRF extracted (submit_page_form): {csrf[:20]}...  (len={len(csrf)})")
+            else:
+                _log(username, f"submit_page_form: no CSRF (len={len(_form_html)})")
+        except Exception as _be:
+            _log(username, f"submit_page_form failed: {_be}")
+    if not csrf and _has_browser:
+        # Fallback: try GET /Formulario via browser_nav
+        _log(username, "GET /Formulario (browser_nav fallback)")
+        try:
+            _form_nav_url = await loop.run_in_executor(
+                executor, lambda: client.browser_nav(FORMULARIO, timeout=40))
+            _form_html = await loop.run_in_executor(
+                executor, lambda: client.browser_eval("document.documentElement.outerHTML")) or ""
+            _elapsed(f"Formulario GET done (len={len(_form_html)})")
+            _form_snip = _form_html[:2000].encode('ascii', 'replace').decode()
+            _log(username, f"Formulario GET snippet: {_form_snip}")
+            csrf = _extract_csrf(_form_html) or ""
+            if csrf:
+                _log(username, f"CSRF extracted (browser GET): {csrf[:20]}...  (len={len(csrf)})")
+        except Exception as _be2:
+            _log(username, f"Formulario browser_nav failed: {_be2}")
+    if not csrf:
+        _log(username, "ERROR: CSRF token not found — cannot submit ScheduleController")
+        raise RuntimeError("csrf_missing")
+
+    # Step 5: ScheduleController
     payload = _build_schedule_payload(acct, posto_id, csrf, nat, residence=res)
     _log(username, f"ScheduleController key fields: f0sf1={payload.get('f0sf1')}  "
          f"f1={payload.get('f1')}  f3={payload.get('f3')}  f4={payload.get('f4')}  "
-         f"f14={payload.get('f14')}  nacionalidade={payload.get('nacionalidade')}  "
-         f"pais_residencia={payload.get('pais_residencia')}  csrf_len={len(csrf)}")
+         f"f14={payload.get('f14')}  csrf_len={len(csrf)}")
+
+    # Use browser_fetch multipart when we have a browser (same DataDome clearance context)
+    if _has_browser and csrf:
+        _log(username, f"POST /ScheduleController?posto_id={posto_id} (browser_fetch multipart)")
+        _sched_posted = False
+        try:
+            _file_names = ["foto", "file1", "file2", "file3", "file4"]
+            raw = await loop.run_in_executor(executor, lambda: client.browser_fetch(
+                SCHED_CTRL, payload,
+                params={"posto_id": posto_id},
+                headers={"Referer": FORMULARIO},
+                encode="multipart",
+                file_fields=_file_names,
+                timeout=45))
+            sc_status, sc_url = raw["status"], SCHED_CTRL
+            _log(username, f"ScheduleController -> {sc_status} (browser)")
+            _sched_posted = True  # POST reached the server — do not re-POST via primp
+        except Exception as _be:
+            _log(username, f"browser ScheduleController failed: {_be} - falling back to primp")
+        if _sched_posted:
+            # ScheduleController was POSTed successfully; navigate Schedule.jsp to read
+            # the resulting form state. Failure here does NOT fall back to primp POST.
+            sched_jsp_url = SCHED_JSP + "?posto_id=" + posto_id
+            try:
+                _log(username, f"NAV /Schedule.jsp?posto_id={posto_id} (browser page.goto)")
+                await loop.run_in_executor(executor, lambda: client.browser_nav(sched_jsp_url, timeout=40))
+                sched_html = await loop.run_in_executor(executor, lambda: client.browser_eval(
+                    "document.documentElement.outerHTML")) or ""
+                _log(username, f"Schedule.jsp browser len={len(sched_html)}")
+                _log(username, f"Schedule.jsp body snippet: {sched_html[:400].encode('ascii', 'replace').decode()}")
+                posto_pdf = posto_id
+                m_pdf = re.search(r"SubmeterVistoCriaPDF\?posto_id=(\d+)", sched_html)
+                if m_pdf:
+                    posto_pdf = m_pdf.group(1)
+                    if posto_pdf != posto_id:
+                        _log(username, f"POSTO_PDF={posto_pdf} (differs from POSTO={posto_id})")
+            except Exception as _nav_e:
+                _log(username, f"browser Schedule.jsp nav failed: {_nav_e} — using posto_id as fallback")
+                posto_pdf = posto_id
+            return {"posto_pdf": posto_pdf, "sched_url": sched_jsp_url}
 
     _primp_client = getattr(client, 'client', client)
     _boundary  = "----WebKitFormBoundary" + _uuid.uuid4().hex[:16]
-    _file_names = {"foto", "file1", "file2", "file3", "file4"}
+    _fnames_set = {"foto", "file1", "file2", "file3", "file4"}
     _mp_body = b""
     for k, v in payload.items():
-        if k in _file_names:
+        if k in _fnames_set:
             _mp_body += (
                 f"--{_boundary}\r\n"
                 f'Content-Disposition: form-data; name="{k}"; filename=""\r\n'
@@ -284,35 +558,40 @@ async def _run_steps_2_to_6(client, posto_id: str, acct: dict,
             ).encode("utf-8")
     _mp_body += f"--{_boundary}--\r\n".encode()
     _mp_ct = f"multipart/form-data; boundary={_boundary}"
-
-    _log(username, f"POST /ScheduleController?posto_id={posto_id} (multipart/form-data)")
+    _log(username, f"POST /ScheduleController?posto_id={posto_id} (primp multipart)")
     r_raw = await loop.run_in_executor(executor, lambda: _primp_client.post(
         SCHED_CTRL, params={"posto_id": posto_id},
         content=_mp_body,
         headers={**_HDR_SCHED_CTRL, "Content-Type": _mp_ct},
         timeout=30))
-
-    class _R:
-        def __init__(self, raw):
-            self.status_code = raw.status_code
-            self.text = raw.text
-            self.url = str(raw.url)
-    r = _R(r_raw)
-    _log(username, f"ScheduleController → {r.status_code}  url={r.url}")
-    if r.status_code not in (200, 302):
-        _log(username, f"ScheduleController body (first 500): {(r.text or '')[:500]}")
+    sc_status, sc_url = r_raw.status_code, str(r_raw.url)
+    sc_body = r_raw.text or ""
+    _log(username, f"ScheduleController -> {sc_status}  url={sc_url}  len={len(sc_body)}")
+    _log(username, f"ScheduleController body snippet: {sc_body[:300].encode('ascii', 'replace').decode()}")
 
     # Step 6: Schedule.jsp
     sched_jsp_url = SCHED_JSP + "?posto_id=" + posto_id
-    if "Schedule.jsp" not in r.url:
-        _log(username, f"GET /Schedule.jsp?posto_id={posto_id}")
-        r = await loop.run_in_executor(executor, lambda: client.get(
-            SCHED_JSP, params={"posto_id": posto_id},
-            headers={**sess.HEADERS_NAV, "Referer": SCHED_CTRL + "?posto_id=" + posto_id},
-            timeout=20))
-    _log(username, f"Schedule.jsp HTTP {r.status_code}  url={r.url}")
-    sched_html = r.text or ""
-    _log(username, f"Schedule.jsp body snippet: {sched_html[:600]}")
+    if _has_browser and "Schedule.jsp" not in sc_url:
+        # Browser page.goto() bypasses DataDome. Cookie sync in _CMD_NAV injects
+        # primp's current Vistos_sid so the server sees the same session state.
+        _log(username, f"NAV /Schedule.jsp?posto_id={posto_id} (browser page.goto)")
+        await loop.run_in_executor(executor, lambda: client.browser_nav(sched_jsp_url, timeout=35))
+        sched_html = await loop.run_in_executor(executor, lambda: client.browser_eval(
+            "document.documentElement.outerHTML")) or ""
+        _log(username, f"Schedule.jsp browser len={len(sched_html)}")
+        _log(username, f"Schedule.jsp body snippet: {sched_html[:400].encode('ascii', 'replace').decode()}")
+    else:
+        if "Schedule.jsp" not in sc_url:
+            _log(username, f"GET /Schedule.jsp?posto_id={posto_id} (primp)")
+            r = await loop.run_in_executor(executor, lambda: client.get(
+                SCHED_JSP, params={"posto_id": posto_id},
+                headers={**sess.HEADERS_NAV, "Referer": SCHED_CTRL + "?posto_id=" + posto_id},
+                timeout=20))
+            sched_html = r.text or ""
+        else:
+            sched_html = r_raw.text or ""
+        _log(username, f"Schedule.jsp primp len={len(sched_html)}")
+        _log(username, f"Schedule.jsp body snippet: {sched_html[:400].encode('ascii', 'replace').decode()}")
 
     posto_pdf = posto_id
     m_pdf = re.search(r"SubmeterVistoCriaPDF\?posto_id=(\d+)", sched_html)
@@ -324,7 +603,7 @@ async def _run_steps_2_to_6(client, posto_id: str, acct: dict,
     return {"posto_pdf": posto_pdf, "sched_url": sched_jsp_url}
 
 
-# ── apply_warmup: steps 1-6 + checkpoint save ─────────────────────────────────
+# -- apply_warmup: steps 1-6 + checkpoint save ---------------------------------
 
 async def apply_warmup(acct: dict, posto_id: str,
                        capsolver_keys: list[str], anticaptcha_keys: list[str],
@@ -366,7 +645,10 @@ async def apply_warmup(acct: dict, posto_id: str,
     try:
         info = await _run_steps_2_to_6(client, posto_id, acct, nat, res, executor)
     except Exception as e:
+        import traceback, logging as _logging
         _log(username, f"warmup steps 2-6 failed: {e}")
+        _logging.getLogger("engine.warmup").error(
+            f"[{username}] warmup steps 2-6 exception: {e}\n{traceback.format_exc()}")
         return "error"
 
     posto_pdf = info["posto_pdf"]
@@ -390,7 +672,7 @@ async def apply_warmup(acct: dict, posto_id: str,
             "sched_url": sched_url}
 
 
-# ── apply_book: steps 7-9 ─────────────────────────────────────────────────────
+# -- apply_book: steps 7-9 -----------------------------------------------------
 
 async def apply_book(acct: dict, posto_id: str, posto_pdf: str,
                      slot_manager,
@@ -428,23 +710,94 @@ async def apply_book(acct: dict, posto_id: str, posto_pdf: str,
             return "captcha_failed"
 
         _log(username, f"POST /slots?posto_id={posto_id}")
-        r = await loop.run_in_executor(executor, lambda: client.post(
-            SLOTS_URL, params={"posto_id": posto_id},
-            data={"posto_id": posto_id, "captcha": token},
-            headers={**sess.HEADERS_XHR, "Referer": sched_jsp_url}, timeout=30))
+        _has_browser = hasattr(client, "browser_fetch")
+
+        # Extract session cookies for proxy-rotation retries
+        import session_store as _ss
+        _primp_c = getattr(client, "client", client)
+        try:
+            _session_cookies = _primp_c.get_cookies(_ss.COOKIES_URL) or {}
+        except Exception:
+            _session_cookies = {}
+
+        slots_text = ""
+        slots_status = 0
+        for _slot_attempt in range(_SLOTS_PROXY_RETRIES + 1):
+            _is_first = (_slot_attempt == 0)
+            try:
+                if _is_first and _has_browser:
+                    raw = await loop.run_in_executor(executor, lambda: client.browser_fetch(
+                        SLOTS_URL, {"posto_id": posto_id, "captcha": token},
+                        params={"posto_id": posto_id},
+                        headers={"X-Requested-With": "XMLHttpRequest", "Referer": sched_jsp_url},
+                        timeout=30))
+                    slots_text = raw["body"]
+                    slots_status = raw["status"]
+                    _method = "browser_fetch"
+                else:
+                    import primp as _primp
+                    _rot_proxy = _next_slots_proxy()
+                    _log(username, f"slots: rotating to fresh proxy (attempt {_slot_attempt}), re-solving CAPTCHA")
+                    # Re-solve CAPTCHA — tokens are single-use; the token solved before
+                    # the loop is expired by the time any retry runs.
+                    try:
+                        token = await loop.run_in_executor(
+                            executor,
+                            lambda: solvermod.race_all(
+                                capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
+                                "SCHEDULE_EVISA", _rot_proxy, min_score=50,
+                            ),
+                        )
+                    except Exception as _ce:
+                        _log(username, f"slots: CAPTCHA re-solve failed (attempt {_slot_attempt}): {_ce}")
+                        if _slot_attempt >= _SLOTS_PROXY_RETRIES:
+                            return "captcha_failed"
+                        continue
+                    _tmp = _primp.Client(
+                        proxy=_rot_proxy, impersonate="chrome_131",
+                        verify=True, follow_redirects=False)
+                    if _session_cookies:
+                        _tmp.set_cookies(_ss.COOKIES_URL, _session_cookies)
+                    r = await loop.run_in_executor(executor, lambda: _tmp.post(
+                        SLOTS_URL, params={"posto_id": posto_id},
+                        data={"posto_id": posto_id, "captcha": token},
+                        headers={**sess.HEADERS_XHR, "Referer": sched_jsp_url}, timeout=30))
+                    slots_text, slots_status = r.text, r.status_code
+                    _method = f"primp(proxy#{_slot_attempt})"
+            except Exception as _e:
+                _log(username, f"slots: fetch error (attempt {_slot_attempt}): {_e}")
+                if _slot_attempt >= _SLOTS_PROXY_RETRIES:
+                    return "error"
+                continue
+
+            _body_snip = slots_text[:300]
+            if slots_status == 302:
+                _log(username, f"slots: 302 redirect via {_method} (session expired or WAF) (attempt {_slot_attempt})")
+                if _slot_attempt >= _SLOTS_PROXY_RETRIES:
+                    return "proxy_blocked"
+                continue  # rotate proxy and retry
+            if "body{margin:0;background:#fff}" in _body_snip or "datadome" in _body_snip.lower():
+                _log(username, f"slots: DataDome block via {_method} (attempt {_slot_attempt})")
+                if _slot_attempt >= _SLOTS_PROXY_RETRIES:
+                    return "proxy_blocked"
+                continue  # rotate proxy and retry
+            break  # got a real response
 
         try:
-            slots_json = r.json()
+            slots_json = json.loads(slots_text)
         except Exception:
-            _log(username, f"slots: non-JSON response: {r.text[:200]}")
+            _log(username, f"slots: non-JSON response: {slots_text[:300]}")
             return "error"
 
         _log(username, f"slots raw: {json.dumps(slots_json)[:600]}")
 
         if isinstance(slots_json, dict):
+            if slots_json.get("type") == "error":
+                _log(username, f"slots: server error: {slots_json.get('description', '')}")
+                return "error"
             slots_data = slots_json.get("data") or {}
             if not slots_data:
-                _log(username, "slots: empty data — no appointments available")
+                _log(username, "slots: empty data -- no appointments available")
                 return "no_slot"
             slots_json = [
                 {"date": d, "periods": [{"id": p} if not isinstance(p, dict) else p
@@ -454,7 +807,7 @@ async def apply_book(acct: dict, posto_id: str, posto_pdf: str,
             _log(username, f"slots normalized: {json.dumps(slots_json)[:300]}")
 
         if not slots_json:
-            _log(username, "slots: empty — no appointments available")
+            _log(username, "slots: empty -- no appointments available")
             return "no_slot"
 
         _log(username, f"slots: {len(slots_json)} dates available")
@@ -481,7 +834,7 @@ async def apply_book(acct: dict, posto_id: str, posto_pdf: str,
                 elif isinstance(periods, (str, int)):
                     slot_period = str(periods)
                 else:
-                    _log(username, f"slot format unknown — first={first}")
+                    _log(username, f"slot format unknown -- first={first}")
                     return "error"
             except Exception as e:
                 _log(username, f"slot parse error: {e}")
@@ -497,7 +850,7 @@ async def apply_book(acct: dict, posto_id: str, posto_pdf: str,
             headers={**sess.HEADERS_XHR, "Referer": sched_jsp_url}, timeout=30))
 
         resp_text = r.text.strip()
-        _log(username, f"SubmeterVisto → {r.status_code}  body={resp_text[:150]}")
+        _log(username, f"SubmeterVisto -> {r.status_code}  body={resp_text[:150]}")
 
         _known_errors = ("indisponivel", "unavailable", "erro", "error", "bd_problm")
         _has_error_kw = any(kw in resp_text.lower() for kw in _known_errors)
@@ -513,25 +866,43 @@ async def apply_book(acct: dict, posto_id: str, posto_pdf: str,
                 slot_manager.confirm(lease)
             pdf_saved = False
             try:
-                pdf_url = BASE + "/VistosOnline/MostrarPdf?"
-                r_pdf = await loop.run_in_executor(executor, lambda: client.get(
-                    pdf_url,
+                # SubmeterVistoCriaPDF response is an HTML page that embeds MostrarPdf
+                # in an iframe src / anchor href / object data. Extract the URL from the HTML.
+                _pdf_url: str | None = None
+                _mostrar_patterns = [
+                    r'(?:src|href|data)=["\']([^"\']*MostrarPdf[^"\']*)["\']',
+                    r'(?:src|href|data)=["\']([^"\']*\.pdf[^"\']*)["\']',
+                ]
+                for _pat in _mostrar_patterns:
+                    _m = re.search(_pat, resp_text, re.IGNORECASE)
+                    if _m:
+                        _raw = _m.group(1)
+                        _pdf_url = _raw if _raw.startswith("http") else BASE + (_raw if _raw.startswith("/") else "/" + _raw)
+                        _log(username, f"MostrarPdf URL extracted from SubmeterVisto response: {_pdf_url}")
+                        break
+                if not _pdf_url:
+                    # Fallback: bare MostrarPdf endpoint (params unknown — server may use session)
+                    _pdf_url = BASE + "/VistosOnline/MostrarPdf"
+                    _log(username, f"MostrarPdf URL not found in response, using fallback: {_pdf_url}")
+                r_pdf = await loop.run_in_executor(executor, lambda u=_pdf_url: client.get(
+                    u,
                     headers={**sess.HEADERS_NAV, "Referer": sched_jsp_url},
                     timeout=30))
                 ct = (getattr(r_pdf, "headers", {}) or {}).get("content-type", "")
+                _pdf_bytes_raw = r_pdf.content if hasattr(r_pdf, "content") else r_pdf.text.encode()
                 if r_pdf.status_code == 200 and (
                     "application/pdf" in ct
-                    or (hasattr(r_pdf, "content") and len(r_pdf.content) > 1000)
+                    or _pdf_bytes_raw[:4] == b'%PDF'
+                    or len(_pdf_bytes_raw) > 5000
                 ):
                     pdf_dir = Path(__file__).parent / "data" / "pdfs"
                     pdf_dir.mkdir(exist_ok=True)
                     pdf_path = pdf_dir / f"{username}.pdf"
-                    pdf_bytes = r_pdf.content if hasattr(r_pdf, "content") else r_pdf.text.encode()
-                    pdf_path.write_bytes(pdf_bytes)
-                    _log(username, f"PDF saved → {pdf_path}  ({len(pdf_bytes)} bytes)")
+                    pdf_path.write_bytes(_pdf_bytes_raw)
+                    _log(username, f"PDF saved -> {pdf_path}  ({len(_pdf_bytes_raw)} bytes)")
                     pdf_saved = True
                 else:
-                    _log(username, f"PDF download failed: status={r_pdf.status_code} ct={ct[:60]}")
+                    _log(username, f"PDF download failed: status={r_pdf.status_code} ct={ct[:60]} len={len(_pdf_bytes_raw)}")
             except Exception as pdf_err:
                 _log(username, f"PDF download error: {pdf_err}")
 
@@ -545,7 +916,7 @@ async def apply_book(acct: dict, posto_id: str, posto_pdf: str,
         if "indisponivel" in resp_text.lower() or "unavailable" in resp_text.lower():
             if lease:
                 slot_manager.release(lease, "already_taken")
-            _log(username, "slot already taken — release and retry later")
+            _log(username, "slot already taken -- release and retry later")
             return "no_slot"
 
         if lease:
@@ -555,10 +926,15 @@ async def apply_book(acct: dict, posto_id: str, posto_pdf: str,
 
     except Exception as e:
         _log(username, f"EXCEPTION in apply_book: {e}")
+        if slot_manager and lease:
+            try:
+                slot_manager.release(lease, f"exception:{type(e).__name__}")
+            except Exception:
+                pass
         return "error"
 
 
-# ── poll_slots_once: scout polling (lazy re-warm + /slots) ────────────────────
+# -- poll_slots_once: scout polling (lazy re-warm + /slots) --------------------
 
 async def poll_slots_once(client, proxy: str | None, posto_id: str,
                           acct: dict, nat: str, res: str,
@@ -566,8 +942,8 @@ async def poll_slots_once(client, proxy: str | None, posto_id: str,
                           twocaptcha_keys: list[str], capmonster_keys: list[str],
                           executor: ThreadPoolExecutor) -> list[dict]:
     """
-    One scout poll cycle: check alive → lazy re-warm if form state expired →
-    solve CAPTCHA → POST /slots → return normalized slot list.
+    One scout poll cycle: check alive -> lazy re-warm if form state expired ->
+    solve CAPTCHA -> POST /slots -> return normalized slot list.
     Raises SessionExpired if Vistos_sid is dead or re-warm fails.
     """
     import session as sess
@@ -578,25 +954,48 @@ async def poll_slots_once(client, proxy: str | None, posto_id: str,
     loop      = asyncio.get_event_loop()
     sched_url = SCHED_JSP + "?posto_id=" + posto_id
 
-    # Check session alive
-    alive = await loop.run_in_executor(executor, session_store.is_alive, client)
-    if not alive:
-        raise SessionExpired(f"{username}: Vistos_sid dead")
+    _has_browser = hasattr(client, "browser_nav")
 
-    # Lazy re-warm: form draft expires ~5-7 min after ScheduleController POST
-    try:
-        r_check = await loop.run_in_executor(executor, lambda: client.get(
-            sched_url, headers=sess.HEADERS_NAV, timeout=15, follow_redirects=False))
-        schedule_ok = r_check.status_code == 200
-    except Exception:
-        schedule_ok = False
-
-    if not schedule_ok:
-        _log(username, "poll: form state expired — re-warming steps 2-6")
+    # Check session alive + Schedule.jsp form state
+    if _has_browser:
+        # Browser path: page.goto(Schedule.jsp) -- Playwright handles DataDome challenge.
         try:
-            await _run_steps_2_to_6(client, posto_id, acct, nat, res, executor)
+            await loop.run_in_executor(executor, lambda: client.browser_nav(sched_url, timeout=25))
+            sched_body = await loop.run_in_executor(executor, lambda: client.browser_eval(
+                "document.documentElement.outerHTML")) or ""
         except Exception as e:
-            raise SessionExpired(f"{username}: re-warm failed: {e}")
+            raise SessionExpired(f"{username}: Schedule.jsp browser_nav failed: {e}")
+        if "/ch/bd.js" in sched_body:
+            raise SessionExpired(f"{username}: DataDome challenge on Schedule.jsp -- browser session stale")
+        at_auth = "Authentication.jsp" in sched_body or 'action="/VistosOnline/login"' in sched_body
+        if at_auth:
+            raise SessionExpired(f"{username}: redirected to auth on Schedule.jsp")
+        schedule_ok = "SubmeterVistoCriaPDF" in sched_body or "posto_id" in sched_body
+        if not schedule_ok:
+            _log(username, "poll: form state expired -- re-warming steps 2-6 (browser)")
+            try:
+                await _run_steps_2_to_6(client, posto_id, acct, nat, res, executor)
+            except Exception as e:
+                raise SessionExpired(f"{username}: re-warm failed: {e}")
+    else:
+        # primp path (fallback for restored sessions)
+        alive = await loop.run_in_executor(executor, session_store.is_alive, client)
+        if not alive:
+            raise SessionExpired(f"{username}: Vistos_sid dead")
+        try:
+            r_check = await loop.run_in_executor(executor, lambda: client.get(
+                sched_url, headers=sess.HEADERS_NAV, timeout=15, follow_redirects=False))
+            schedule_ok = r_check.status_code == 200
+            _log(username, f"poll: Schedule.jsp status={r_check.status_code} url={r_check.url}")
+        except Exception as e:
+            schedule_ok = False
+            _log(username, f"poll: Schedule.jsp error: {e}")
+        if not schedule_ok:
+            _log(username, "poll: form state expired -- re-warming steps 2-6 (primp)")
+            try:
+                await _run_steps_2_to_6(client, posto_id, acct, nat, res, executor)
+            except Exception as e:
+                raise SessionExpired(f"{username}: re-warm failed: {e}")
 
     # Solve CAPTCHA
     try:
@@ -611,18 +1010,33 @@ async def poll_slots_once(client, proxy: str | None, posto_id: str,
         _log(username, f"poll: CAPTCHA failed: {e}")
         return []
 
-    # POST /slots
+    # POST /slots -- browser path passes DataDome; primp fallback for restored sessions
     try:
-        r = await loop.run_in_executor(executor, lambda: client.post(
-            SLOTS_URL, params={"posto_id": posto_id},
-            data={"posto_id": posto_id, "captcha": token},
-            headers={**sess.HEADERS_XHR, "Referer": sched_url}, timeout=30))
-        slots_json = r.json()
+        if _has_browser:
+            raw = await loop.run_in_executor(executor, lambda: client.browser_fetch(
+                SLOTS_URL, {"posto_id": posto_id, "captcha": token},
+                params={"posto_id": posto_id},
+                headers={"X-Requested-With": "XMLHttpRequest", "Referer": sched_url},
+                timeout=30))
+            slots_text = raw["body"]
+            slots_status = raw["status"]
+        else:
+            r = await loop.run_in_executor(executor, lambda: client.post(
+                SLOTS_URL, params={"posto_id": posto_id},
+                data={"posto_id": posto_id, "captcha": token},
+                headers={**sess.HEADERS_XHR, "Referer": sched_url}, timeout=30))
+            slots_text, slots_status = r.text, r.status_code
+        _log(username, f"poll: /slots status={slots_status} body_len={len(slots_text)}")
+        import json as _json
+        slots_json = _json.loads(slots_text)
     except Exception as e:
         _log(username, f"poll: /slots error: {e}")
         return []
 
     if isinstance(slots_json, dict):
+        if slots_json.get("type") == "error":
+            _log(username, f"poll: slots server error: {slots_json.get('description', '')}")
+            return []
         slots_data = slots_json.get("data") or {}
         if not slots_data:
             return []
@@ -634,7 +1048,7 @@ async def poll_slots_once(client, proxy: str | None, posto_id: str,
     return slots_json if isinstance(slots_json, list) else []
 
 
-# ── apply_one: thin wrapper (warmup + book) ────────────────────────────────────
+# -- apply_one: thin wrapper (warmup + book) ------------------------------------
 
 async def apply_one(acct: dict, posto_id: str,
                     slot_manager,
@@ -664,7 +1078,7 @@ async def apply_one(acct: dict, posto_id: str,
             client, proxy = loaded
             alive = await loop.run_in_executor(executor, session_store.is_alive, client)
             if not alive:
-                _log(username, "session expired — re-logging in")
+                _log(username, "session expired -- re-logging in")
                 client = None
         if client is None:
             try:

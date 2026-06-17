@@ -298,9 +298,9 @@ class PersistentProxyPool:
       pool.reset(keep_cursor=True) — clears used_ips only
     """
 
-    def __init__(self, proxy_file: str | Path):
+    def __init__(self, proxy_file: str | Path, state_file: str | Path | None = None):
         self._file       = Path(proxy_file)
-        self._state_file = self._file.with_suffix(_STATE_SUFFIX)
+        self._state_file = Path(state_file) if state_file else self._file.with_suffix(_STATE_SUFFIX)
         self._proxies: list[str] = []
         self._lock        = threading.Lock()
         self._state: dict = {}
@@ -321,6 +321,8 @@ class PersistentProxyPool:
         Two concurrent callers always get different proxies.
         """
         with self._lock:
+            if not self._proxies:
+                raise RuntimeError(f"Proxy pool is empty (file: {self._file})")
             idx = self._mem_cursor % len(self._proxies)
             proxy = self._proxies[idx]
             self._mem_cursor += 1
@@ -328,6 +330,69 @@ class PersistentProxyPool:
                 self._state["cursor"] = self._mem_cursor
                 self._save_state()
             return proxy
+
+    def advance_unique(self, event_ips: set, lock: threading.Lock,
+                       max_skip: int = 30) -> str:
+        """
+        Return the next proxy whose exit IP is not already in event_ips.
+        Fast path: ip_cache lookup only (no HTTP). Unknown proxies are accepted
+        optimistically (IP is populated later by cache_ip()).
+        Falls back to the next unchecked proxy if all max_skip candidates are
+        cached duplicates — still registers that IP in event_ips so the same
+        proxy is not returned twice.
+        Thread-safe — holds self._lock across the ip_cache read AND the
+        event_ips update to eliminate the TOCTOU window.
+        """
+        for _ in range(max_skip):
+            with self._lock:
+                if not self._proxies:
+                    raise RuntimeError(f"Proxy pool is empty (file: {self._file})")
+                idx = self._mem_cursor % len(self._proxies)
+                proxy = self._proxies[idx]
+                self._mem_cursor += 1
+                if self._mem_cursor % CURSOR_FLUSH_EVERY == 0:
+                    self._state["cursor"] = self._mem_cursor
+                    self._save_state()
+                cached_ip = self._state.get("ip_cache", {}).get(_extract_session_id(proxy))
+                if cached_ip is None:
+                    return proxy  # unknown IP — accept optimistically
+                # Hold self._lock while acquiring event_ip lock to close the
+                # TOCTOU window between "check" and "claim".
+                with lock:
+                    if cached_ip not in event_ips:
+                        event_ips.add(cached_ip)
+                        return proxy
+            # known duplicate — try next slot
+
+        # All max_skip candidates had cached duplicate IPs. Accept the next
+        # proxy unconditionally but still register its IP so it won't be
+        # returned a second time in this same event.
+        proxy = self.advance()
+        sid = _extract_session_id(proxy)
+        with self._lock:
+            cached_ip = self._state.get("ip_cache", {}).get(sid)
+        if cached_ip:
+            with lock:
+                event_ips.add(cached_ip)
+        return proxy
+
+    def cache_ip(self, proxy: str) -> str | None:
+        """
+        Resolve and cache the exit IP for proxy. Call fire-and-forget via executor
+        after a successful login so future advance_unique() calls hit the fast path.
+        Returns the IP string, or None if the proxy is unreachable.
+        """
+        sid = _extract_session_id(proxy)
+        with self._lock:
+            cached = self._state.get("ip_cache", {}).get(sid)
+        if cached:
+            return cached
+        ip = _get_exit_ip(proxy)
+        if ip:
+            with self._lock:
+                self._state.setdefault("ip_cache", {})[sid] = ip
+                self._save_state()
+        return ip
 
     def verify_and_claim(self, proxy: str, account: str = "") -> str | None:
         """

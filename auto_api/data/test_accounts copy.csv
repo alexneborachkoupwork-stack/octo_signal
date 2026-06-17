@@ -1,0 +1,51 @@
+id,username,password,status,account_type,first_name,last_name,gender,birthdate,nationality,traveldoc,email,email_pass,proxy,proxy_idx,registered_at,last_login,appointment_ref,notes
+1,isacor7434,hE8c1gofiE71!#,active,test,ISABEL,CORREIA,F,2005/04/12,CPV,PA642445,lz645mnlqe91@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:14:41Z,,err_attempts:1
+2,hellop9862,u6aGc9k4pg0U!#,active,test,HELDER,LOPES,M,1992/11/08,CPV,PA678376,8c1b0ad8em74@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:14:43Z,,non-JSON response err_attempts:1
+3,herbar8410,D8w8b1g1cPag!#,active,test,HERNANI,BARROS,M,1993/06/27,CPV,PA200578,atm1aykukqan@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:16:17Z,,non_json_body err_attempts:1
+4,felvar9062,cYp77Tii7yz6!#,active,test,FELICIANO,VARELA,M,1977/04/18,CPV,PA233397,5m9smdghvwi2@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:15:37Z,,non-JSON response
+5,marcar7669,czvn0XAc071x!#,verified,test,MARTA INES,CARVALHO,F,1982/08/09,CPV,PA843670,5xqvyj48xsyp@maillab.live,,proxy.soax.com:5000,,,,,non-JSON response err_attempts:2
+6,pauram7704,tT2Rkrt063jd!#,active,test,PAULO,RAMOS,M,1997/05/11,CPV,PA557444,y868quqpu0ip@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:16:45Z,,waf_challenge
+7,aldfer4190,11kboJ0gaE0e!#,active,test,ALDINA ROSARIA,FERREIRA RAMOS,F,1999/08/12,CPV,PA855085,bdaxh117rimi@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:18:51Z,,type=error
+8,vanbor9970,Tm11x7eWe9ek!#,active,test,VANESSA,BORGES,F,1972/11/10,CPV,PA778353,f65fy4vkz1ba@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:15:27Z,,waf_challenge err_attempts:1
+9,edslop1266,aj2jjV09F5fs!#,active,test,EDSON,LOPES,M,1975/12/31,CPV,PA328659,yuaadttjyo97@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:16:52Z,,rejected type='error' status=200 err_attempts:1
+10,helsem6435,04wBw61mPdmi!#,active,test,HELDER,SEMEDO,M,1978/02/03,CPV,PA843812,zqgigx36048y@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:16:55Z,,waf_challenge_after_bypass err_attempts:1
+11,carfer2161,5nsP3kb1Lf6d!#,active,test,CARLOS JOSE,FERREIRA,M,1966/07/07,CPV,PA326266,88m2ekp6bk2v@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:16:15Z,,waf_challenge_after_bypass err_attempts:1
+12,isagom3174,ap77vY4xv0kL!#,active,test,ISABEL,GOMES,F,1988/11/26,CPV,PA539325,olowmvsm5zg9@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:17:48Z,,err_attempts:1
+13,soflim7098,dy5z31aRtn4B!#,active,test,SOFIA,LIMA CUNHA,F,1969/01/03,CPV,PA403479,to4chik4dy43@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:16:51Z,,err_attempts:1
+14,silfur3211,Jum2gsr593Op!#,verified,test,SILVANA,FURTADO,F,1996/08/13,CPV,PA656553,2pmcu3kag49s@maillab.live,,proxy.soax.com:5000,,,,,waf_bypass_ineffective err_attempts:1
+15,leasan4503,Slidg7Tl385f!#,login_failed,test,LEANDRO,SANTOS,M,2007/03/02,CPV,PA144779,wcbmntwrwvzb@maillab.live,,proxy.soax.com:5000,,,,,err_attempts:1
+16,niltav5616,47kfJFl7rhv7!#,active,test,NILTON,TAVARES,M,2005/02/01,CPV,PA358305,4z316tzhszvz@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:18:48Z,,rejected type='error' status=200
+17,adicor5845,84rh1a1kzXJn!#,verified,test,ADILSON,CORREIA,M,1997/04/05,CPV,PA145277,a9voqe07q1an@maillab.live,,proxy.soax.com:5000,,,,,regen:3 err_attempts:1
+18,elimor2365,iwwz97pYL74c!#,verified,test,ELISEU EDSON,MOREIRA,M,2000/12/05,CPV,PA551340,sgbojntxw59w@maillab.live,,proxy.soax.com:5000,,,,,regen:1 err_attempts:1
+19,ronper6244,em87OpvA29nc!#,login_failed,test,RONALDO,PEREIRA GOMES,M,1987/02/13,CPV,PA958922,b5w4s7pd08tr@maillab.live,,proxy.soax.com:5000,,,,,test_login exception: browser_login failed: reCAPTCHA: no token after all attempts (challenge_detected=False)
+20,eucgom6577,T8dw99Hxxh9r!#,active,test,EUCLIDES,GOMES,M,1978/03/15,CPV,PA845299,z230tozv5gxj@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:19:22Z,,waf_challenge_after_bypass
+21,josand5837,eQwd6Ig2v16j!#,verified,test,JOSE,ANDRADE,M,1971/08/12,CPV,PA103731,47n807b3rtqm@maillab.live,,proxy.soax.com:5000,,,,,
+22,filcun7120,63d8loZPhm7r!#,verified,test,FILOMENA,CUNHA,F,1976/02/21,CPV,PA366512,1yewj2ier61e@maillab.live,,proxy.soax.com:5000,,,,,regen:2
+23,joatei9217,kG8tc43jcZ6i!#,verified,test,JOAO,TEIXEIRA,M,1994/01/13,CPV,PA324059,5iluqpce75x4@maillab.live,,proxy.soax.com:5000,,,,,
+24,helmor7986,w32dpY2aoXm0!#,verified,test,HELDER,MOREIRA,M,1971/02/18,CPV,PA861120,3qklevak8dit@maillab.live,,proxy.soax.com:5000,,,,,
+25,roscun9788,1ulFph8Jg6z3!#,verified,test,ROSARIA,CUNHA,F,1995/02/23,CPV,PA271348,al3m2mdw8rkw@maillab.live,,proxy.soax.com:5000,,,,,regen:1
+26,luivar3632,fjgzBt07mI06!#,verified,test,LUIS,VARELA,M,1981/09/02,CPV,PA028785,5tdkcuu6knbc@maillab.live,,proxy.soax.com:5000,,,,,
+27,clafer8430,z2sKkkz3m33S!#,verified,test,CLAUDIA,FERNANDES,F,1971/03/16,CPV,PA996605,pctk4pmh9jnl@maillab.live,,proxy.soax.com:5000,,,,,regen:1
+28,migalm9207,h01wPvW5me7p!#,verified,test,MIGUEL,ALMEIDA,M,1970/05/05,CPV,PA470002,ctzyxnralm9x@maillab.live,,proxy.soax.com:5000,,,,,
+29,roscor5372,60p7R2dxknBw!#,verified,test,ROSARIA,CORREIA,F,1991/06/18,CPV,PA858901,7rpzbd8xx1eh@maillab.live,,proxy.soax.com:5000,,,,,regen:2
+30,helfer6082,jt91Grsb6yO9!#,verified,test,HELDER,FERREIRA SILVA,M,1969/03/16,CPV,PA458897,ob8g13qs1tyz@maillab.live,,proxy.soax.com:5000,,,,,
+31,fertav3253,tFan4G2cgr83!#,verified,test,FERNANDA,TAVARES,F,1968/11/28,CPV,PA441730,3ydvs4utjool@maillab.live,,proxy.soax.com:5000,,,,,
+32,riccar3787,i3cuf34txN4K!#,verified,test,RICARDO,CARVALHO,M,2004/04/27,CPV,PA790173,y0l3nc47fxnh@maillab.live,,proxy.soax.com:5000,,,,,regen:1
+33,siltav6119,Jq69Zv4mg2vf!#,verified,test,SILVANA,TAVARES,F,1968/08/10,CPV,PA496351,wz1vpf1j0nco@maillab.live,,proxy.soax.com:5000,,,,,regen:1
+34,joamat5729,27MEpoqg8xy1!#,verified,test,JOAO,MATOS,M,1978/02/17,CPV,PA471764,4iyd21rss9wf@maillab.live,,proxy.soax.com:5000,,,,,
+35,luibor8544,7ay2zN1nOsg9!#,verified,test,LUIS,BORGES,M,1987/10/02,CPV,PA589412,aq288f907y2j@maillab.live,,proxy.soax.com:5000,,,,,
+36,silvie2330,gn62Z93Lohrr!#,verified,test,SILVANA,VIEIRA,F,1979/05/11,CPV,PA073118,n43hgty45v5s@maillab.live,,proxy.soax.com:5000,,,,,regen:retry
+37,pedmon5516,4q0c9olXoW1j!#,verified,test,PEDRO,MONTEIRO,M,1991/10/01,CPV,PA209697,dcmvhzrpdt37@maillab.live,,proxy.soax.com:5000,,,,,regen:2
+38,ernalm7660,oV40rat8Pd4m!#,verified,test,ERNESTO,ALMEIDA LIMA,M,1976/05/21,CPV,PA819545,j5p4n4vr9tpc@maillab.live,,proxy.soax.com:5000,,,,,
+39,ronram1546,s0lr66bro5IO!#,verified,test,RONALDO,RAMOS,M,1993/10/08,CPV,PA704286,qoapva9p5pw2@maillab.live,,proxy.soax.com:5000,,,,,regen:2
+40,marbor9524,uOa0hl4qS20t!#,verified,test,MARIO,BORGES,M,1971/11/16,CPV,PA545105,fqv6w70ukzkh@maillab.live,,proxy.soax.com:5000,,,,,
+41,pedcos5650,bFmb9bz0hC32!#,verified,test,PEDRO,COSTA CUNHA,M,1988/12/29,CPV,PA491929,xpftbotyakbj@maillab.live,,proxy.soax.com:5000,,,,,
+42,joafer2518,i0j9ItgTy10k!#,verified,test,JOAO,FERREIRA,M,1990/09/10,CPV,PA113498,c8l1jt32sf3z@maillab.live,,proxy.soax.com:5000,,,,,
+43,serand2522,0Vd2pPqhl2y6!#,verified,test,SERGIO,ANDRADE,M,1972/03/25,CPV,PA681209,tptdi6z7wkag@maillab.live,,proxy.soax.com:5000,,,,,max_regen_exceeded:PA681209
+44,inepir3952,6zmZdv5fp1A1!#,verified,test,INES GRACIETE,PIRES,F,1998/01/28,CPV,PA534817,jcij1tlx1kja@maillab.live,,proxy.soax.com:5000,,,,,
+45,edncun1096,835kTxu4Sibt!#,verified,test,EDNA,CUNHA,F,1998/01/10,CPV,PA126587,0orl4bxgbzvy@maillab.live,,proxy.soax.com:5000,,,,,regen:1
+46,edsmon4423,ucI4E7nbe97w!#,verified,test,EDSON,MONTEIRO,M,1993/03/18,CPV,PA685830,jyxhkdi8yrs6@maillab.live,,proxy.soax.com:5000,,,,,regen:3
+47,fabalm9229,hKNj1it4hn66!#,verified,test,FABIO,ALMEIDA SANTOS,M,2007/11/25,CPV,PA304518,gwalndlv9suy@maillab.live,,proxy.soax.com:5000,,,,,
+48,ricsil2435,h82kcYDrz09h!#,verified,test,RICARDO EDSON,SILVA,M,1987/04/28,CPV,PA401797,2ssuitebh7lb@maillab.live,,proxy.soax.com:5000,,,,,regen:1
+49,ednsem1228,Ji0atm26lNt9!#,verified,test,EDNA,SEMEDO,F,1987/08/01,CPV,PA135979,cv892f8ff3eh@maillab.live,,proxy.soax.com:5000,,,,,regen:1
+50,marfer8315,79bkfxV8tm5I!#,verified,test,MARIA ELISA,FERREIRA ALMEIDA,F,1983/07/27,CPV,PA277406,fdbikbeeival@maillab.live,,proxy.soax.com:5000,,,,,
