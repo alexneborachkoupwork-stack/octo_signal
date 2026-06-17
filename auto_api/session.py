@@ -275,6 +275,7 @@ class PlaywrightSession:
     _CMD_CLOSE_BROWSER        = "close_browser"   # full shutdown after login; primp lives on
     _CMD_FORM_POST            = "form_post"        # DOM form.submit() -- real page nav, bypasses DataDome
     _CMD_SUBMIT_PAGE_FORM     = "submit_page_form"  # submit existing on-page form (no new form injected)
+    _CMD_DATADOME_UNBLOCK     = "datadome_unblock"  # solve DataDome challenge for a non-login endpoint
     _CMD_CLOSE           = "close"
 
     def __init__(self, proxy: str | None, inject_cookies: dict | None = None,
@@ -452,6 +453,13 @@ class PlaywrightSession:
                     except Exception as exc:
                         self._res_q.put(("err", str(exc)))
 
+                elif cmd.get("action") == self._CMD_DATADOME_UNBLOCK:
+                    try:
+                        result = self._do_datadome_unblock(page, cmd)
+                        self._res_q.put(("ok", result))
+                    except Exception as exc:
+                        self._res_q.put(("err", str(exc)))
+
                 elif cmd.get("action") == self._CMD_LOGIN:
                     try:
                         result = self._do_browser_login(page, cmd)
@@ -549,21 +557,27 @@ class PlaywrightSession:
                             print(f"[session] form_post browser-cookie read error: {_ce}")
                         fields_js = _json.dumps(post_data)
                         url_js    = _json.dumps(post_url)
-                        with page.expect_navigation(wait_until="networkidle", timeout=45000):
-                            page.evaluate(f"""() => {{
-                                const f = document.createElement('form');
-                                f.method = 'POST';
-                                f.action = {url_js};
-                                f.enctype = 'application/x-www-form-urlencoded';
-                                const fields = {fields_js};
-                                for (const [k, v] of Object.entries(fields)) {{
-                                    const i = document.createElement('input');
-                                    i.type = 'hidden'; i.name = k; i.value = String(v);
-                                    f.appendChild(i);
-                                }}
-                                document.body.appendChild(f);
-                                f.submit();
-                            }}""")
+                        try:
+                            with page.expect_navigation(wait_until="networkidle", timeout=45000):
+                                page.evaluate(f"""() => {{
+                                    const f = document.createElement('form');
+                                    f.method = 'POST';
+                                    f.action = {url_js};
+                                    f.enctype = 'application/x-www-form-urlencoded';
+                                    const fields = {fields_js};
+                                    for (const [k, v] of Object.entries(fields)) {{
+                                        const i = document.createElement('input');
+                                        i.type = 'hidden'; i.name = k; i.value = String(v);
+                                        f.appendChild(i);
+                                    }}
+                                    document.body.appendChild(f);
+                                    f.submit();
+                                }}""")
+                        except Exception as _nav_e:
+                            # expect_navigation/evaluate can itself raise the "page is
+                            # navigating" race — the form submit DID trigger navigation;
+                            # fall through to the content-retry loop instead of giving up.
+                            print(f"[session] form_post: expect_navigation raced ({_nav_e}) - retrying content read")
                         _content = ""
                         for _ci in range(6):
                             try:
@@ -579,6 +593,17 @@ class PlaywrightSession:
                             page.wait_for_load_state("networkidle", timeout=10000)
                             page.wait_for_timeout(3000)
                             _content = page.content() or ""
+                        if not _content:
+                            # All retries failed to read content while navigating. The POST
+                            # likely already succeeded server-side; re-navigate to wherever the
+                            # page actually landed and read fresh content instead of giving up.
+                            try:
+                                _landed_url = page.url
+                                page.goto(_landed_url, wait_until="networkidle", timeout=20000)
+                                _content = page.content() or ""
+                                print(f"[session] form_post: re-navigated to landed url {_landed_url} -> len={len(_content)}")
+                            except Exception as _re:
+                                print(f"[session] form_post: re-navigate fallback failed: {_re}")
                         html = _content
                         print(f"[session] form_post -> {page.url}  len={len(html)}")
                         self._res_q.put(("ok", page.url, html))
@@ -621,9 +646,12 @@ class PlaywrightSession:
                         if not _form_action:
                             self._res_q.put(("err", "no_form_found", ""))
                         else:
-                            with page.expect_navigation(wait_until="networkidle", timeout=45000):
-                                _submit_result = page.evaluate(_submit_js)
-                            print(f"[session] submit_page_form submitted: {_submit_result}")
+                            try:
+                                with page.expect_navigation(wait_until="networkidle", timeout=45000):
+                                    _submit_result = page.evaluate(_submit_js)
+                                print(f"[session] submit_page_form submitted: {_submit_result}")
+                            except Exception as _nav_e:
+                                print(f"[session] submit_page_form: expect_navigation raced ({_nav_e}) - retrying content read")
                             _content = ""
                             for _ci in range(6):
                                 try:
@@ -1301,25 +1329,37 @@ class PlaywrightSession:
         try:
             with page.expect_navigation(wait_until="networkidle", timeout=45000):
                 page.evaluate(login_form_js)
-            # A second JS-triggered redirect may start after networkidle; retry content() until stable.
-            _login_content = ""
-            for _ci in range(6):
-                try:
-                    page.wait_for_timeout(1500)
-                    _login_content = page.content() or ""
-                    break
-                except Exception:
-                    try:
-                        page.wait_for_load_state("networkidle", timeout=10000)
-                    except Exception:
-                        pass
-            if "/ch/bd.js" in _login_content:
-                page.wait_for_load_state("networkidle", timeout=25000)
-                page.wait_for_timeout(3000)
+        except Exception as _nav_e:
+            # expect_navigation/evaluate can itself raise the "page is navigating" race
+            # (the form submit DID trigger navigation; the wait mechanism just choked
+            # reading state mid-flight). Don't abort — fall through to the content-retry
+            # loop below, which re-checks page state instead of giving up immediately.
+            print(f"[session] login form submit: expect_navigation raced ({_nav_e}) - retrying content read")
+        # A second JS-triggered redirect may start after networkidle; retry content() until stable.
+        _login_content = ""
+        for _ci in range(6):
+            try:
+                page.wait_for_timeout(1500)
                 _login_content = page.content() or ""
-        except Exception as e:
-            print(f"[session] login form submit failed: {e}")
-            return {"status": 0, "body": "", "captcha_token": token}
+                break
+            except Exception:
+                try:
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
+        if "/ch/bd.js" in _login_content:
+            page.wait_for_load_state("networkidle", timeout=25000)
+            page.wait_for_timeout(3000)
+            _login_content = page.content() or ""
+        if not _login_content:
+            try:
+                _landed_url = page.url
+                page.goto(_landed_url, wait_until="networkidle", timeout=20000)
+                _login_content = page.content() or ""
+                print(f"[session] login form submit: re-navigated to landed url {_landed_url} -> len={len(_login_content)}")
+            except Exception as _re:
+                print(f"[session] login form submit failed (all fallbacks exhausted): {_re}")
+                return {"status": 0, "body": "", "captcha_token": token}
         final_url    = page.url
         html_content = _login_content
         has_challenge = "/ch/bd.js" in html_content
@@ -1400,6 +1440,100 @@ class PlaywrightSession:
                 print(f"[session] post-login primp sync failed: {_se}")
 
         return {"status": status, "body": body, "captcha_token": token}
+
+    def _do_datadome_unblock(self, page, cmd: dict) -> bool:
+        """
+        Generic DataDome unblock for any endpoint blocked via fetch() (used by /slots
+        and other non-login XHR calls). A fetch() response body containing the bd.js
+        challenge HTML is never executed by the browser, so no challenge iframe ever
+        appears in the DOM and the login-path's DOM-extraction trick has nothing to
+        find. Fix: navigate the real page to challenge_url (a genuine GET navigation),
+        which DOES execute bd.js and render the captcha-delivery iframe, then reuse
+        the same capsolver DatadomeSliderTask + cookie-injection mechanism as login.
+        Returns True if a datadome cookie was solved and injected, False otherwise.
+        """
+        import re as _re
+        import solver as _solver
+
+        challenge_url  = cmd["challenge_url"]
+        capsolver_keys = cmd.get("capsolver_keys") or []
+
+        try:
+            page.goto(challenge_url, timeout=25000)
+            page.wait_for_load_state("networkidle", timeout=15000)
+            page.wait_for_timeout(3000)
+        except Exception as _ge:
+            print(f"[session] datadome_unblock: nav to challenge_url failed: {_ge}")
+            return False
+
+        html_content = page.content() or ""
+        if "/ch/bd.js" not in html_content:
+            print("[session] datadome_unblock: challenge_url did not re-trigger a challenge "
+                  "(already clean? or endpoint doesn't challenge on GET) — nothing to solve")
+            return False
+
+        captcha_url = None
+        try:
+            captcha_url = page.evaluate(
+                "document.querySelector('iframe[src*=\"captcha-delivery.com\"]')?.src || null"
+            )
+        except Exception as _ee:
+            print(f"[session] datadome_unblock: DOM extract failed: {_ee}")
+
+        if not captcha_url:
+            m = _re.search(
+                r'https://geo\.captcha-delivery\.com/captcha/\?[^"\'<\s]+',
+                html_content,
+            )
+            captcha_url = m.group(0) if m else None
+
+        if not captcha_url:
+            try:
+                _iframes = page.evaluate(
+                    "() => Array.from(document.querySelectorAll('iframe')).map(f => f.src || '(no-src)').slice(0,10)"
+                )
+                print(f"[session] datadome_unblock: iframes on page: {_iframes}")
+            except Exception:
+                pass
+            print("[session] datadome_unblock: captchaUrl not found — cannot bypass")
+            return False
+
+        print(f"[session] datadome_unblock: captchaUrl len={len(captcha_url)}")
+
+        try:
+            user_agent = page.evaluate("navigator.userAgent") or ""
+        except Exception:
+            user_agent = ""
+
+        cookie_str = _solver.solve_datadome_capsolver(
+            capsolver_keys, captcha_url, challenge_url, user_agent, self.proxy
+        )
+        if not cookie_str:
+            print("[session] datadome_unblock: solver returned no cookie")
+            return False
+
+        dd_value = cookie_str.removeprefix("datadome=")
+        print(f"[session] datadome_unblock: injecting cookie  len={len(dd_value)}")
+        try:
+            page.context.add_cookies([{
+                "name":   "datadome",
+                "value":  dd_value,
+                "domain": ".pedidodevistos.mne.gov.pt",
+                "path":   "/",
+            }])
+        except Exception as _ce:
+            print(f"[session] datadome_unblock: cookie inject failed: {_ce}")
+            return False
+
+        # Sync to primp too so the non-browser retry path (primp.post) also carries it.
+        try:
+            if self._primp is not None:
+                _cookies_now = {c["name"]: c["value"] for c in page.context.cookies()}
+                self._primp.set_cookies(challenge_url, _cookies_now)
+        except Exception as _se:
+            print(f"[session] datadome_unblock: primp cookie sync failed: {_se}")
+
+        return True
 
     def _try_datadome_bypass(
         self, page, html_content: str, website_url: str,
@@ -1646,6 +1780,34 @@ class PlaywrightSession:
         if status == "err":
             raise RuntimeError(f"browser_fetch failed: {result}")
         return result
+
+    def unblock_datadome(self, challenge_url: str, capsolver_keys: list,
+                         timeout: int = 90) -> bool:
+        """
+        Solve a DataDome challenge for an arbitrary endpoint (e.g. /slots) that was
+        blocked when called via fetch() (fetch responses never execute their JS, so
+        bd.js never runs and no challenge iframe ever appears in the DOM). Navigates
+        the real browser page to challenge_url so bd.js actually runs and renders the
+        challenge iframe, solves it via capsolver DatadomeSliderTask, and injects the
+        resulting datadome cookie into the browser context. Caller should retry its
+        original request (browser_fetch/browser_form_post/...) immediately after this
+        returns True — the cookie travels with the session for subsequent calls.
+        Returns True on success, False if the bypass could not be completed.
+        """
+        self._cmd_q.put({
+            "action":        self._CMD_DATADOME_UNBLOCK,
+            "challenge_url": challenge_url,
+            "capsolver_keys": capsolver_keys,
+        })
+        try:
+            status, result = self._res_q.get(timeout=timeout)
+        except queue.Empty:
+            print(f"[session] unblock_datadome timed out after {timeout}s")
+            return False
+        if status == "err":
+            print(f"[session] unblock_datadome failed: {result}")
+            return False
+        return bool(result)
 
     def browser_login(self, username: str, password: str, lang: str = "PT",
                       solver_key: str = "", twocaptcha_key: str = "",

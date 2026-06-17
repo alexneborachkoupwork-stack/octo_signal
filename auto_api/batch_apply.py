@@ -149,6 +149,32 @@ def _log(account: str, msg: str) -> None:
         print(f"[{account}] {msg}", flush=True)
 
 
+# -- State-evidence screenshots ---------------------------------------------
+# Off by default (screenshots cost ~100-300ms + disk space per call, and a
+# browser isn't always attached). Enable with EVIDENCE_SCREENSHOTS=1 in .env
+# or the environment for verification runs. Uses the same client.screenshot()
+# plumbing already proven at login (auto_api/session.py _take_screenshot).
+import os as _os
+_EVIDENCE_SCREENSHOTS = _os.environ.get("EVIDENCE_SCREENSHOTS", "") == "1"
+
+
+async def _evidence(client, username: str, state: str, executor: ThreadPoolExecutor) -> None:
+    """Best-effort state screenshot for visual verification evidence. Never raises,
+    never blocks the workflow on failure — a missed screenshot is not a workflow error."""
+    if not _EVIDENCE_SCREENSHOTS or not hasattr(client, "screenshot"):
+        return
+    try:
+        loop = asyncio.get_event_loop()
+        path = await loop.run_in_executor(executor, lambda: client.screenshot(username, state))
+        ts = _time.strftime("%Y-%m-%d %H:%M:%S")
+        if path:
+            _log(username, f"EVIDENCE state={state} screenshot={path} ts={ts}")
+        else:
+            _log(username, f"EVIDENCE state={state} screenshot=FAILED ts={ts}")
+    except Exception as _ee:
+        _log(username, f"EVIDENCE state={state} screenshot=ERROR ({_ee})")
+
+
 def _load_dotenv() -> dict:
     env = {}
     if not _ENV_FILE.exists():
@@ -252,6 +278,7 @@ async def _run_steps_2_to_6(client, posto_id: str, acct: dict,
         try:
             _home_nav_url = await loop.run_in_executor(executor, lambda: client.browser_nav(_home_url, timeout=30))
             _log(username, f"HOME nav: final_url={_home_nav_url}")
+            await _evidence(client, username, "authenticated_index", executor)
             # Dump the authenticated HOME dashboard content
             _home_diag_js = """(() => {
                 // 1. Page visible text (what user sees)
@@ -301,6 +328,7 @@ async def _run_steps_2_to_6(client, posto_id: str, acct: dict,
         _q0_url = await loop.run_in_executor(executor, lambda: client.browser_nav(QUEST_URL, timeout=35, skip_cookie_sync=True))
         _elapsed("Questionario nav done")
         _log(username, f"Questionario: final_url={_q0_url}")
+        await _evidence(client, username, "questionario", executor)
         _last_quest_fields: dict = {}
         for _bi, _bstep in enumerate(quest_steps):
             _bparams = {**base_qs, **_bstep}
@@ -492,6 +520,7 @@ async def _run_steps_2_to_6(client, posto_id: str, acct: dict,
     if not csrf:
         _log(username, "ERROR: CSRF token not found — cannot submit ScheduleController")
         raise RuntimeError("csrf_missing")
+    await _evidence(client, username, "formulario", executor)
 
     # Step 5: ScheduleController
     payload = _build_schedule_payload(acct, posto_id, csrf, nat, residence=res)
@@ -528,6 +557,7 @@ async def _run_steps_2_to_6(client, posto_id: str, acct: dict,
                     "document.documentElement.outerHTML")) or ""
                 _log(username, f"Schedule.jsp browser len={len(sched_html)}")
                 _log(username, f"Schedule.jsp body snippet: {sched_html[:400].encode('ascii', 'replace').decode()}")
+                await _evidence(client, username, "schedule_controller", executor)
                 posto_pdf = posto_id
                 m_pdf = re.search(r"SubmeterVistoCriaPDF\?posto_id=(\d+)", sched_html)
                 if m_pdf:
@@ -580,6 +610,7 @@ async def _run_steps_2_to_6(client, posto_id: str, acct: dict,
             "document.documentElement.outerHTML")) or ""
         _log(username, f"Schedule.jsp browser len={len(sched_html)}")
         _log(username, f"Schedule.jsp body snippet: {sched_html[:400].encode('ascii', 'replace').decode()}")
+        await _evidence(client, username, "schedule_controller", executor)
     else:
         if "Schedule.jsp" not in sc_url:
             _log(username, f"GET /Schedule.jsp?posto_id={posto_id} (primp)")
@@ -722,10 +753,48 @@ async def apply_book(acct: dict, posto_id: str, posto_pdf: str,
 
         slots_text = ""
         slots_status = 0
+        _dd_unblock_tried = False
         for _slot_attempt in range(_SLOTS_PROXY_RETRIES + 1):
             _is_first = (_slot_attempt == 0)
+            _method = ""
             try:
-                if _is_first and _has_browser:
+                if _is_first and _has_browser and hasattr(client, "browser_form_post"):
+                    # Try a real navigation (form.submit()) first — the same trick that
+                    # already bypasses DataDome for Formulario/login. fetch()/XHR calls to
+                    # this endpoint get blocked because bd.js never runs against them; a
+                    # real navigation runs bd.js and is generally trusted, regardless of
+                    # whether the body it returns is the raw JSON or an HTML-wrapped page.
+                    try:
+                        _fp_url, _fp_html = await loop.run_in_executor(
+                            executor, lambda: client.browser_form_post(
+                                SLOTS_URL + "?posto_id=" + posto_id,
+                                {"posto_id": posto_id, "captcha": token}, timeout=30))
+                        _fp_snip = _fp_html[:300]
+                        _fp_blank = _fp_html.strip() in (
+                            "", "<html><head></head><body></body></html>",
+                        )
+                        if _fp_blank:
+                            # Real navigation landed on chrome-error://chromewebdata/ (a proxy
+                            # connection failure mid-navigation, e.g. ERR_TUNNEL_CONNECTION_FAILED)
+                            # — not a DataDome block, not a real empty-slots answer. Must rotate
+                            # like any other failed attempt, not be accepted as a final response.
+                            _log(username, "slots: browser_form_post landed on blank/chrome-error page (proxy connection failure) — falling back to fetch")
+                            slots_text, slots_status, _method = "", 0, ""
+                        elif not (
+                            "body{margin:0;background:#fff}" in _fp_snip
+                            or "datadome" in _fp_snip.lower()
+                        ):
+                            slots_text = _fp_html
+                            slots_status = 200
+                            _method = "browser_form_post"
+                        else:
+                            _log(username, "slots: browser_form_post also DataDome-blocked — falling back to fetch")
+                            slots_text, slots_status, _method = "", 0, ""
+                    except Exception as _fpe:
+                        _log(username, f"slots: browser_form_post failed: {_fpe} — falling back to fetch")
+                        slots_text, slots_status, _method = "", 0, ""
+
+                if _is_first and _has_browser and not _method:
                     raw = await loop.run_in_executor(executor, lambda: client.browser_fetch(
                         SLOTS_URL, {"posto_id": posto_id, "captcha": token},
                         params={"posto_id": posto_id},
@@ -734,7 +803,7 @@ async def apply_book(acct: dict, posto_id: str, posto_pdf: str,
                     slots_text = raw["body"]
                     slots_status = raw["status"]
                     _method = "browser_fetch"
-                else:
+                if not _is_first or not _has_browser:
                     import primp as _primp
                     _rot_proxy = _next_slots_proxy()
                     _log(username, f"slots: rotating to fresh proxy (attempt {_slot_attempt}), re-solving CAPTCHA")
@@ -778,6 +847,57 @@ async def apply_book(acct: dict, posto_id: str, posto_pdf: str,
                 continue  # rotate proxy and retry
             if "body{margin:0;background:#fff}" in _body_snip or "datadome" in _body_snip.lower():
                 _log(username, f"slots: DataDome block via {_method} (attempt {_slot_attempt})")
+                if _is_first and _has_browser and not _dd_unblock_tried:
+                    _dd_unblock_tried = True
+                    # This is DataDome's lightweight "tag" challenge (bd.js + location.reload()),
+                    # the same one session.py already handles elsewhere by waiting then re-GETting
+                    # the same URL — NOT the interactive slider/CAPTCHA challenge login hits. Try
+                    # the cheap fix first: wait for bd.js's timing check to pass, then retry the
+                    # exact same request on the same proxy/session before spending a proxy rotation.
+                    _log(username, "slots: tag-challenge — waiting 4s then retrying same proxy")
+                    await asyncio.sleep(4)
+                    try:
+                        raw = await loop.run_in_executor(executor, lambda: client.browser_fetch(
+                            SLOTS_URL, {"posto_id": posto_id, "captcha": token},
+                            params={"posto_id": posto_id},
+                            headers={"X-Requested-With": "XMLHttpRequest", "Referer": sched_jsp_url},
+                            timeout=30))
+                        slots_text = raw["body"]
+                        slots_status = raw["status"]
+                        _body_snip = slots_text[:300]
+                        if slots_status != 302 and not (
+                            "body{margin:0;background:#fff}" in _body_snip
+                            or "datadome" in _body_snip.lower()
+                        ):
+                            break  # wait-and-retry worked — got a real response
+                        _log(username, "slots: still blocked after wait-and-retry — trying interactive unblock")
+                    except Exception as _we:
+                        _log(username, f"slots: wait-and-retry failed: {_we}")
+
+                    # Fallback: in case this WAS the heavier interactive challenge, try the
+                    # iframe-based DatadomeSliderTask solve (same mechanism as the login path).
+                    _challenge_url = SLOTS_URL + "?posto_id=" + posto_id
+                    _unblocked = await loop.run_in_executor(
+                        executor, lambda: client.unblock_datadome(_challenge_url, capsolver_keys))
+                    if _unblocked:
+                        _log(username, "slots: datadome unblocked (interactive) — retrying same proxy")
+                        try:
+                            raw = await loop.run_in_executor(executor, lambda: client.browser_fetch(
+                                SLOTS_URL, {"posto_id": posto_id, "captcha": token},
+                                params={"posto_id": posto_id},
+                                headers={"X-Requested-With": "XMLHttpRequest", "Referer": sched_jsp_url},
+                                timeout=30))
+                            slots_text = raw["body"]
+                            slots_status = raw["status"]
+                            _body_snip = slots_text[:300]
+                            if slots_status != 302 and not (
+                                "body{margin:0;background:#fff}" in _body_snip
+                                or "datadome" in _body_snip.lower()
+                            ):
+                                break  # unblock worked — got a real response
+                            _log(username, "slots: still blocked after interactive unblock")
+                        except Exception as _ue:
+                            _log(username, f"slots: retry after unblock failed: {_ue}")
                 if _slot_attempt >= _SLOTS_PROXY_RETRIES:
                     return "proxy_blocked"
                 continue  # rotate proxy and retry
@@ -786,10 +906,22 @@ async def apply_book(acct: dict, posto_id: str, posto_pdf: str,
         try:
             slots_json = json.loads(slots_text)
         except Exception:
-            _log(username, f"slots: non-JSON response: {slots_text[:300]}")
-            return "error"
+            # When the response comes via a real browser navigation (browser_form_post),
+            # Chrome wraps a raw JSON response in its built-in viewer HTML: <pre>{...}</pre>.
+            # Unwrap that before giving up.
+            _pre_m = re.search(r"<pre[^>]*>(.*?)</pre>", slots_text, re.DOTALL)
+            if _pre_m:
+                try:
+                    slots_json = json.loads(_pre_m.group(1).strip())
+                except Exception:
+                    _log(username, f"slots: non-JSON response (pre-unwrap failed): {slots_text[:300]}")
+                    return "error"
+            else:
+                _log(username, f"slots: non-JSON response: {slots_text[:300]}")
+                return "error"
 
         _log(username, f"slots raw: {json.dumps(slots_json)[:600]}")
+        await _evidence(client, username, "slots", executor)
 
         if isinstance(slots_json, dict):
             if slots_json.get("type") == "error":
@@ -841,8 +973,15 @@ async def apply_book(acct: dict, posto_id: str, posto_pdf: str,
                 return "error"
 
         _log(username, f"booking slot: date={slot_date} period={slot_period}")
+        # No distinct visual state to screenshot here yet — slot selection in this
+        # headless flow is a value choice (date/period from the JSON), not a calendar
+        # click, so the live page is unchanged from the "slots" evidence shot above.
 
         # Step 9: SubmeterVistoCriaPDF
+        # NOTE: this still uses primp's client.post() (bare XHR-equivalent), the same
+        # request shape that DataDome was blocking on /slots before the browser_form_post
+        # fix. Untested against a real open slot — if this gets DataDome-blocked the same
+        # way, it needs the identical real-navigation fix applied here.
         r = await loop.run_in_executor(executor, lambda: client.post(
             SUBMIT_URL, params={"posto_id": posto_pdf},
             data={"lang": "ENG", "txtHuman": "", "back": "",
@@ -851,6 +990,10 @@ async def apply_book(acct: dict, posto_id: str, posto_pdf: str,
 
         resp_text = r.text.strip()
         _log(username, f"SubmeterVisto -> {r.status_code}  body={resp_text[:150]}")
+        # Best-effort only: client.post() is primp, not the browser, so this screenshot
+        # reflects whatever page the browser last navigated to (the slots/Schedule.jsp
+        # page), not the actual submission result. Kept for completeness/debug visibility.
+        await _evidence(client, username, "pdf_submission", executor)
 
         _known_errors = ("indisponivel", "unavailable", "erro", "error", "bd_problm")
         _has_error_kw = any(kw in resp_text.lower() for kw in _known_errors)
