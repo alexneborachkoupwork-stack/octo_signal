@@ -6,34 +6,42 @@ Automated E-VISA appointment booking system for the Portuguese consulate portal 
 
 ---
 
-## Architecture — Three Layers
+## Architecture — `app/` package (Phase 0 restructure, 2026-06-17)
+
+`auto_api/` and `engine/` no longer exist as source trees — both were merged into a single
+importable `app/` package, organized by role instead of historical accident. See
+`memory/project_structure.md` (Claude's memory) for the full rationale and verification evidence.
 
 ```
-engine/                     ← Orchestration layer (asyncio)
-│   manager.py              — Spawns & supervises all worker coroutines
-│   worker.py               — Per-account state machine
-│   signals.py              — SlotSignalBus: resettable event + HTTP server :8989
-│   __init__.py             — Adds auto_api/ to sys.path
+app/
+│   __init__.py             — Adds app/core/ to sys.path (replaces old auto_api/-on-path trick)
+│   cli.py                  — ← engine/manager.py — CLI entrypoint: `python -m app.cli ...`
+│   worker.py               — ← engine/worker.py — Per-account state machine (unchanged logic)
 │
-auto_api/                   ← Automation layer (FROZEN — do not modify)
-│   session.py              — Playwright browser login + fingerprint bypass
-│   batch_apply.py          — Full apply workflow steps 1-9
-│   session_store.py        — Session checkpoint save/load/probe
-│   proxy_pool.py           — PersistentProxyPool (round-robin, cursor persisted to disk)
-│   slot_manager.py         — SlotManager atomic lease system
-│   solver.py               — CAPTCHA solver race (capsolver/anticaptcha/2captcha/capmonster)
-│   batch_warmup.py         — Standalone warmup CLI (fallback)
-│   data/
-│       accounts.csv        — 196 real applicant accounts (172 verified)
-│       test_accounts.csv   — 100 test/fake accounts (94 verified)
-│       proxies_soax.txt    — 20,000 SOAX rotating proxies (package 335959)
-│       proxies_isp.txt     — 192 static ISP proxies (not yet usable — HTTPS tunnel fails)
-│       quest_steps.json    — Portal questionnaire steps per nationality
-│       form_defaults.json  — Default form field values
+│   core/                   ← Automation layer (CORNERSTONE files unchanged — do not modify content)
+│       session.py          — Playwright browser login + fingerprint bypass
+│       batch_apply.py      — Full apply workflow steps 1-9
+│       session_store.py    — Session checkpoint save/load/probe
+│       proxy_pool.py       — PersistentProxyPool (round-robin, cursor persisted to disk)
+│       slot_manager.py     — SlotManager atomic lease system
+│       solver.py           — CAPTCHA solver race (capsolver/anticaptcha/2captcha/capmonster)
+│       signals.py          — ← engine/signals.py — SlotSignalBus: resettable event + HTTP :8989
+│       isp_proxy_pool.py   — ← engine/isp_proxy_pool.py
+│       batch_warmup.py     — Standalone warmup CLI (fallback)
+│       data/
+│           accounts.csv        — real applicant accounts
+│           test_accounts.csv   — test/fake accounts
+│           proxies_soax.txt    — SOAX rotating proxies
+│           proxies_webshare.txt — Webshare AR/AU/DO SOCKS5 proxies (current primary, swap geo as needed)
+│           proxies_isp.txt     — static ISP proxies
+│           quest_steps.json    — Portal questionnaire steps per nationality
+│           form_defaults.json  — Default form field values
+│           pdfs/               — Downloaded booking confirmation PDFs
 │       sessions/           — Per-account checkpoint JSON files
-│       pdfs/               — Downloaded booking confirmation PDFs
-│
-data/                       ← Identity generation utilities
+│       screenshots/        — Login + state-evidence screenshots (EVIDENCE_SCREENSHOTS=1)
+
+probes/                     ← One-off/diagnostic scripts (was auto_api/probes/ + engine/verify_apply_flow.py)
+data/                       ← Identity generation utilities (unrelated root-level scripts)
 ```
 
 ---
@@ -75,16 +83,15 @@ idle → logging_in → logged_in → warming_up → warmed
 ## Run Command (Real Mode)
 
 ```bash
-cd auto_api
-set PYTHONPATH=..
-uv run python -m engine.manager \
+# from project root (NOT app/ or app/core/)
+.venv\Scripts\python.exe -m app.cli \
   --mode real \
   --scouts 15 \
   --count 196 \
   --account-offset 32 \
   --max-lifetime 72000 \
   --login-concurrency 40 \
-  > ..\engine_real_run.log 2> ..\engine_real_run_err.log
+  > logs\runs\real_run.log 2> logs\runs\real_run_err.log
 ```
 
 **Monitor:**
@@ -117,11 +124,11 @@ curl http://localhost:8989/status
 
 ## Known Constraints
 
-- **auto_api/ is frozen** — confirmed login/register flows must not be modified. All changes go in engine/ or around them.
+- **app/core/session.py + solver.py login/register call chains are cornerstones** — must not be modified. All changes go in app/cli.py, app/worker.py, or around them.
 - **Audio challenge banned** — clicking audio button triggers "automated queries" bot detection. Never re-enable.
 - **SOAX package 335959** — rotating proxies. Traffic can be exhausted; cursor state persisted to `proxies_soax.txt.proxy_state.json`.
 - **ISP proxies** — `proxies_isp.txt` has 192 entries but most fail HTTPS CONNECT tunneling (can't reach portal). The `WHnPcVTJPqBz` credential group returns 403 auth failures.
-- **aiohttp must be installed** in `auto_api/.venv` for HTTP signal server on :8989. Install: `cd auto_api && .venv\Scripts\python -m pip install aiohttp`
+- **aiohttp must be installed** in the project's `.venv` for HTTP signal server on :8989.
 - **2captcha balance** — currently zero. Solver race falls back to capsolver/capmonster/anticaptcha.
 - **is_alive false negative** — `probe_session()` in `session_store.py` returns "dead" post-warmup if portal body no longer contains "Questionario"/"logout". Mitigated by 300s poll interval. Cannot fix without unfreezing session_store.py.
 - **--account-offset** — applies to test_accounts.csv (scouts) only. Accounts 0-31 used in previous runs.

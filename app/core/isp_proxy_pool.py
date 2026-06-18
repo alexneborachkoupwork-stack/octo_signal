@@ -53,12 +53,17 @@ class IspFirstRequester:
     Per-worker proxy requester: stick to one ISP proxy for ISP_STICK login attempts,
     then rotate to the next ISP proxy. Falls back to soax_advance() when ISP pool
     is exhausted. One instance per real worker — not shared.
+
+    soax_pool: optional PersistentProxyPool reference used by report_failure() to
+    cool SOAX credentials when the failure belongs to the SOAX pool, not the ISP pool.
     """
     ISP_STICK = 3  # login attempts before rotating to next ISP proxy
 
-    def __init__(self, isp_pool: IspProxyPool, soax_advance: Callable[[], str]):
-        self._isp_pool = isp_pool
+    def __init__(self, isp_pool: IspProxyPool, soax_advance: Callable[[], str],
+                 soax_pool=None):
+        self._isp_pool     = isp_pool
         self._soax_advance = soax_advance
+        self._soax_pool    = soax_pool
         self._current_isp: str | None = None
         self._tries = 0
 
@@ -88,3 +93,15 @@ class IspFirstRequester:
         """Call when the current ISP proxy has hard-failed — rotate immediately."""
         self._current_isp = None
         self._tries = 0
+
+    def report_failure(self, proxy: str) -> None:
+        """
+        Route a connectivity failure to the correct pool.
+        If the failing proxy is the current ISP proxy, rotate it immediately.
+        Otherwise it belongs to the SOAX pool — cool it there if available.
+        Called by worker.py's exception path when _is_proxy_fault() is True.
+        """
+        if self._current_isp and proxy == self._current_isp:
+            self.mark_failed()
+        elif self._soax_pool is not None:
+            self._soax_pool.report_failure(proxy)

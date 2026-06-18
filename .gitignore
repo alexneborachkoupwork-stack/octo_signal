@@ -14,7 +14,9 @@ check_*.py
 extension/config.json
 /manager/node_modules
 /logs
-/auto_api/screenshots
-/auto_api/data
-/auto_api/sessions
-/auto_api/data
+/app/core/screenshots
+/app/core/data
+/app/core/sessions
+/auto_api/.venv
+/app/db/octo.sqlite3
+/app/core/logs

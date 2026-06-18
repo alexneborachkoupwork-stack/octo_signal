@@ -1,5 +1,5 @@
 """
-Parse auto_api/data/paria_new_unique.txt → append new rows to accounts.csv.
+Parse app/core/data/paria_new_unique.txt → append new rows to accounts.csv.
 Skips entries whose traveldoc already exists in the CSV (idempotent).
 
 Usage:

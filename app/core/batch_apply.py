@@ -153,7 +153,7 @@ def _log(account: str, msg: str) -> None:
 # Off by default (screenshots cost ~100-300ms + disk space per call, and a
 # browser isn't always attached). Enable with EVIDENCE_SCREENSHOTS=1 in .env
 # or the environment for verification runs. Uses the same client.screenshot()
-# plumbing already proven at login (auto_api/session.py _take_screenshot).
+# plumbing already proven at login (app/core/session.py _take_screenshot).
 import os as _os
 _EVIDENCE_SCREENSHOTS = _os.environ.get("EVIDENCE_SCREENSHOTS", "") == "1"
 
@@ -453,7 +453,7 @@ async def _run_steps_2_to_6(client, posto_id: str, acct: dict,
         _log(username, f"POST {_formulario_post_url} (browser_form_post, merged payload={list(_merged_payload.keys())})")
         try:
             _form_final_url, _form_html = await loop.run_in_executor(
-                executor, lambda: client.browser_form_post(_formulario_post_url, _merged_payload, timeout=55))
+                executor, lambda: client.browser_form_post(_formulario_post_url, _merged_payload, timeout=100))
             _elapsed(f"Formulario POST done (len={len(_form_html)})")
             _log(username, f"Formulario browser_form_post -> {_form_final_url}  len={len(_form_html)}")
             _form_snip = _form_html[:2000].encode('ascii', 'replace').decode()
@@ -471,7 +471,7 @@ async def _run_steps_2_to_6(client, posto_id: str, acct: dict,
         _log(username, f"POST {_alt_formulario} (browser_form_post alternate variant)")
         try:
             _form_final_url, _form_html = await loop.run_in_executor(
-                executor, lambda: client.browser_form_post(_alt_formulario, _merged_payload, timeout=55))
+                executor, lambda: client.browser_form_post(_alt_formulario, _merged_payload, timeout=100))
             _elapsed(f"Formulario POST (no copy) done (len={len(_form_html)})")
             _log(username, f"Formulario browser_form_post (no copy) -> {_form_final_url}  len={len(_form_html)}")
             _form_snip = _form_html[:2000].encode('ascii', 'replace').decode()
@@ -489,7 +489,7 @@ async def _run_steps_2_to_6(client, posto_id: str, acct: dict,
         _log(username, "POST /Formulario (submit_page_form fallback — existing Questionario form)")
         try:
             _form_final_url, _form_html = await loop.run_in_executor(
-                executor, lambda: client.submit_page_form(action_contains="Formulario", timeout=55))
+                executor, lambda: client.submit_page_form(action_contains="Formulario", timeout=100))
             _elapsed(f"Formulario submit_page_form done (len={len(_form_html)})")
             _log(username, f"Formulario submit_page_form -> {_form_final_url}  len={len(_form_html)}")
             _form_snip = _form_html[:2000].encode('ascii', 'replace').decode()
@@ -768,7 +768,7 @@ async def apply_book(acct: dict, posto_id: str, posto_pdf: str,
                         _fp_url, _fp_html = await loop.run_in_executor(
                             executor, lambda: client.browser_form_post(
                                 SLOTS_URL + "?posto_id=" + posto_id,
-                                {"posto_id": posto_id, "captcha": token}, timeout=30))
+                                {"posto_id": posto_id, "captcha": token}, timeout=100))
                         _fp_snip = _fp_html[:300]
                         _fp_blank = _fp_html.strip() in (
                             "", "<html><head></head><body></body></html>",
@@ -978,21 +978,48 @@ async def apply_book(acct: dict, posto_id: str, posto_pdf: str,
         # click, so the live page is unchanged from the "slots" evidence shot above.
 
         # Step 9: SubmeterVistoCriaPDF
-        # NOTE: this still uses primp's client.post() (bare XHR-equivalent), the same
-        # request shape that DataDome was blocking on /slots before the browser_form_post
-        # fix. Untested against a real open slot — if this gets DataDome-blocked the same
-        # way, it needs the identical real-navigation fix applied here.
-        r = await loop.run_in_executor(executor, lambda: client.post(
-            SUBMIT_URL, params={"posto_id": posto_pdf},
-            data={"lang": "ENG", "txtHuman": "", "back": "",
-                  "f_date_c": slot_date, "cmbPeriodo": slot_period},
-            headers={**sess.HEADERS_XHR, "Referer": sched_jsp_url}, timeout=30))
+        # Same DataDome risk /slots had: a bare primp POST (XHR-equivalent) can be blocked
+        # regardless of proxy quality, while a real navigation (form.submit()) is trusted.
+        # Try the real-navigation path first; fall back to primp POST if unavailable/blocked.
+        resp_text = ""
+        _submit_status = 0
+        _submit_method = ""
+        _submit_url_full = SUBMIT_URL + "?posto_id=" + posto_pdf
+        if hasattr(client, "browser_form_post"):
+            try:
+                _sp_url, _sp_html = await loop.run_in_executor(
+                    executor, lambda: client.browser_form_post(
+                        _submit_url_full,
+                        {"lang": "ENG", "txtHuman": "", "back": "",
+                         "f_date_c": slot_date, "cmbPeriodo": slot_period},
+                        timeout=100))
+                _sp_snip = _sp_html[:300]
+                _sp_blank = _sp_html.strip() in ("", "<html><head></head><body></body></html>")
+                if _sp_blank:
+                    _log(username, "SubmeterVisto: browser_form_post landed on blank/chrome-error page — falling back to primp POST")
+                elif "body{margin:0;background:#fff}" in _sp_snip or "datadome" in _sp_snip.lower():
+                    _log(username, "SubmeterVisto: browser_form_post DataDome-blocked — falling back to primp POST")
+                else:
+                    resp_text = _sp_html
+                    _submit_status = 200
+                    _submit_method = "browser_form_post"
+            except Exception as _spe:
+                _log(username, f"SubmeterVisto: browser_form_post failed: {_spe} — falling back to primp POST")
 
-        resp_text = r.text.strip()
-        _log(username, f"SubmeterVisto -> {r.status_code}  body={resp_text[:150]}")
-        # Best-effort only: client.post() is primp, not the browser, so this screenshot
-        # reflects whatever page the browser last navigated to (the slots/Schedule.jsp
-        # page), not the actual submission result. Kept for completeness/debug visibility.
+        if not _submit_method:
+            r = await loop.run_in_executor(executor, lambda: client.post(
+                SUBMIT_URL, params={"posto_id": posto_pdf},
+                data={"lang": "ENG", "txtHuman": "", "back": "",
+                      "f_date_c": slot_date, "cmbPeriodo": slot_period},
+                headers={**sess.HEADERS_XHR, "Referer": sched_jsp_url}, timeout=30))
+            resp_text = r.text.strip()
+            _submit_status = r.status_code
+            _submit_method = "primp"
+
+        _log(username, f"SubmeterVisto -> {_submit_status} via {_submit_method}  body={resp_text[:150]}")
+        # Best-effort only: when via primp, this screenshot reflects whatever page the
+        # browser last navigated to (the slots/Schedule.jsp page), not the submission
+        # result. When via browser_form_post, it IS the actual submission result page.
         await _evidence(client, username, "pdf_submission", executor)
 
         _known_errors = ("indisponivel", "unavailable", "erro", "error", "bd_problm")
@@ -1004,7 +1031,7 @@ async def apply_book(acct: dict, posto_id: str, posto_pdf: str,
             or (len(resp_text) > 100 and not _has_error_kw)
         )
 
-        if r.status_code == 200 and _looks_ok:
+        if _submit_status == 200 and _looks_ok:
             if lease:
                 slot_manager.confirm(lease)
             pdf_saved = False
@@ -1063,7 +1090,7 @@ async def apply_book(acct: dict, posto_id: str, posto_pdf: str,
             return "no_slot"
 
         if lease:
-            slot_manager.release(lease, f"http_{r.status_code}")
+            slot_manager.release(lease, f"http_{_submit_status}")
         _log(username, f"SubmeterVisto unexpected response: {resp_text[:200]}")
         return "error"
 

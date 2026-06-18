@@ -4,18 +4,23 @@ SlotSignalBus — resettable asyncio.Event + HTTP override server.
 Replaces the single-shot event in SlotDetector with a resettable design
 that survives multiple signal rounds (all-no-slot → reset → scouts resume → next round).
 
-HTTP server on :8989 (same contract as SlotDetector._override_server):
-  POST /signal  {}  or  {"date":"YYYY-MM-DD","period_id":"1"}
+The signal carries NO slot data. A scout's (or a human's) only job is to say
+"something is available, go check" — each waking real worker does its own fresh
+/slots POST (with its own fresh CAPTCHA token) inside apply_book() when it wakes,
+since that's the only way to get a non-stale, CAPTCHA-gated answer anyway. Carrying
+slot data through the signal would just be a second, redundant, potentially-stale
+data path alongside the one that already has to exist.
+
+HTTP server on :8989:
+  POST /signal        body ignored — pure wake-up trigger
+  POST /signal/reset
   GET  /status
 """
 
 import asyncio
-import json
 import logging
 
-import engine  # noqa: F401 — triggers __init__.py path setup
-
-log = logging.getLogger("engine.signals")
+log = logging.getLogger("app.core.signals")
 
 
 class SlotSignalBus:
@@ -30,18 +35,16 @@ class SlotSignalBus:
         """Block until the next slot signal (used by real workers)."""
         await self._event.wait()
 
-    def fire(self, slots: list[dict]) -> None:
+    def fire(self) -> None:
         """
-        Called by scout workers when poll_slots_once() returns data.
-        Updates the slot pool and wakes all waiting real workers.
-        Idempotent: if already set, only updates the pool.
+        Called by scout workers when poll_slots_once() finds availability (truthy
+        result) — NOT given the slots themselves, just the fact that some exist.
+        Wakes all waiting real workers. Idempotent: a second fire() while already
+        set is a no-op besides the (suppressed) count.
         """
-        added = self._slot_manager.update_pool(slots)
-        if added > 0:
-            log.info(f"[signal] {added} new slot(s) added to pool")
         if not self._event.is_set():
             self._fired_count += 1
-            log.info(f"[signal] fired (round #{self._fired_count})  pool={self._slot_manager.stats()['pool']}")
+            log.info(f"[signal] fired (round #{self._fired_count})")
         self._event.set()
 
     def reset(self) -> None:
@@ -53,15 +56,13 @@ class SlotSignalBus:
         self._event.clear()
         log.info("[signal] reset — scouts continue, real workers re-enter wait")
 
-    def fire_synthetic(self, date: str | None = None, period_id: str | None = None) -> None:
+    def fire_synthetic(self) -> None:
         """
-        External signal (human via HTTP / Telegram).
-        Optionally injects a specific slot into the pool first.
-        Wakes all warmed real workers regardless of scout state.
+        External signal (human via HTTP / Telegram / a separate app.scout process).
+        Pure wake-up — wakes all warmed real workers regardless of scout state.
+        Each worker fetches its own fresh /slots data when it wakes; this call
+        carries no slot data because there is none to carry.
         """
-        if date and period_id:
-            self._slot_manager.update_pool([{"date": date, "periods": [{"id": period_id}]}])
-            log.info(f"[signal] synthetic slot injected: {date} period {period_id}")
         if not self._event.is_set():
             self._fired_count += 1
             log.info(f"[signal] synthetic signal fired (round #{self._fired_count})")
@@ -76,7 +77,7 @@ class SlotSignalBus:
     async def serve_http(self, port: int = 8989) -> None:
         """
         Tiny aiohttp server on :port.
-        POST /signal  body: {} or {"date":"...","period_id":"..."}
+        POST /signal  body ignored — pure wake-up trigger
         GET  /status  returns JSON stats
         Runs forever until cancelled.
         """
@@ -88,17 +89,10 @@ class SlotSignalBus:
             return
 
         async def handle_signal(request: web.Request) -> web.Response:
-            try:
-                body = await request.json()
-            except Exception:
-                body = {}
-            date      = body.get("date")
-            period_id = body.get("period_id")
-            self.fire_synthetic(date, period_id)
+            self.fire_synthetic()
             return web.json_response({
                 "ok": True,
                 "fired_count": self._fired_count,
-                "pool": self._slot_manager.stats()["pool"],
             })
 
         async def handle_status(request: web.Request) -> web.Response:

@@ -399,7 +399,20 @@ class PlaywrightSession:
             page.wait_for_load_state("networkidle", timeout=15000)
             time.sleep(2)
 
-            content   = page.content()
+            # Same "page is navigating" race as every other page.content() call site
+            # in this file — a 5th occurrence found 2026-06-18, here at the very start
+            # of get_session() before login even begins. Same retry-loop fix applied.
+            content = ""
+            for _ci in range(6):
+                try:
+                    content = page.content() or ""
+                    break
+                except Exception:
+                    time.sleep(1.5)
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=10000)
+                    except Exception:
+                        pass
             challenge = "/ch/bd.js" in content
             raw_cookies = ctx.cookies()
             cookie_dict = {c["name"]: c["value"] for c in raw_cookies}
@@ -1782,7 +1795,7 @@ class PlaywrightSession:
         return result
 
     def unblock_datadome(self, challenge_url: str, capsolver_keys: list,
-                         timeout: int = 90) -> bool:
+                         timeout: int = 180) -> bool:
         """
         Solve a DataDome challenge for an arbitrary endpoint (e.g. /slots) that was
         blocked when called via fetch() (fetch responses never execute their JS, so
@@ -1793,6 +1806,10 @@ class PlaywrightSession:
         original request (browser_fetch/browser_form_post/...) immediately after this
         returns True — the cookie travels with the session for subsequent calls.
         Returns True on success, False if the bypass could not be completed.
+        timeout default is 180s: nav/settle overhead (~43s) plus solve_datadome_capsolver's
+        own internal poll timeout (120s default) can legitimately reach ~163s. A shorter
+        outer timeout would abandon the call while the solver is still polling, and the
+        late result would corrupt the next unrelated call's result-queue read.
         """
         self._cmd_q.put({
             "action":        self._CMD_DATADOME_UNBLOCK,
@@ -1876,9 +1893,16 @@ class PlaywrightSession:
         return result
 
     def browser_form_post(self, url: str, data: dict,
-                          timeout: int = 55) -> tuple[str, str]:
+                          timeout: int = 100) -> tuple[str, str]:
         """Submit a form POST via browser DOM (form.submit()), causing a real page navigation.
-        Syncs primp cookies first. Returns (final_url, html)."""
+        Syncs primp cookies first. Returns (final_url, html).
+        timeout default is 100s, not a guess: the worker-thread side can legitimately take
+        up to ~87s in its worst case (45s expect_navigation + 9s content-retry loop + 13s
+        bd.js settle wait + 20s re-navigate fallback). A shorter outer timeout here doesn't
+        just fail faster — it abandons the call while the worker thread is still running,
+        and the eventual late result lands in the result queue where the NEXT unrelated
+        call's .get() wrongly consumes it, corrupting that call's state. Always keep this
+        margin above the real worst-case duration of the underlying _CMD_FORM_POST handler."""
         self._cmd_q.put({"action": self._CMD_FORM_POST, "url": url, "data": data})
         try:
             result = self._res_q.get(timeout=timeout)
@@ -1891,9 +1915,10 @@ class PlaywrightSession:
             raise RuntimeError(f"browser_form_post timed out after {timeout}s")
 
     def submit_page_form(self, action_contains: str = "Formulario",
-                         timeout: int = 55) -> tuple[str, str]:
+                         timeout: int = 100) -> tuple[str, str]:
         """Submit the existing on-page form (populated by questionnaire XHR steps).
-        Does NOT inject a new form. Returns (final_url, html)."""
+        Does NOT inject a new form. Returns (final_url, html).
+        See browser_form_post's timeout docstring — same outer/inner timeout-margin reasoning."""
         self._cmd_q.put({"action": self._CMD_SUBMIT_PAGE_FORM, "action_contains": action_contains})
         try:
             result = self._res_q.get(timeout=timeout)

@@ -1,33 +1,42 @@
 """
-Manager — creates and supervises Worker coroutines for one booking event run.
+Booking Event Service — creates and supervises real-account Worker coroutines for
+one booking event run. Booking-only: no scouting, no slot polling responsibility.
+Slot detection lives entirely in the separate, standalone `app.scout` service —
+this process only warms real workers, keeps sessions alive, and applies the
+moment a signal arrives on its HTTP /signal endpoint (fired either manually, or
+by a separately-running `app.scout --notify-url http://<this-host>:<signal-port>/signal`).
 
 Responsibilities:
-  - Load accounts (scouts from test CSV, real from mode-specific CSV)
-  - Create one Worker per account, assign role and shared resources
+  - Load real accounts from the mode-specific CSV
+  - Create one Worker(role="real") per account
   - Dispatch proxies on demand (each worker calls provide_proxy())
   - Start all workers + HTTP signal server + lifecycle monitor concurrently
-  - Count no_slot reports: when all real workers exhaust retries → reset signal bus
+  - Count no_slot reports: when all workers exhaust retries → reset signal bus
   - Kill workers that exceed max_lifetime (graceful stop, then hard cancel)
   - Print live status table every MONITOR_INTERVAL seconds
 
 CLI:
-  uv run python -m engine.manager \\
+  uv run python -m app.cli \\
       --posto 5086 \\
-      --scouts 3 \\
       --mode test \\
       --max-lifetime 43200 \\
       --login-concurrency 50 \\
       --apply-concurrency 30
 
 Mode:
-  test — real workers from data/test_accounts.csv, scouts also from test CSV (different rows)
-  real — real workers from data/accounts.csv, scouts always from data/test_accounts.csv
+  test — real workers from data/test_accounts.csv
+  real — real workers from data/accounts.csv
+
+Pair with the scout service (separate process), pointed at the same target and
+at this process's /signal endpoint:
+  python -m app.scout --mode test --posto 5086 --notify-url http://localhost:8989/signal
 """
 
 import argparse
 import asyncio
 import json
 import logging
+import os
 import re
 import sys
 import threading
@@ -36,30 +45,29 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
-import engine  # noqa: F401 — triggers __init__.py sys.path setup
+import app  # noqa: F401 — triggers __init__.py sys.path setup (adds app/core to sys.path)
 
-from engine.signals import SlotSignalBus
-from engine.worker  import Worker
+from app.core.signals import SlotSignalBus
+from app.worker        import Worker
 
-log = logging.getLogger("engine.manager")
+log = logging.getLogger("app.cli")
 
 MONITOR_INTERVAL = 30   # seconds between lifecycle checks
 STOP_GRACE_SECS  = 60   # seconds before hard cancel after graceful stop request
 
 _ROOT           = Path(__file__).parent.parent
-_AUTO_API       = _ROOT / "auto_api"
-_REAL_ACCT_FILE = _AUTO_API / "data" / "accounts.csv"
-_TEST_ACCT_FILE = _AUTO_API / "data" / "test_accounts.csv"
-_SOAX_PROXY_FILE = _AUTO_API / "data" / "proxies_soax.txt"
-_ISP_PROXY_FILE  = _AUTO_API / "data" / "proxies_isp.txt"
-_LOG_DIR        = _AUTO_API / "data" / "logs"
+_CORE_DIR       = _ROOT / "app" / "core"
+_REAL_ACCT_FILE = _CORE_DIR / "data" / "accounts.csv"
+_TEST_ACCT_FILE = _CORE_DIR / "data" / "test_accounts.csv"
+_SOAX_PROXY_FILE = _CORE_DIR / "data" / "proxies_soax.txt"
+_ISP_PROXY_FILE  = _CORE_DIR / "data" / "proxies_isp.txt"
+_LOG_DIR        = _CORE_DIR / "data" / "logs"
 
 
 class Manager:
     def __init__(
         self,
         real_accounts:      list[dict],
-        scout_accounts:     list[dict],
         proxy_pool,
         slot_manager,
         posto_id:           str,
@@ -75,9 +83,10 @@ class Manager:
         executor_threads:   int   = 120,
         signal_port:        int   = 8989,
         log_file:           Path  | None = None,
+        acct_file:          Path  | None = None,
     ):
         self._real_accounts    = real_accounts
-        self._scout_accounts   = scout_accounts
+        self._acct_file        = acct_file
         self._proxy_pool       = proxy_pool
         self._isp_pool         = isp_pool
         self._slot_manager     = slot_manager
@@ -89,13 +98,16 @@ class Manager:
         self.max_slot_retries  = max_slot_retries
         self.event_time        = event_time
         self._signal_port      = signal_port
-        self._log_file         = log_file
 
         self._executor  = ThreadPoolExecutor(max_workers=executor_threads,
                                              thread_name_prefix="eng-worker")
+        # Open the JSONL event log once so every _log_event() call is a simple write,
+        # not a repeated open/close cycle (which was the previous behavior).
+        self._log_fh = open(log_file, "a", encoding="utf-8") if log_file else None
         self._login_sem = asyncio.Semaphore(login_concurrency)
         self._apply_sem = asyncio.Semaphore(apply_concurrency)
         self._signal_bus = SlotSignalBus(slot_manager)
+        self._signal_task: asyncio.Task | None = None  # set in run(); serve_http() runs forever, must be cancellable
 
         self._workers:       list[Worker]        = []
         self._workers_by_id: dict[str, Worker]   = {}
@@ -121,6 +133,29 @@ class Manager:
         self._states[worker_id] = new_state
         self._log_event(worker_id, new_state, detail)
 
+        if new_state == "failed" and self._acct_file:
+            reason = detail.get("reason", "")
+            if reason == "login_hard_exhausted":
+                # Hard failure = explicit server-side account rejection (wrong credentials,
+                # account suspended, etc.) — mark login_failed so future runs skip this account.
+                # Soft/unknown/global exhaustion is proxy attrition, NOT account failure;
+                # those reasons leave the account as "verified" so it's retried next run
+                # with a healthier proxy pool.
+                try:
+                    from account_pool import AccountPool
+                    AccountPool(self._acct_file).mark_login_failed(
+                        worker_id,
+                        notes=f"hard_exhausted at {datetime.now().isoformat(timespec='seconds')}",
+                    )
+                except Exception as _ue:
+                    log.warning(f"[manager] could not persist login_failed for {worker_id}: {_ue}")
+            elif reason in ("login_soft_exhausted", "login_unknown_exhausted",
+                            "login_global_exhausted"):
+                # Proxy attrition — account is fine, just log so the operator can see
+                # the pattern without needing to diff the CSV.
+                log.warning(
+                    f"[manager] {worker_id} login retired ({reason}) — account stays verified")
+
         if new_state == "no_slot_exhausted":
             self._no_slot_round.add(worker_id)
             active = self._active_real_count()
@@ -135,7 +170,9 @@ class Manager:
                 self._signal_bus.reset()
 
     def _active_real_count(self) -> int:
-        # Count ALL non-terminal real workers, including those still in login/warmup.
+        # Count ALL non-terminal workers, including those still in login/warmup.
+        # (Service B only ever has role="real" workers — scouting lives entirely in
+        # the separate app.scout service — so no role filter is needed here.)
         #
         # Why: signal_bus.wait() returns immediately when the event is already set, so
         # workers that finish warmup AFTER a signal fires go directly into apply — they
@@ -149,25 +186,25 @@ class Manager:
         terminal = {"done", "failed", "expired", "stopped", "blocked", "crashed"}
         return sum(
             1 for w in self._workers
-            if w.role == "real"
-            and self._states.get(w.worker_id) not in terminal
+            if self._states.get(w.worker_id) not in terminal
             and w.worker_id in self._tasks
             and not self._tasks[w.worker_id].done()
         )
 
     def _log_event(self, worker_id: str, state: str, detail: dict) -> None:
+        if self._log_fh is None:
+            return
         entry = {"ts": time.time(), "worker": worker_id, "state": state, **detail}
-        if self._log_file:
-            try:
-                with open(self._log_file, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(entry) + "\n")
-            except Exception:
-                pass
+        try:
+            self._log_fh.write(json.dumps(entry) + "\n")
+            self._log_fh.flush()
+        except Exception:
+            pass
 
     # ── Worker creation ────────────────────────────────────────────────────────
 
     def _create_workers(self) -> None:
-        from engine.isp_proxy_pool import IspFirstRequester
+        from app.core.isp_proxy_pool import IspFirstRequester
 
         def _soax_advance() -> str:
             return self._proxy_pool.advance_unique(self._event_ips, self._event_ip_lock)
@@ -188,21 +225,11 @@ class Manager:
             apply_sem       = self._apply_sem,
             proxy_pool      = self._proxy_pool,
         )
-        for acct in self._scout_accounts:
-            # ISP-first for scouts too, SOAX fallback
-            if self._isp_pool is not None:
-                req = IspFirstRequester(self._isp_pool, _soax_advance)
-            else:
-                req = _soax_advance
-            w = Worker(account=acct, role="scout", proxy_requester=req, **common)
-            self._workers.append(w)
-            self._workers_by_id[w.worker_id] = w
-            self._states[w.worker_id] = "idle"
-
         for acct in self._real_accounts:
             # ISP-first, SOAX fallback. One requester per worker (not shared).
             if self._isp_pool is not None:
-                req = IspFirstRequester(self._isp_pool, _soax_advance)
+                req = IspFirstRequester(self._isp_pool, _soax_advance,
+                                        soax_pool=self._proxy_pool)
             else:
                 req = _soax_advance
             w = Worker(account=acct, role="real", proxy_requester=req, **common)
@@ -214,24 +241,45 @@ class Manager:
 
     async def run(self) -> None:
         self._create_workers()
-        n_scouts = len(self._scout_accounts)
-        n_real   = len(self._real_accounts)
+        n_real = len(self._real_accounts)
         log.info(
-            f"[manager] starting: {n_real} real workers, {n_scouts} scouts, "
+            f"[manager] starting: {n_real} real workers, "
             f"posto={self.posto_id}  nationality={self.nationality}  residence={self.residence}"
         )
+        # Prune stale session files; pass active usernames so only known accounts are kept.
+        import session_store as _ss
+        active = {w.username for w in self._workers}
+        _ss.cleanup_stale(max_age_days=7, active_usernames=active)
 
         for worker in self._workers:
             task = asyncio.create_task(
                 worker.run(), name=f"worker-{worker.worker_id}")
             self._tasks[worker.worker_id] = task
 
-        await asyncio.gather(
-            self._signal_bus.serve_http(self._signal_port),
-            self._lifecycle_monitor(),
-            *self._tasks.values(),
-            return_exceptions=True,
-        )
+        # serve_http() runs forever (while True: sleep(3600)) by design — it must be
+        # its own cancellable task, not a bare coroutine in gather(), otherwise the
+        # gather below never completes even after every worker finishes and
+        # _lifecycle_monitor() returns. (Found 2026-06-18: "[manager] all real workers
+        # finished — exiting" was printing correctly, but the process never actually
+        # exited on its own — every prior test run was being manually killed
+        # afterward, masking this.) _lifecycle_monitor cancels this task itself once
+        # all workers are terminal.
+        self._signal_task = asyncio.create_task(
+            self._signal_bus.serve_http(self._signal_port), name="signal-http")
+
+        try:
+            await asyncio.gather(
+                self._signal_task,
+                self._lifecycle_monitor(),
+                *self._tasks.values(),
+                return_exceptions=True,
+            )
+        finally:
+            if self._log_fh is not None:
+                try:
+                    self._log_fh.close()
+                except Exception:
+                    pass
         log.info("[manager] all coroutines finished")
         self._print_status_table(final=True)
 
@@ -279,18 +327,16 @@ class Manager:
 
             self._print_status_table()
 
-            # Stop scouts when all real workers are in terminal states
+            # Exit once all real workers are in terminal states
             all_real_done = all(
                 self._states.get(w.worker_id) in ("done", "failed", "expired", "stopped", "blocked", "crashed")
                 or self._tasks[w.worker_id].done()
-                for w in self._workers if w.role == "real"
+                for w in self._workers
             )
             if all_real_done and self._real_accounts:
-                log.info("[manager] all real workers finished — stopping scouts and exiting")
-                for w in self._workers:
-                    if w.role == "scout" and not self._tasks[w.worker_id].done():
-                        w._stop_event.set()
-                return  # exit monitor; gather() will complete naturally
+                log.info("[manager] all real workers finished — exiting")
+                self._signal_task.cancel()  # serve_http() never returns on its own — see run()
+                return
 
     # ── Status table ──────────────────────────────────────────────────────────
 
@@ -328,11 +374,22 @@ def _load_dotenv(env_file: Path) -> dict[str, str]:
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, _, v = line.partition("=")
-        env[k.strip()] = v.strip()
+        k, v = k.strip(), v.strip()
+        env[k] = v
+        # Also push into os.environ (a real env var, if already set, wins) so
+        # modules that check os.environ.get(...) directly — e.g. batch_apply.py's
+        # EVIDENCE_SCREENSHOTS flag — actually see values set only in .env, not
+        # just the args/solver_keys this dict feeds explicitly.
+        os.environ.setdefault(k, v)
     return env
 
 
-def _load_accounts(csv_file: Path, statuses: tuple[str, ...] = ("verified", "active", "login_failed")) -> list[dict]:
+def _load_accounts(csv_file: Path, statuses: tuple[str, ...] = ("verified", "active")) -> list[dict]:
+    # "login_failed" deliberately excluded by default — Manager._on_worker_status persists
+    # that status on login-exhaustion specifically so these accounts stop being silently
+    # re-picked by future runs. Pass statuses=(...,"login_failed") explicitly to retry them
+    # (e.g. after getting a fresh proxy pool, since most exhaustions are proxy-luck, not
+    # account-specific).
     from account_pool import AccountPool
     pool = AccountPool(csv_file)
     return [a for a in pool.all() if a.get("status") in statuses]
@@ -363,7 +420,7 @@ async def _run(args: argparse.Namespace, env: dict, ts: str) -> None:
     _kill_stale_browser_procs()
 
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
-    _PDF_DIR = _AUTO_API / "data" / "pdfs"
+    _PDF_DIR = _CORE_DIR / "data" / "pdfs"
     _PDF_DIR.mkdir(parents=True, exist_ok=True)
 
     log_file = _LOG_DIR / f"manager_{ts}.jsonl"
@@ -383,13 +440,13 @@ async def _run(args: argparse.Namespace, env: dict, ts: str) -> None:
         sys.exit(1)
 
     # Proxy pools
-    _proxy_file = _AUTO_API / "data" / args.proxy_file if args.proxy_file else _SOAX_PROXY_FILE
-    log.info(f"[proxy] pool file: {_proxy_file.name}")
-    proxy_pool = PersistentProxyPool(_proxy_file)
+    _proxy_file = _CORE_DIR / "data" / args.proxy_file if args.proxy_file else _SOAX_PROXY_FILE
+    log.info(f"[proxy] pool file: {_proxy_file.name}" + (f"  offset={args.proxy_offset}" if args.proxy_offset else ""))
+    proxy_pool = PersistentProxyPool(_proxy_file, proxy_offset=args.proxy_offset)
 
     isp_pool = None
     if _ISP_PROXY_FILE.exists() and not args.no_isp:
-        from engine.isp_proxy_pool import IspProxyPool
+        from app.core.isp_proxy_pool import IspProxyPool
         isp_pool = IspProxyPool(str(_ISP_PROXY_FILE))
         log.info(f"[proxy] ISP pool loaded: {isp_pool.size_available}/{isp_pool.size_total} proxies")
     elif args.no_isp:
@@ -401,26 +458,22 @@ async def _run(args: argparse.Namespace, env: dict, ts: str) -> None:
     slot_manager = SlotManager()
 
     # Load accounts
-    scout_accounts_pool = _load_accounts(_TEST_ACCT_FILE)
-    if args.account_offset:
-        scout_accounts_pool = scout_accounts_pool[args.account_offset:]
-    if not scout_accounts_pool:
-        log.error(f"No verified/active accounts in {_TEST_ACCT_FILE} for scouts")
-        sys.exit(1)
-    scout_accounts = scout_accounts_pool[:args.scouts]
-
     if args.mode == "test":
-        # Real workers: remaining rows from test CSV (not used as scouts)
-        scout_usernames = {a["username"] for a in scout_accounts}
-        real_accounts = [
-            a for a in scout_accounts_pool
-            if a["username"] not in scout_usernames
-        ]
+        acct_file = _TEST_ACCT_FILE
+        real_accounts = _load_accounts(acct_file)
+        if not real_accounts:
+            log.error(f"No verified/active accounts in {acct_file}")
+            sys.exit(1)
+        if args.account_offset:
+            real_accounts = real_accounts[args.account_offset:]
         nationality = env.get("TEST_NATIONALITY", "CPV")
         residence   = env.get("TEST_RESIDENCE",   nationality)
         posto_id    = args.posto or env.get("TEST_POSTO_ID", "5086")
     else:
-        real_accounts = list(reversed(_load_accounts(_REAL_ACCT_FILE)))
+        acct_file = _REAL_ACCT_FILE
+        real_accounts = list(reversed(_load_accounts(acct_file)))
+        if args.account_offset:
+            real_accounts = real_accounts[args.account_offset:]
         nationality   = args.nationality or env.get("NATIONALITY", "CPV")
         residence     = args.residence   or env.get("RESIDENCE",   nationality)
         posto_id      = args.posto or env.get("POSTO_ID", "5086")
@@ -429,17 +482,15 @@ async def _run(args: argparse.Namespace, env: dict, ts: str) -> None:
         real_accounts = real_accounts[:args.count]
 
     log.info(
-        f"[manager] mode={args.mode}  scouts={len(scout_accounts)}  "
-        f"real={len(real_accounts)}  posto={posto_id}  "
+        f"[manager] mode={args.mode}  real={len(real_accounts)}  posto={posto_id}  "
         f"nationality={nationality}  residence={residence}"
     )
-    if not real_accounts and args.scouts == 0:
+    if not real_accounts:
         log.error("No accounts to run — check CSV files")
         sys.exit(1)
 
     manager = Manager(
         real_accounts     = real_accounts,
-        scout_accounts    = scout_accounts,
         proxy_pool        = proxy_pool,
         isp_pool          = isp_pool,
         slot_manager      = slot_manager,
@@ -455,6 +506,7 @@ async def _run(args: argparse.Namespace, env: dict, ts: str) -> None:
         executor_threads  = args.executor_threads,
         signal_port       = args.signal_port,
         log_file          = log_file,
+        acct_file         = acct_file,
     )
     await manager.run()
 
@@ -464,13 +516,7 @@ def main() -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)-5s %(name)s  %(message)s",
-        datefmt="%H:%M:%S",
-    )
-
-    env = _load_dotenv(_AUTO_API / ".env")
+    env = _load_dotenv(_CORE_DIR / ".env")
 
     parser = argparse.ArgumentParser(
         description="Engine manager — login workers, keep sessions alive, apply when slots appear")
@@ -483,8 +529,6 @@ def main() -> None:
                         help="ISO nationality code (real mode, overrides .env NATIONALITY)")
     parser.add_argument("--residence",          default="",
                         help="Country of residence ISO code (real mode, overrides .env RESIDENCE)")
-    parser.add_argument("--scouts",             type=int, default=3,
-                        help="Number of scout workers (fake accounts, from test_accounts.csv)")
     parser.add_argument("--count",              type=int, default=0,
                         help="Max real worker accounts (0 = all available)")
     parser.add_argument("--account-offset",    type=int, default=0, dest="account_offset",
@@ -505,10 +549,24 @@ def main() -> None:
                         help="Skip ISP proxy pool even if proxies_isp.txt exists; use SOAX only")
     parser.add_argument("--proxy-file",          type=str, default=None, dest="proxy_file",
                         help="Override SOAX proxy file (e.g. proxies_webshare.txt)")
+    parser.add_argument("--proxy-offset",        type=int, default=0, dest="proxy_offset",
+                        help="Start the proxy cursor at this index — use to manually partition a "
+                             "proxy file between this process and a concurrently-running app.scout "
+                             "(or another app.cli) pointed at the SAME file, since two processes "
+                             "do not coordinate cursors in real time (see proxy_pool.py docstring)")
 
     args = parser.parse_args()
 
     # --- Per-run log file (stdout + stderr + logging, all in one place) ----------
+    # IMPORTANT: exactly ONE file handle for the whole run. An earlier version opened
+    # a second, independent handle via logging.FileHandler(_run_log_path) pointed at
+    # the SAME path as this Tee's handle — two concurrent handles to one file on
+    # Windows caused most logging-module records (login attempt warnings, etc.) to
+    # silently vanish from the file while print()-based [session]/[solver] lines
+    # still came through fine via the Tee. Fix: logging.basicConfig() is called
+    # AFTER sys.stderr is swapped to the Tee, so its StreamHandler binds to the Tee
+    # object directly — logging records flow through the exact same single file
+    # handle as everything else, no second handle involved.
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
     _run_log_path = _LOG_DIR / f"run_{args.mode}_{ts}.log"
@@ -531,11 +589,12 @@ def main() -> None:
     sys.stdout = _Tee(sys.stdout, _log_fh)
     sys.stderr = _Tee(sys.stderr, _log_fh)
 
-    # Also send logging records to the same file.
-    _file_handler = logging.FileHandler(_run_log_path, encoding="utf-8")
-    _file_handler.setFormatter(logging.Formatter(
-        "%(asctime)s %(levelname)-5s %(name)s  %(message)s", datefmt="%H:%M:%S"))
-    logging.getLogger().addHandler(_file_handler)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-5s %(name)s  %(message)s",
+        datefmt="%H:%M:%S",
+        force=True,  # discard any handler a prior basicConfig/import may have installed
+    )
 
     log.info(f"[manager] run log: {_run_log_path}")
     # ---------------------------------------------------------------------------

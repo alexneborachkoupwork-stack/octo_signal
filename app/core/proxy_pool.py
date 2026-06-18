@@ -19,11 +19,19 @@ import json
 import re
 import random as _random
 import threading
+import time
 from pathlib import Path
 
 # How often to flush the in-memory cursor to disk.
 # Crash can replay at most this many proxy slots (acceptable trade-off for speed).
 CURSOR_FLUSH_EVERY = 50
+
+# Seconds a proxy credential is skipped after a connectivity failure is reported.
+# Workers call report_failure(proxy) on ERR_TUNNEL / connection-level faults only
+# (not on CAPTCHA failures or server-side rejections where the proxy itself was fine).
+# 3 minutes is long enough to clear transient routing issues but short enough that
+# a proxy with intermittent connectivity can re-enter the pool within one run.
+PROXY_COOLDOWN_SECS = 180
 
 # IP-check endpoints, cycled round-robin to avoid rate-limiting any single one.
 _IP_CHECK_URLS = [
@@ -296,17 +304,42 @@ class PersistentProxyPool:
     Reset:
       pool.reset()                 — clears used_ips + resets cursor to 0
       pool.reset(keep_cursor=True) — clears used_ips only
+
+    Multi-PROCESS warning: the cursor coordination above (threading.Lock + periodic
+    disk flush) only guarantees no collision between threads in ONE process. Two
+    separate processes (e.g. app.cli + app.scout run side by side against the same
+    proxy_file) each keep a private in-memory cursor that's only synced to disk
+    every CURSOR_FLUSH_EVERY calls or at clean exit — between flushes, neither
+    process can see the other's allocations, so both can independently hand out
+    the SAME proxy slot to different workers. Confirmed in production 2026-06-18:
+    8 proxy slots used by both a concurrent app.cli and app.scout run, both having
+    started from the same persisted cursor=0. Use proxy_offset to manually
+    partition the pool between simultaneously-running processes (e.g. Service B
+    gets offset=0, Service A gets offset=len(proxies)//2) — this is the practical
+    fix; true cross-process coordination would need a DB-backed cursor with row
+    locking (the kind of thing Phase B's proxy_dispatcher was meant to eventually
+    provide), out of scope for this single-file pool.
     """
 
-    def __init__(self, proxy_file: str | Path, state_file: str | Path | None = None):
+    def __init__(self, proxy_file: str | Path, state_file: str | Path | None = None,
+                 proxy_offset: int = 0):
         self._file       = Path(proxy_file)
         self._state_file = Path(state_file) if state_file else self._file.with_suffix(_STATE_SUFFIX)
         self._proxies: list[str] = []
         self._lock        = threading.Lock()
         self._state: dict = {}
         self._mem_cursor  = 0   # in-memory; flushed periodically
+        # In-memory cooldown table: proxy_url → unix expiry time.
+        # Reset on process restart (intentional — transient conditions clear overnight).
+        # Guarded by self._lock. Only workers report failures here — never set externally.
+        self._cooldown: dict[str, float] = {}
         self._load_proxies()
         self._load_state()
+        if proxy_offset:
+            # Jump forward, never backward — if the persisted cursor is already
+            # past this offset (e.g. a long-running process flushed further along),
+            # respect that instead of rewinding into already-used proxies.
+            self._mem_cursor = max(self._mem_cursor, proxy_offset)
         atexit.register(self._flush_cursor)
         print(f"[proxy] PersistentProxyPool: {len(self._proxies)} proxies  "
               f"cursor={self._mem_cursor}  used_ips={self.used_count}  "
@@ -316,33 +349,48 @@ class PersistentProxyPool:
 
     def advance(self) -> str:
         """
-        Return the next proxy (thread-safe). Cursor is kept in memory and flushed
-        to disk every CURSOR_FLUSH_EVERY calls — no disk write on every advance.
-        Two concurrent callers always get different proxies.
+        Return the next proxy (thread-safe), skipping any in cooldown.
+        Cursor is kept in memory and flushed to disk every CURSOR_FLUSH_EVERY calls.
+        Two concurrent callers always get different proxy slots (including skipped ones
+        whose cursor positions are consumed even though the proxy is cooled).
+        If every proxy in the pool is cooling, returns the next one anyway and logs a warning.
         """
         with self._lock:
             if not self._proxies:
                 raise RuntimeError(f"Proxy pool is empty (file: {self._file})")
-            idx = self._mem_cursor % len(self._proxies)
-            proxy = self._proxies[idx]
-            self._mem_cursor += 1
-            if self._mem_cursor % CURSOR_FLUSH_EVERY == 0:
-                self._state["cursor"] = self._mem_cursor
-                self._save_state()
+            now = time.time()
+            n   = len(self._proxies)
+            for _ in range(n):
+                idx   = self._mem_cursor % n
+                proxy = self._proxies[idx]
+                self._mem_cursor += 1
+                if self._mem_cursor % CURSOR_FLUSH_EVERY == 0:
+                    self._state["cursor"] = self._mem_cursor
+                    self._save_state()
+                exp = self._cooldown.get(proxy, 0.0)
+                if exp == 0.0 or now > exp:
+                    if exp:
+                        del self._cooldown[proxy]  # expired entry — clean up
+                    return proxy
+                # proxy is cooling — skip, advance cursor past it
+            # Every proxy in the pool is cooling — return last candidate anyway
+            print(f"[proxy] WARNING: all {n} proxies in cooldown — returning {_redact(proxy)} anyway")
             return proxy
 
     def advance_unique(self, event_ips: set, lock: threading.Lock,
                        max_skip: int = 30) -> str:
         """
-        Return the next proxy whose exit IP is not already in event_ips.
+        Return the next proxy whose exit IP is not already in event_ips,
+        also skipping any proxy currently in cooldown.
         Fast path: ip_cache lookup only (no HTTP). Unknown proxies are accepted
         optimistically (IP is populated later by cache_ip()).
         Falls back to the next unchecked proxy if all max_skip candidates are
-        cached duplicates — still registers that IP in event_ips so the same
-        proxy is not returned twice.
-        Thread-safe — holds self._lock across the ip_cache read AND the
+        cached duplicates or cooling — still registers that IP in event_ips so
+        the same proxy is not returned twice.
+        Thread-safe — holds self._lock across the ip_cache/cooldown read AND the
         event_ips update to eliminate the TOCTOU window.
         """
+        now = time.time()
         for _ in range(max_skip):
             with self._lock:
                 if not self._proxies:
@@ -353,6 +401,13 @@ class PersistentProxyPool:
                 if self._mem_cursor % CURSOR_FLUSH_EVERY == 0:
                     self._state["cursor"] = self._mem_cursor
                     self._save_state()
+                # Skip proxies in cooldown (clean up expired entries as we go)
+                exp = self._cooldown.get(proxy, 0.0)
+                if exp and now > exp:
+                    del self._cooldown[proxy]
+                    exp = 0.0
+                if exp:
+                    continue  # still cooling — advance cursor past it
                 cached_ip = self._state.get("ip_cache", {}).get(_extract_session_id(proxy))
                 if cached_ip is None:
                     return proxy  # unknown IP — accept optimistically
@@ -362,7 +417,7 @@ class PersistentProxyPool:
                     if cached_ip not in event_ips:
                         event_ips.add(cached_ip)
                         return proxy
-            # known duplicate — try next slot
+            # known duplicate or cooling — try next slot
 
         # All max_skip candidates had cached duplicate IPs. Accept the next
         # proxy unconditionally but still register its IP so it won't be
@@ -452,6 +507,20 @@ class PersistentProxyPool:
             }
             self._save_state()
             return ip
+
+    def report_failure(self, proxy: str) -> None:
+        """
+        Mark a proxy credential as cooling after a connectivity failure.
+        The credential is skipped by advance()/advance_unique() for PROXY_COOLDOWN_SECS.
+        Only call this for proxy/network connectivity faults (ERR_TUNNEL, connection
+        refused, etc.) — NOT for CAPTCHA failures or server-side rejections where
+        the proxy itself was reachable and functional.
+        Cooldown is in-memory only and resets on process restart.
+        """
+        with self._lock:
+            self._cooldown[proxy] = time.time() + PROXY_COOLDOWN_SECS
+        print(f"[proxy] cooling {_redact(proxy)} for {PROXY_COOLDOWN_SECS}s  "
+              f"(active cooldowns: {len(self._cooldown)})")
 
     def burn_today(self, proxy: str, reason: str = "") -> None:
         """Mark a proxy burned for today (server-side block). Auto-cleared at midnight."""

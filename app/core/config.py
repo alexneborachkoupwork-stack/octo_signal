@@ -1,5 +1,5 @@
 """
-Loads config from auto_api/.env, then applies command-line overrides.
+Loads config from app/core/.env, then applies command-line overrides.
 All other scripts import: from config import load
 """
 

@@ -17,7 +17,7 @@ USERNAME = 'erivar3335'
 PASSWORD = 'ljfWlF689cr6!#'
 
 env = {}
-for ef in [Path('.env'), Path('auto_api/.env'), Path('../.env')]:
+for ef in [Path('.env'), Path('app/core/.env'), Path('../.env')]:
     if ef.exists():
         for line in ef.read_text(encoding='utf-8').splitlines():
             line = line.strip()

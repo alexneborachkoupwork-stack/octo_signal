@@ -24,22 +24,114 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-import engine  # noqa: F401 -- triggers __init__.py sys.path setup
+import app  # noqa: F401 -- triggers __init__.py sys.path setup (adds app/core to sys.path)
 
-log = logging.getLogger("engine.worker")
+log = logging.getLogger("app.worker")
 
-LOGIN_MAX_ATTEMPTS   = 15
-CRITICAL_LOGIN_MAX   = 5
-CRITICAL_WINDOW_SECS = 2 * 3600   # < 2 h to event -> use CRITICAL_LOGIN_MAX
+CRITICAL_WINDOW_SECS = 2 * 3600   # < 2 h to event -> tighten limits
+WARMUP_MAX_ATTEMPTS  = 3          # retries for generic (non-session_dead) warmup errors — same session/proxy, no new login cost
 KEEPALIVE_INTERVAL   = 4 * 60     # primp GET Schedule.jsp every 4 min keeps both Vistos_sid and form state alive
 DOWN_RETRY_SECS      = 5 * 60     # extra sleep when portal is "down"
 POLL_INTERVAL        = 300        # seconds between slot polls (scout) -- portal kills session ~90s after /slots POST; 5 min interval keeps re-warm stable
 
+# ── Login failure counters ─────────────────────────────────────────────────────
+# Three independent counters replace the old flat attempt limit.
+# Hard: explicit server-side account rejection → retire + mark login_failed in CSV
+# Soft: proxy/network connectivity fault → pause 60s, retry with fresh proxies (account stays verified)
+# Unknown: unclassified pattern → retire without marking login_failed (need investigation)
+# Global: total safety guard across all types (prevents infinite loops from misclassification)
+HARD_FAIL_LIMIT    = 5    # explicit server rejection → retire permanently
+SOFT_FAIL_LIMIT    = 20   # proxy attrition → pause + retry (reset to 0, hard keeps accumulating)
+SOFT_FAIL_CRITICAL = 5    # soft limit in critical window (< CRITICAL_WINDOW_SECS to event)
+UNKNOWN_FAIL_LIMIT = 10   # unclassified → retire, flag for investigation
+GLOBAL_FAIL_LIMIT  = 100  # total across all types — safety net against misclassification loops
+SOFT_PAUSE_SECS    = 60   # sleep between soft-exhaustion retry rounds (releases login_sem during wait)
+
+# Patterns that identify HARD failures (server-side account rejection, unrecoverable).
+# Matched case-insensitively against the full error/rejection string.
+_HARD_PATTERNS = (
+    "invalid credentials",
+    "account suspended",
+    "account blocked",
+    "account is disabled",
+    "conta suspensa",
+    "conta bloqueada",
+    "senha inválida",
+    "utilizador bloqueado",
+)
+
+# Patterns that identify SOFT failures (proxy/network/infrastructure, recoverable by retry).
+# A proxy connectivity failure should NOT permanently retire the account.
+_SOFT_PATTERNS = (
+    "net::err",              # catches all Playwright ERR_* network codes
+    "err_tunnel",
+    "err_connection",
+    "err_timed_out",
+    "err_name_not_resolved",
+    "err_empty_response",
+    "err_aborted",
+    "unable to retrieve content because the page is navigating",
+    "unblock_datadome timeout",
+    "no token after all attempts",
+    "datadome_challenge_on_post",
+    "login_failed_auth_redirect",
+    "too many attempts",
+    "muitas tentativas",
+    "non-json response",     # DataDome HTML challenge page returned instead of JSON
+    "captcha",
+    "recaptcha",
+    # Note: broad "timeout" removed — "err_timed_out" and "etimedout" below cover
+    # real connectivity timeouts without matching server-side gateway/SSL errors.
+    "connection refused",
+    "connection reset",
+    "econnrefused",
+    "etimedout",
+    "socket hang up",
+    "socket closed",
+    "csrf_missing",          # page.content() race during get_session
+)
+
+# Subset of soft patterns that are specifically proxy connectivity faults.
+# Only these warrant calling proxy_pool.report_failure() to cool that credential.
+_PROXY_FAULT_PATTERNS = (
+    "net::err",
+    "err_tunnel",
+    "err_connection",
+    "err_timed_out",
+    "err_name_not_resolved",
+    "err_empty_response",
+    "err_aborted",
+    "connection refused",
+    "connection reset",
+    "econnrefused",
+    "etimedout",
+    "socket hang up",
+    "socket closed",
+)
+
+
+def _classify_login_failure(msg: str) -> str:
+    """Classify a login failure string as 'hard', 'soft', or 'unknown'."""
+    ml = msg.lower()
+    if any(p in ml for p in _HARD_PATTERNS):
+        return "hard"
+    if any(p in ml for p in _SOFT_PATTERNS):
+        return "soft"
+    return "unknown"
+
+
+def _is_proxy_fault(msg: str) -> bool:
+    """True when the failure is a proxy/network connectivity issue specifically.
+    Used to decide whether to call proxy_pool.report_failure() — CAPTCHA and
+    server-side rejections don't warrant cooling the proxy credential."""
+    ml = msg.lower()
+    return any(p in ml for p in _PROXY_FAULT_PATTERNS)
+
 LOGIN_URL = "https://pedidodevistos.mne.gov.pt/VistosOnline/login"
 
-# PDF output dir relative to auto_api/
-_AUTO_API_DIR = Path(__file__).parent.parent / "auto_api"
-_PDF_DIR      = _AUTO_API_DIR / "data" / "pdfs"
+# PDF output dir relative to app/core/
+_CORE_DIR = Path(__file__).parent / "core"
+_PDF_DIR  = _CORE_DIR / "data" / "pdfs"
 
 
 class Worker:
@@ -79,7 +171,7 @@ class Worker:
         self.max_lifetime     = max_lifetime
         self.max_slot_retries = max_slot_retries
         self.event_time       = event_time
-        self._login_sem       = login_sem or asyncio.Semaphore(LOGIN_MAX_ATTEMPTS)
+        self._login_sem       = login_sem or asyncio.Semaphore(50)
         self._apply_sem       = apply_sem or asyncio.Semaphore(1)
         self._proxy_pool      = proxy_pool
 
@@ -100,16 +192,56 @@ class Worker:
         self._stop_event         = asyncio.Event()
         self._stop_requested_at  = 0.0
 
+        # Login failure counters — persisted across soft-pause retry rounds so
+        # hard failures genuinely accumulate even when the outer loop retries.
+        # soft_fail and global_fail stay local to each _phase_login() call
+        # (soft resets by design; global is a per-round safety guard).
+        self._hard_fail    = 0
+        self._unknown_fail = 0
+
     # -- Entry point -----------------------------------------------------------
 
     async def run(self) -> None:
         try:
             resumed = await self._try_resume()
             if not resumed:
-                async with self._login_sem:
-                    ok = await self._phase_login()
+                ok     = False
+                reason = "unknown"
+                while True:
+                    async with self._login_sem:
+                        ok, reason = await self._phase_login()
+                    if ok:
+                        break
+
+                    # Soft exhaustion in normal window: pause and retry with fresh proxies.
+                    # The semaphore is released during the sleep so other workers can log in.
+                    if (reason == "soft"
+                            and not self._is_critical_window()
+                            and not self._stop_event.is_set()
+                            and not self._past_lifetime()):
+                        self._log(
+                            f"soft proxy exhaustion — pausing {SOFT_PAUSE_SECS}s "
+                            "before retry with fresh proxies", "warning")
+                        await asyncio.sleep(SOFT_PAUSE_SECS)
+                        if self._stop_event.is_set():
+                            self._report("stopped", {"reason": "stop_during_login_pause"})
+                            return
+                        if self._past_lifetime():
+                            self._report("expired", {"reason": "lifetime_during_login_pause"})
+                            return
+                        continue  # re-enter login with fresh proxy batch
+                    break  # any other reason (hard/unknown/global/soft-critical) → terminal
+
                 if not ok:
-                    self._report("failed", {"reason": "login_exhausted"})
+                    _reason_labels = {
+                        "hard":    "login_hard_exhausted",    # → login_failed written to CSV
+                        "soft":    "login_soft_exhausted",    # account stays verified
+                        "unknown": "login_unknown_exhausted", # account stays verified
+                        "global":  "login_global_exhausted",  # account stays verified
+                        "stopped": "stop_requested",
+                    }
+                    self._report("failed", {
+                        "reason": _reason_labels.get(reason, f"login_{reason}_exhausted")})
                     return
                 await self._phase_warmup()
                 if self.state in ("failed", "expired", "stopped"):
@@ -202,26 +334,60 @@ class Worker:
 
     # -- Login -----------------------------------------------------------------
 
-    async def _phase_login(self) -> bool:
+    async def _phase_login(self) -> tuple[bool, str]:
+        """
+        Login loop with hard/soft/unknown failure classification.
+
+        Returns (True, "ok") on success.
+        Returns (False, reason) on exhaustion:
+          "hard"    — explicit server-side account rejection (HARD_FAIL_LIMIT reached)
+          "soft"    — proxy connectivity attrition (SOFT_FAIL_LIMIT reached); account stays verified
+          "unknown" — unclassified failures (UNKNOWN_FAIL_LIMIT reached); account stays verified
+          "global"  — total safety guard (GLOBAL_FAIL_LIMIT reached); account stays verified
+          "stopped" — _stop_event set before exhaustion
+
+        self._hard_fail and self._unknown_fail are instance variables that accumulate across
+        soft-pause retry rounds. soft_fail and global_fail are reset each call (soft resets
+        by design; global is a per-round safety guard, not a cross-round accumulator).
+        """
         import session as sess
         import json as _json
         import session_store
 
         loop = asyncio.get_event_loop()
         self._report("logging_in", {})
-        limit = self._login_limit()
-        cap   = self._solver_keys
+        cap = self._solver_keys
 
-        for attempt in range(limit):
+        soft_fail   = 0
+        global_fail = 0
+        attempt     = 0   # monotonic for log messages
+
+        while True:
+            # Recompute soft_limit each iteration so the critical window tightening
+            # applies the moment event_time crosses the threshold.
+            soft_limit = SOFT_FAIL_CRITICAL if self._is_critical_window() else SOFT_FAIL_LIMIT
+
             if self._stop_event.is_set():
-                return False
+                return False, "stopped"
+            if self._hard_fail    >= HARD_FAIL_LIMIT:
+                self._log(f"hard failure limit reached ({self._hard_fail}) — retiring", "error")
+                return False, "hard"
+            if soft_fail          >= soft_limit:
+                return False, "soft"
+            if self._unknown_fail >= UNKNOWN_FAIL_LIMIT:
+                self._log(f"unknown failure limit reached ({self._unknown_fail}) — retiring", "error")
+                return False, "unknown"
+            if global_fail        >= GLOBAL_FAIL_LIMIT:
+                self._log(f"global failure limit reached ({global_fail}) — retiring", "error")
+                return False, "global"
 
+            attempt += 1
             login_proxy = self._proxy_req()
             s = None
             try:
                 s = await loop.run_in_executor(self._executor, sess.get_session, login_proxy)
 
-                _cap = cap
+                _cap  = cap
                 _user = self.username
                 _pwd  = self.account["password"]
                 result = await loop.run_in_executor(
@@ -237,11 +403,12 @@ class Worker:
                         timeout=300,
                     ),
                 )
-                body  = (result.get("body") or "").strip()
+                body        = (result.get("body") or "").strip()
                 http_status = result.get("status", 0)
                 if not body or body.startswith("<"):
                     desc = f"html len={len(body)}" if body else "empty"
                     raise ValueError(f"login non-JSON response ({desc}) http={http_status}")
+
                 resp  = _json.loads(body)
                 rtype = resp.get("type", "")
 
@@ -251,31 +418,63 @@ class Worker:
                     s = None  # prevent finally from closing the session we're keeping
                     if self.started_at == 0.0:
                         self.started_at = time.time()
-                    self._log(f"login OK (attempt={attempt+1}/{limit})")
+                    self._log(
+                        f"login OK (attempt={attempt}  "
+                        f"hard={self._hard_fail} soft={soft_fail} unknown={self._unknown_fail})")
                     session_store.save(self.username, self.client, self.proxy)
                     if self._proxy_pool is not None:
-                        # Fire-and-forget: resolve and cache exit IP for this proxy.
-                        # Populates ip_cache so advance_unique() can dedup faster next run.
                         self._executor.submit(self._proxy_pool.cache_ip, login_proxy)
-                    self._report("logged_in", {"proxy": login_proxy, "attempt": attempt + 1})
-                    return True
+                    self._report("logged_in", {"proxy": login_proxy, "attempt": attempt})
+                    return True, "ok"
 
-                _desc = resp.get("description") or resp.get("message") or ""
-                self._log(f"login rejected type={rtype!r} desc={_desc!r} (attempt={attempt+1}/{limit})", "warning")
+                # Server responded but rejected — classify from type/description fields
+                _desc    = resp.get("description") or resp.get("message") or ""
+                fail_str = f"type={rtype} desc={_desc}"
+                kind     = _classify_login_failure(fail_str)
+                self._log(
+                    f"login rejected {fail_str!r}  [{kind}]  "
+                    f"(attempt={attempt} hard={self._hard_fail} soft={soft_fail} unk={self._unknown_fail})",
+                    "warning",
+                )
+                if kind == "hard":
+                    self._hard_fail += 1
+                elif kind == "soft":
+                    soft_fail += 1
+                    # JSON rejections mean proxy reached server fine;
+                    # don't penalise the proxy credential for a solver/server issue.
+                else:
+                    self._unknown_fail += 1
+                global_fail += 1
 
             except Exception as e:
-                self._log(f"login attempt {attempt+1}/{limit} failed: {e}", "warning")
+                err_str = str(e)
+                kind    = _classify_login_failure(err_str)
+                self._log(
+                    f"login attempt {attempt} failed [{kind}]: {err_str}  "
+                    f"(hard={self._hard_fail} soft={soft_fail} unk={self._unknown_fail})",
+                    "warning",
+                )
+                if kind == "hard":
+                    self._hard_fail += 1
+                elif kind == "soft":
+                    soft_fail += 1
+                    if _is_proxy_fault(err_str):
+                        # Route failure to whichever pool actually owns this proxy.
+                        # IspFirstRequester exposes report_failure(); plain callables do not.
+                        if hasattr(self._proxy_req, "report_failure"):
+                            self._proxy_req.report_failure(login_proxy)
+                        elif self._proxy_pool is not None:
+                            self._proxy_pool.report_failure(login_proxy)
+                else:
+                    self._unknown_fail += 1
+                global_fail += 1
 
             finally:
-                # Always close the browser unless we kept it (s set to None on success).
                 if s is not None:
                     try:
                         s.close()
                     except Exception:
                         pass
-
-        self._log(f"login failed after {limit} attempts", "error")
-        return False
 
     # -- Warmup ----------------------------------------------------------------
 
@@ -284,19 +483,35 @@ class Worker:
         import session_store
 
         self._report("warming_up", {})
-        cap    = self._solver_keys
-        result = await apply_warmup(
-            self.account, self.posto_id,
-            cap.get("capsolver",   []),
-            cap.get("anticaptcha", []),
-            cap.get("twocaptcha",  []),
-            cap.get("capmonster",  []),
-            self._executor,
-            nationality=self.nationality,
-            residence=self.residence,
-            client=self.client,
-            proxy=self.proxy,
-        )
+        cap = self._solver_keys
+
+        # Retry generic warmup errors (e.g. csrf_missing from a Formulario response
+        # quirk) a couple of times before giving up. We're already logged in at this
+        # point — a warmup retry just re-walks Questionario/Formulario/ScheduleController
+        # on the SAME session/proxy, no new proxy or CAPTCHA-spending login needed, so
+        # it's cheap relative to a full re-login. Previously any non-"session_dead"
+        # failure went straight to "failed" with zero retry — a real gap (a logged-in
+        # worker that already paid the login cost was discarded over one transient
+        # Formulario-response quirk).
+        result = None
+        for _wi in range(WARMUP_MAX_ATTEMPTS):
+            result = await apply_warmup(
+                self.account, self.posto_id,
+                cap.get("capsolver",   []),
+                cap.get("anticaptcha", []),
+                cap.get("twocaptcha",  []),
+                cap.get("capmonster",  []),
+                self._executor,
+                nationality=self.nationality,
+                residence=self.residence,
+                client=self.client,
+                proxy=self.proxy,
+            )
+            if isinstance(result, dict) or result == "session_dead":
+                break
+            if _wi < WARMUP_MAX_ATTEMPTS - 1:
+                self._log(f"warmup attempt {_wi+1}/{WARMUP_MAX_ATTEMPTS} failed: {result} -- retrying", "warning")
+
         if isinstance(result, dict):
             self.posto_pdf = result["posto_pdf"]
             self.nat       = result["nat"]
@@ -344,12 +559,12 @@ class Worker:
 
         self._log("restore: cookie swap failed -- full re-login")
         async with self._login_sem:
-            ok = await self._phase_login()
+            ok, reason = await self._phase_login()
         if ok:
             await self._phase_warmup()
             return self.state == "warmed"
 
-        self._log("restore: re-login exhausted", "error")
+        self._log(f"restore: re-login exhausted (reason={reason})", "error")
         return False
 
     # -- Scout: slot polling loop -----------------------------------------------
@@ -380,8 +595,11 @@ class Worker:
                     self._executor,
                 )
                 if slots:
+                    # Only the fact that something is available matters here — not
+                    # the data itself. Each waking real worker fetches its own fresh
+                    # /slots (with its own fresh CAPTCHA token) when it applies.
                     self._log(f"slots found: {len(slots)} date(s) -- signalling")
-                    self._signal_bus.fire(slots)
+                    self._signal_bus.fire()
             except SessionExpired as _se:
                 self._log(f"session expired during polling -- restoring: {_se}", "warning")
                 ok = await self._restore()
@@ -674,13 +892,15 @@ class Worker:
     def _log(self, msg: str, level: str = "info") -> None:
         getattr(log, level)(f"[{self.username}] {msg}")
 
-    def _login_limit(self) -> int:
+    def _is_critical_window(self) -> bool:
+        """True when the booking event is < CRITICAL_WINDOW_SECS away.
+        Tightens the soft-failure limit and disables the soft-pause retry loop
+        so workers don't sleep through the booking window."""
         if self.event_time:
             remaining = self.event_time - time.time()
             if 0 < remaining <= CRITICAL_WINDOW_SECS:
-                self._log(f"critical window ({remaining/3600:.1f}h left) -- login limit={CRITICAL_LOGIN_MAX}")
-                return CRITICAL_LOGIN_MAX
-        return LOGIN_MAX_ATTEMPTS
+                return True
+        return False
 
     def _remaining_lifetime(self) -> float:
         if self.started_at:

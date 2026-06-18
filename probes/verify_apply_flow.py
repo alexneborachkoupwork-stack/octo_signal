@@ -25,14 +25,15 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-# Engine sys.path bootstrap
-import engine  # noqa: F401
+# sys.path bootstrap — requires project root on sys.path (run as `python -m probes.verify_apply_flow`
+# or with the root on PYTHONPATH) so `import app` resolves and adds app/core to sys.path.
+import app  # noqa: F401
 
 _ROOT       = Path(__file__).parent.parent
-_AUTO_API   = _ROOT / "auto_api"
-_SESS_DIR   = _AUTO_API / "sessions"
-_PDF_DIR    = _AUTO_API / "data" / "pdfs"
-_SOAX_FILE  = _AUTO_API / "data" / "proxies_soax.txt"
+_CORE_DIR   = _ROOT / "app" / "core"
+_SESS_DIR   = _CORE_DIR / "sessions"
+_PDF_DIR    = _CORE_DIR / "data" / "pdfs"
+_SOAX_FILE  = _CORE_DIR / "data" / "proxies_soax.txt"
 
 SCHED_JSP   = "https://pedidodevistos.mne.gov.pt/VistosOnline/Schedule.jsp"
 POSTO_TEST  = "2032"

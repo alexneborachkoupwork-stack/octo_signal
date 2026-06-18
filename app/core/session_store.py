@@ -1,7 +1,7 @@
 ﻿"""
 Cookie persistence for logged-in primp sessions.
 
-Saves/loads {cookies, proxy} per account to auto_api/sessions/<username>.json.
+Saves/loads {cookies, proxy} per account to app/core/sessions/<username>.json.
 Critical: Vistos_sid has Path=/VistosOnline/ -- must probe with the full path URL.
 """
 
@@ -128,3 +128,33 @@ def delete(username: str) -> None:
     p = _path(username)
     if p.exists():
         p.unlink()
+
+
+def cleanup_stale(max_age_days: int = 7, active_usernames: set[str] | None = None) -> int:
+    """
+    Remove session files that are either:
+    - older than max_age_days (stale from retired/deleted accounts), or
+    - not in active_usernames if that set is provided (unknown accounts).
+
+    Returns the number of files removed.
+    Called once at service startup to prevent unbounded session-directory growth.
+    """
+    if not _SESSIONS_DIR.exists():
+        return 0
+    cutoff = time.time() - max_age_days * 86400
+    removed = 0
+    for f in _SESSIONS_DIR.glob("*.json"):
+        try:
+            if active_usernames is not None:
+                if f.stem not in active_usernames:
+                    f.unlink()
+                    removed += 1
+                    continue
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+                removed += 1
+        except Exception:
+            pass
+    if removed:
+        print(f"[session_store] cleaned up {removed} stale session file(s)")
+    return removed

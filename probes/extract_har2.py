@@ -1,6 +1,6 @@
 import json, re, base64
 
-har = json.load(open('c:/Users/Administrator/Documents/Maru/octo_connection/auto_api/har/apply.har', encoding='utf-8'))
+har = json.load(open('c:/Users/Administrator/Documents/Maru/octo_connection/app/core/har/apply.har', encoding='utf-8'))
 entries = har.get('log', {}).get('entries', [])
 
 for e in entries:

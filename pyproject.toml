@@ -1,0 +1,8 @@
+[project]
+name = "octo-connection"
+version = "0.1.0"
+description = "E-VISA appointment automation — app package (Phase 0 restructure)"
+requires-python = ">=3.10"
+
+[tool.setuptools]
+packages = ["app"]

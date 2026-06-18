@@ -35,12 +35,26 @@ Status lifecycle:
 
 import csv
 import random as _random
+import threading
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-STATUSES = ("new", "registered", "verified", "active", "applied", "blocked", "failed")
+STATUSES = ("new", "registered", "verified", "active", "applied", "blocked", "failed",
+            "login_failed")
+
+# Per-file write locks prevent concurrent open("w") from two AccountPool instances
+# (e.g. cli.py and batch_apply.py) targeting the same CSV from corrupting it.
+_file_locks: dict[Path, threading.Lock] = {}
+_file_locks_meta = threading.Lock()
+
+
+def _get_file_lock(path: Path) -> threading.Lock:
+    with _file_locks_meta:
+        if path not in _file_locks:
+            _file_locks[path] = threading.Lock()
+        return _file_locks[path]
 
 _FIELDS = (
     "id", "username", "password", "status", "account_type",
@@ -55,9 +69,12 @@ _WEBSHARE_HOST = "p.webshare.io"
 _WEBSHARE_PORT = 80
 
 
-def webshare_proxy(idx: int) -> str:
-    """Return the full HTTP proxy URL for Webshare residential sub-user #{idx}."""
-    return f"http://Mylist1234-DE-ES-FR-IT-US-{idx}:{_WEBSHARE_PASS}@{_WEBSHARE_HOST}:{_WEBSHARE_PORT}"
+def webshare_proxy(idx: int, geo: str = "ID") -> str:
+    """Return the SOCKS5 proxy URL for Webshare sub-user #{idx}.
+    geo: two-letter country suffix embedded in the credential (default 'ID').
+    The actual credential format must match proxies_webshare.txt exactly.
+    """
+    return f"socks5://Mylist1234-{geo}-{idx}:{_WEBSHARE_PASS}@{_WEBSHARE_HOST}:{_WEBSHARE_PORT}"
 
 _DEFAULT_FILE = Path(__file__).parent / "data" / "accounts.csv"
 
@@ -151,6 +168,12 @@ class AccountPool:
         self.update(username, status="failed",
                     **({"notes": notes} if notes else {}))
 
+    def mark_login_failed(self, username: str, notes: str = "") -> None:
+        """Mark account as login_failed — explicit server-side rejection (wrong creds/suspended).
+        Future runs skip these accounts by default; pass statuses=(...,'login_failed') to retry."""
+        self.update(username, status="login_failed",
+                    **({"notes": notes} if notes else {}))
+
     def counts(self) -> dict[str, int]:
         """Return count of accounts per status."""
         result = {s: 0 for s in STATUSES}
@@ -188,10 +211,11 @@ class AccountPool:
         print(f"[accounts] loaded {len(self._accounts)} accounts from {self._file.name}")
 
     def _save(self) -> None:
-        with self._file.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(_FIELDS))
-            writer.writeheader()
-            writer.writerows(self._accounts)
+        with _get_file_lock(self._file):
+            with self._file.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=list(_FIELDS))
+                writer.writeheader()
+                writer.writerows(self._accounts)
 
 
 # ── Module-level convenience ───────────────────────────────────────────────────
