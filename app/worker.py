@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -384,12 +385,33 @@ class Worker:
             attempt += 1
             login_proxy = self._proxy_req()
             s = None
+
+            # Pre-solve CAPTCHA in parallel with browser launch + page navigation.
+            # By the time the browser finishes loading and filling the form (~20-40s),
+            # the token is usually ready — no serial wait.
+            _cap        = cap
+            _user       = self.username
+            _pwd        = self.account["password"]
+            _pre_token: list[str] = [""]   # mutable; pre-solve thread writes here
+
+            def _pre_solve() -> None:
+                import solver as _pre_s
+                try:
+                    _pre_token[0] = _pre_s.race_all(
+                        _cap.get("capsolver", []), _cap.get("anticaptcha", []),
+                        _cap.get("twocaptcha", []), _cap.get("capmonster", []),
+                        "LOGIN_EVISA", proxy=None, min_score=50,
+                    )
+                    self._log(f"pre-solve done  len={len(_pre_token[0])}")
+                except Exception as _pe:
+                    self._log(f"pre-solve failed: {_pe}", "warning")
+
+            threading.Thread(target=_pre_solve, daemon=True,
+                             name=f"presol-{self.username}").start()
+
             try:
                 s = await loop.run_in_executor(self._executor, sess.get_session, login_proxy)
 
-                _cap  = cap
-                _user = self.username
-                _pwd  = self.account["password"]
                 result = await loop.run_in_executor(
                     self._executor,
                     lambda: s.browser_login(
@@ -400,6 +422,7 @@ class Worker:
                         capmonster_keys=_cap.get("capmonster", []),
                         skip_checkbox=True,
                         min_score=50,
+                        pre_token=_pre_token,
                         timeout=300,
                     ),
                 )

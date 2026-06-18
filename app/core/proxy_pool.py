@@ -612,9 +612,11 @@ class PersistentProxyPool:
         self._mem_cursor = self._state.get("cursor", 0)
 
     def _save_state(self) -> None:
+        # Atomic write: temp file + rename so a crash mid-write never corrupts state.
         try:
-            self._state_file.write_text(
-                json.dumps(self._state, indent=2), encoding="utf-8")
+            tmp = self._state_file.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self._state, indent=2), encoding="utf-8")
+            tmp.replace(self._state_file)
         except OSError:
             pass
 

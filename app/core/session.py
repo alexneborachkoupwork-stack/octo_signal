@@ -1034,6 +1034,7 @@ class PlaywrightSession:
         capmonster_keys   = cmd.get("capmonster_keys", [])
         skip_checkbox     = cmd.get("skip_checkbox", False)
         min_score         = cmd.get("min_score", 80)
+        pre_token_holder  = cmd.get("pre_token", [])   # mutable list; worker's pre-solve thread writes here
 
         _proxy_short = (self.proxy or "none")[:60]
         print(f"[session] browser_login: user={username}  proxy={_proxy_short}")
@@ -1192,10 +1193,19 @@ class PlaywrightSession:
                 except Exception:
                     pass
 
-        # External solver - race all available services (ProxyLess).
-        # Audio challenge is intentionally skipped: clicking the audio button and
-        # downloading .mp3 files through the proxy are known bot signals that degrade
-        # the IP's reCAPTCHA trust score. External ProxyLess tokens work without it.
+        # External solver — ProxyLess (solver-cloud IPs have high reCAPTCHA Enterprise trust).
+        # Audio challenge is intentionally skipped: .mp3 download via proxy degrades IP trust.
+        # Pre-solved token (started in worker before browser launch) is used first if ready;
+        # this eliminates the serial solver wait on successful pre-solve hits.
+        if not token and pre_token_holder and pre_token_holder[0]:
+            import solver as _solver
+            _pre_score = _solver.score_token(pre_token_holder[0])
+            if _pre_score >= min_score:
+                token = pre_token_holder[0]
+                print(f"[session] pre-solved token accepted  len={len(token)}  score={_pre_score}")
+            else:
+                print(f"[session] pre-solved token score {_pre_score} < min_score {min_score} — solving fresh")
+
         if not token:
             any_keys = capsolver_keys or anticaptcha_keys or twocaptcha_keys or capmonster_keys
             if any_keys:
@@ -1834,12 +1844,16 @@ class PlaywrightSession:
                       capmonster_keys: list | None = None,
                       timeout: int = 300,
                       skip_checkbox: bool = False,
-                      min_score: int = 80) -> dict:
+                      min_score: int = 80,
+                      pre_token: list | None = None) -> dict:
         """
         Type credentials into the login form to build behavioral signals, click the
         reCAPTCHA checkbox, and submit. Races all solver services (ProxyLess) for token.
         skip_checkbox=True: skip click + 25s poll, go straight to race_all() injection.
-        min_score: minimum reCAPTCHA score to accept (0=any, 80=default, 100=2captcha only).
+        min_score: minimum reCAPTCHA score to accept (0=any).
+        pre_token: mutable list[str] — if [0] is non-empty when the token injection point
+            is reached, it is used directly and the solver race is skipped entirely.
+            Worker pre-solves in parallel with browser launch to eliminate serial wait.
         Returns {"status": int, "body": str}.
         """
         self._cmd_q.put({
@@ -1855,6 +1869,7 @@ class PlaywrightSession:
             "capmonster_keys": capmonster_keys or [],
             "skip_checkbox":   skip_checkbox,
             "min_score":       min_score,
+            "pre_token":       pre_token or [],
         })
         try:
             status, result = self._res_q.get(timeout=timeout)

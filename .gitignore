@@ -20,3 +20,4 @@ extension/config.json
 /auto_api/.venv
 /app/db/octo.sqlite3
 /app/core/logs
+/app/core/data

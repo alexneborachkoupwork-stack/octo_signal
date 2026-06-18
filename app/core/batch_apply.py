@@ -550,6 +550,8 @@ async def _run_steps_2_to_6(client, posto_id: str, acct: dict,
             # ScheduleController was POSTed successfully; navigate Schedule.jsp to read
             # the resulting form state. Failure here does NOT fall back to primp POST.
             sched_jsp_url = SCHED_JSP + "?posto_id=" + posto_id
+            sched_html = ""
+            posto_pdf   = posto_id
             try:
                 _log(username, f"NAV /Schedule.jsp?posto_id={posto_id} (browser page.goto)")
                 await loop.run_in_executor(executor, lambda: client.browser_nav(sched_jsp_url, timeout=40))
@@ -558,7 +560,6 @@ async def _run_steps_2_to_6(client, posto_id: str, acct: dict,
                 _log(username, f"Schedule.jsp browser len={len(sched_html)}")
                 _log(username, f"Schedule.jsp body snippet: {sched_html[:400].encode('ascii', 'replace').decode()}")
                 await _evidence(client, username, "schedule_controller", executor)
-                posto_pdf = posto_id
                 m_pdf = re.search(r"SubmeterVistoCriaPDF\?posto_id=(\d+)", sched_html)
                 if m_pdf:
                     posto_pdf = m_pdf.group(1)
@@ -566,7 +567,15 @@ async def _run_steps_2_to_6(client, posto_id: str, acct: dict,
                         _log(username, f"POSTO_PDF={posto_pdf} (differs from POSTO={posto_id})")
             except Exception as _nav_e:
                 _log(username, f"browser Schedule.jsp nav failed: {_nav_e} — using posto_id as fallback")
-                posto_pdf = posto_id
+            # Guard: ScheduleController POST can return 200 yet the server silently
+            # fails to set up form state, causing Schedule.jsp to redirect to
+            # authenticated_index. Detect by looking for scheduling-page markers.
+            # Absence means ScheduleController was rejected (bad CSRF or bad session
+            # state) — must re-warm rather than returning a false "warmed".
+            _sched_markers = ("getSlots", "captchaDiv", "SubmeterVistoCriaPDF", "f_date_c", "cmbPeriodo")
+            if sched_html and not any(m in sched_html for m in _sched_markers):
+                _log(username, f"Schedule.jsp wrong page (len={len(sched_html)}, no scheduling markers) — likely redirected to auth; raising to trigger re-warm")
+                raise RuntimeError("schedule_jsp_redirect")
             return {"posto_pdf": posto_pdf, "sched_url": sched_jsp_url}
 
     _primp_client = getattr(client, 'client', client)
@@ -630,6 +639,11 @@ async def _run_steps_2_to_6(client, posto_id: str, acct: dict,
         posto_pdf = m_pdf.group(1)
         if posto_pdf != posto_id:
             _log(username, f"POSTO_PDF={posto_pdf} (differs from POSTO={posto_id})")
+
+    _sched_markers = ("getSlots", "captchaDiv", "SubmeterVistoCriaPDF", "f_date_c", "cmbPeriodo")
+    if sched_html and not any(m in sched_html for m in _sched_markers):
+        _log(username, f"Schedule.jsp wrong page (len={len(sched_html)}, no scheduling markers) — likely auth redirect; raising to trigger re-warm")
+        raise RuntimeError("schedule_jsp_redirect")
 
     return {"posto_pdf": posto_pdf, "sched_url": sched_jsp_url}
 
@@ -972,7 +986,10 @@ async def apply_book(acct: dict, posto_id: str, posto_pdf: str,
                 _log(username, f"slot parse error: {e}")
                 return "error"
 
-        _log(username, f"booking slot: date={slot_date} period={slot_period}")
+        # Slots JSON uses YYYY-MM-DD (dashes); SubmeterVistoCriaPDF form expects YYYY/MM/DD (slashes).
+        # HAR confirms: f_date_c=2026%2F07%2F02. Convert before any submission path.
+        slot_date_form = slot_date.replace("-", "/")
+        _log(username, f"booking slot: date={slot_date} period={slot_period}  (form date={slot_date_form})")
         # No distinct visual state to screenshot here yet — slot selection in this
         # headless flow is a value choice (date/period from the JSON), not a calendar
         # click, so the live page is unchanged from the "slots" evidence shot above.
@@ -991,7 +1008,7 @@ async def apply_book(acct: dict, posto_id: str, posto_pdf: str,
                     executor, lambda: client.browser_form_post(
                         _submit_url_full,
                         {"lang": "ENG", "txtHuman": "", "back": "",
-                         "f_date_c": slot_date, "cmbPeriodo": slot_period},
+                         "f_date_c": slot_date_form, "cmbPeriodo": slot_period},
                         timeout=100))
                 _sp_snip = _sp_html[:300]
                 _sp_blank = _sp_html.strip() in ("", "<html><head></head><body></body></html>")
@@ -1010,7 +1027,7 @@ async def apply_book(acct: dict, posto_id: str, posto_pdf: str,
             r = await loop.run_in_executor(executor, lambda: client.post(
                 SUBMIT_URL, params={"posto_id": posto_pdf},
                 data={"lang": "ENG", "txtHuman": "", "back": "",
-                      "f_date_c": slot_date, "cmbPeriodo": slot_period},
+                      "f_date_c": slot_date_form, "cmbPeriodo": slot_period},
                 headers={**sess.HEADERS_XHR, "Referer": sched_jsp_url}, timeout=30))
             resp_text = r.text.strip()
             _submit_status = r.status_code

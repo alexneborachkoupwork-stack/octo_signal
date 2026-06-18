@@ -211,7 +211,8 @@ def start_bridge(socks5_url: str) -> str:
 
     fut = asyncio.run_coroutine_threadsafe(_start(), loop)
     fut.result(timeout=5)
-    srv_ready.wait(timeout=3)
+    if not srv_ready.wait(timeout=3):
+        raise RuntimeError(f"proxy_bridge: server failed to start for {socks5_url}")
 
     with _bridge_lock:
         _bridges[socks5_url] = port

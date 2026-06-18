@@ -2,10 +2,9 @@
 reCAPTCHA Enterprise solver wrapper.
 Supports: CapSolver, Anti-Captcha, 2Captcha, CapMonster.
 
-All Enterprise v2 tasks use ProxyLess task types. Solver-service IPs (CapSolver,
-AntiCaptcha, etc.) have dedicated high-trust Google reputation that produces
-higher reCAPTCHA Enterprise scores than passing our own ISP proxy IPs through
-proxy-aware tasks. Competitor analysis confirmed ProxyLess is the working approach.
+All Enterprise v2 tasks use ProxyLess task types. Solver-service IPs have dedicated
+high-trust Google reputation that produces higher reCAPTCHA Enterprise scores than
+passing proxy IPs through proxy-aware tasks.
 
 solve() rotates through the provided key list on failure.
 """
@@ -37,15 +36,22 @@ def _parse_proxy(proxy_url: str | None) -> dict | None:
     Parse http://user:pass@host:port -> {proxyType, proxyAddress, proxyPort,
     proxyLogin, proxyPassword} for CAPTCHA service APIs.
     Returns None if proxy_url is None/empty.
+    proxyAddress is always an IP — hostname is resolved so AntiCaptcha (which
+    rejects hostnames) can use the same proxy dict as other services.
     """
     if not proxy_url:
         return None
     try:
+        import socket
         from urllib.parse import urlparse
         p = urlparse(proxy_url)
+        try:
+            address = socket.gethostbyname(p.hostname)
+        except Exception:
+            address = p.hostname  # fallback: pass hostname as-is
         return {
             "proxyType":     p.scheme or "http",
-            "proxyAddress":  p.hostname,
+            "proxyAddress":  address,
             "proxyPort":     p.port or 6666,
             "proxyLogin":    p.username or "",
             "proxyPassword": p.password or "",
@@ -184,7 +190,9 @@ def race_all(capsolver_keys: list[str], anticaptcha_keys: list[str],
     for t in threads:
         t.start()
 
-    done.wait(timeout=180)
+    timed_out = not done.wait(timeout=180)
+    if timed_out:
+        print(f"[solver] race_all: WARNING — timed out after 180s  collected={len(results)}/{total}")
 
     if results:
         best_token, best_score = max(results, key=lambda x: x[1])
@@ -206,7 +214,7 @@ def solve(service: str, keys: list[str], action: str = "LOGIN_EVISA",
     Raises RuntimeError if all keys fail.
     """
     proxy_info = _parse_proxy(proxy)
-    print(f"[solver] proxyless mode (solver-service IPs -- higher Enterprise score)")
+    print(f"[solver] mode={'proxy-aware' if proxy_info else 'proxyless'}")
 
     last_err = None
     for i, key in enumerate(keys):

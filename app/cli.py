@@ -59,8 +59,9 @@ _ROOT           = Path(__file__).parent.parent
 _CORE_DIR       = _ROOT / "app" / "core"
 _REAL_ACCT_FILE = _CORE_DIR / "data" / "accounts.csv"
 _TEST_ACCT_FILE = _CORE_DIR / "data" / "test_accounts.csv"
-_SOAX_PROXY_FILE = _CORE_DIR / "data" / "proxies_soax.txt"
-_ISP_PROXY_FILE  = _CORE_DIR / "data" / "proxies_isp.txt"
+_WEBSHARE_PROXY_FILE = _CORE_DIR / "data" / "proxies_webshare.txt"
+_SOAX_PROXY_FILE     = _CORE_DIR / "data" / "proxies_soax.txt"
+_ISP_PROXY_FILE      = _CORE_DIR / "data" / "proxies_isp.txt"
 _LOG_DIR        = _CORE_DIR / "data" / "logs"
 
 
@@ -84,6 +85,7 @@ class Manager:
         signal_port:        int   = 8989,
         log_file:           Path  | None = None,
         acct_file:          Path  | None = None,
+        max_rehab_rounds:   int   = 5,
     ):
         self._real_accounts    = real_accounts
         self._acct_file        = acct_file
@@ -116,6 +118,11 @@ class Manager:
 
         # No-slot fan-out tracking (reset each signal round)
         self._no_slot_round: set[str] = set()
+
+        # Rehabilitation: soft/unknown failed workers are re-queued here and respawned
+        self._rehab_queue:    list[dict]     = []
+        self._rehab_attempts: dict[str, int] = {}
+        self._max_rehab_rounds               = max_rehab_rounds
 
         # Per-booking-event exit IP dedup (in-memory, not persisted)
         self._event_ips:     set[str]        = set()
@@ -151,10 +158,22 @@ class Manager:
                     log.warning(f"[manager] could not persist login_failed for {worker_id}: {_ue}")
             elif reason in ("login_soft_exhausted", "login_unknown_exhausted",
                             "login_global_exhausted"):
-                # Proxy attrition — account is fine, just log so the operator can see
-                # the pattern without needing to diff the CSV.
-                log.warning(
-                    f"[manager] {worker_id} login retired ({reason}) — account stays verified")
+                # Proxy attrition — account is fine. Queue for rehab (fresh proxy next wave).
+                attempts = self._rehab_attempts.get(worker_id, 0)
+                if attempts < self._max_rehab_rounds:
+                    acct = self._account_by_username.get(worker_id)
+                    if acct:
+                        self._rehab_queue.append(acct)
+                        self._rehab_attempts[worker_id] = attempts + 1
+                        log.info(
+                            f"[manager] {worker_id} queued for rehab "
+                            f"(round {attempts + 1}/{self._max_rehab_rounds}, reason={reason})"
+                        )
+                else:
+                    log.warning(
+                        f"[manager] {worker_id} exhausted {self._max_rehab_rounds} rehab "
+                        f"rounds ({reason}) — retiring permanently"
+                    )
 
         if new_state == "no_slot_exhausted":
             self._no_slot_round.add(worker_id)
@@ -204,12 +223,13 @@ class Manager:
     # ── Worker creation ────────────────────────────────────────────────────────
 
     def _create_workers(self) -> None:
-        from app.core.isp_proxy_pool import IspFirstRequester
+        self._account_by_username = {a["username"]: a for a in self._real_accounts}
 
-        def _soax_advance() -> str:
+        def _proxy_req() -> str:
             return self._proxy_pool.advance_unique(self._event_ips, self._event_ip_lock)
+        self._proxy_requester = _proxy_req
 
-        common = dict(
+        self._worker_common = dict(
             signal_bus      = self._signal_bus,
             slot_manager    = self._slot_manager,
             status_cb       = self._on_worker_status,
@@ -226,16 +246,42 @@ class Manager:
             proxy_pool      = self._proxy_pool,
         )
         for acct in self._real_accounts:
-            # ISP-first, SOAX fallback. One requester per worker (not shared).
-            if self._isp_pool is not None:
-                req = IspFirstRequester(self._isp_pool, _soax_advance,
-                                        soax_pool=self._proxy_pool)
-            else:
-                req = _soax_advance
-            w = Worker(account=acct, role="real", proxy_requester=req, **common)
+            # Login proxy = Webshare (the main pool). ISP is not used for login —
+            # static ISP IPs are blocked by DataDome on the login POST.
+            w = Worker(account=acct, role="real", proxy_requester=self._proxy_requester,
+                       **self._worker_common)
             self._workers.append(w)
             self._workers_by_id[w.worker_id] = w
             self._states[w.worker_id] = "idle"
+
+    # ── Rehabilitation ─────────────────────────────────────────────────────────
+
+    def _spawn_rehab_wave(self) -> None:
+        """
+        Respawn workers for accounts that failed due to proxy attrition (soft/unknown
+        exhaustion). Each gets a fresh proxy from the pool. Hard-failed accounts are
+        never queued here — they stay retired.
+        """
+        accounts = list(self._rehab_queue)
+        self._rehab_queue.clear()
+        log.info(f"[manager] rehab wave: respawning {len(accounts)} workers")
+        for acct in accounts:
+            username = acct["username"]
+            round_num = self._rehab_attempts[username]
+            old = self._workers_by_id.get(username)
+            w = Worker(account=acct, role="real",
+                       proxy_requester=self._proxy_requester,
+                       **self._worker_common)
+            # Replace old Worker in-place so the status table stays ordered.
+            if old is not None and old in self._workers:
+                self._workers[self._workers.index(old)] = w
+            else:
+                self._workers.append(w)
+            self._workers_by_id[username] = w
+            self._states[username] = "idle"
+            task = asyncio.create_task(w.run(), name=f"worker-{username}-r{round_num}")
+            self._tasks[username] = task
+            log.info(f"[manager] rehab: {username} respawned (round {round_num})")
 
     # ── Main run ───────────────────────────────────────────────────────────────
 
@@ -334,9 +380,14 @@ class Manager:
                 for w in self._workers
             )
             if all_real_done and self._real_accounts:
-                log.info("[manager] all real workers finished — exiting")
-                self._signal_task.cancel()  # serve_http() never returns on its own — see run()
-                return
+                if self._rehab_queue:
+                    # Some workers failed due to proxy attrition — give them another chance.
+                    self._spawn_rehab_wave()
+                    # Loop continues; _lifecycle_monitor picks up the new tasks naturally.
+                else:
+                    log.info("[manager] all real workers finished — exiting")
+                    self._signal_task.cancel()  # serve_http() never returns on its own — see run()
+                    return
 
     # ── Status table ──────────────────────────────────────────────────────────
 
@@ -440,19 +491,25 @@ async def _run(args: argparse.Namespace, env: dict, ts: str) -> None:
         sys.exit(1)
 
     # Proxy pools
-    _proxy_file = _CORE_DIR / "data" / args.proxy_file if args.proxy_file else _SOAX_PROXY_FILE
+    # Priority: --proxy-file override > Webshare (default) > SOAX fallback.
+    # ISP proxies are intentionally excluded from the login path — static ISP IPs
+    # are consistently blocked by DataDome on the login POST. Webshare rotating
+    # SOCKS5 proxies are the correct first-choice for login.
+    if args.proxy_file:
+        _proxy_file = _CORE_DIR / "data" / args.proxy_file
+    elif _WEBSHARE_PROXY_FILE.exists():
+        _proxy_file = _WEBSHARE_PROXY_FILE
+    else:
+        _proxy_file = _SOAX_PROXY_FILE
     log.info(f"[proxy] pool file: {_proxy_file.name}" + (f"  offset={args.proxy_offset}" if args.proxy_offset else ""))
     proxy_pool = PersistentProxyPool(_proxy_file, proxy_offset=args.proxy_offset)
 
+    # ISP pool: available as slot-keepalive proxies only — never used for login.
     isp_pool = None
     if _ISP_PROXY_FILE.exists() and not args.no_isp:
         from app.core.isp_proxy_pool import IspProxyPool
         isp_pool = IspProxyPool(str(_ISP_PROXY_FILE))
-        log.info(f"[proxy] ISP pool loaded: {isp_pool.size_available}/{isp_pool.size_total} proxies")
-    elif args.no_isp:
-        log.info("[proxy] --no-isp: using SOAX only")
-    else:
-        log.warning(f"[proxy] ISP proxy file not found: {_ISP_PROXY_FILE} — real workers will use SOAX")
+        log.info(f"[proxy] ISP pool loaded: {isp_pool.size_available}/{isp_pool.size_total} proxies (keepalive only — not used for login)")
 
     # Slot manager
     slot_manager = SlotManager()
@@ -507,6 +564,7 @@ async def _run(args: argparse.Namespace, env: dict, ts: str) -> None:
         signal_port       = args.signal_port,
         log_file          = log_file,
         acct_file         = acct_file,
+        max_rehab_rounds  = args.max_rehab_rounds,
     )
     await manager.run()
 
@@ -549,6 +607,8 @@ def main() -> None:
                         help="Skip ISP proxy pool even if proxies_isp.txt exists; use SOAX only")
     parser.add_argument("--proxy-file",          type=str, default=None, dest="proxy_file",
                         help="Override SOAX proxy file (e.g. proxies_webshare.txt)")
+    parser.add_argument("--max-rehab-rounds",     type=int, default=5, dest="max_rehab_rounds",
+                        help="Max times a soft/proxy-failed worker is retried (default: 5; 0=disabled)")
     parser.add_argument("--proxy-offset",        type=int, default=0, dest="proxy_offset",
                         help="Start the proxy cursor at this index — use to manually partition a "
                              "proxy file between this process and a concurrently-running app.scout "
