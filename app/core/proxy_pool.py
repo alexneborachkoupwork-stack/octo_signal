@@ -422,6 +422,10 @@ class PersistentProxyPool:
         # All max_skip candidates had cached duplicate IPs. Accept the next
         # proxy unconditionally but still register its IP so it won't be
         # returned a second time in this same event.
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "[proxy_pool] advance_unique exhausted max_skip=%d — "
+            "falling back to advance() which may return a duplicate exit IP", max_skip)
         proxy = self.advance()
         sid = _extract_session_id(proxy)
         with self._lock:

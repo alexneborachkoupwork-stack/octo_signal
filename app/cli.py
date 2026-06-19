@@ -279,6 +279,9 @@ class Manager:
                 self._workers.append(w)
             self._workers_by_id[username] = w
             self._states[username] = "idle"
+            old_task = self._tasks.get(username)
+            if old_task is not None and not old_task.done():
+                old_task.cancel()
             task = asyncio.create_task(w.run(), name=f"worker-{username}-r{round_num}")
             self._tasks[username] = task
             log.info(f"[manager] rehab: {username} respawned (round {round_num})")
@@ -655,6 +658,7 @@ def main() -> None:
         datefmt="%H:%M:%S",
         force=True,  # discard any handler a prior basicConfig/import may have installed
     )
+    logging.getLogger("primp").setLevel(logging.WARNING)
 
     log.info(f"[manager] run log: {_run_log_path}")
     # ---------------------------------------------------------------------------

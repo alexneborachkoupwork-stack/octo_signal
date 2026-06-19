@@ -961,6 +961,7 @@ async def apply_book(acct: dict, posto_id: str, posto_pdf: str,
         # Step 8: Assign slot
         visible_slots = slots_json
         lease = None
+        _lease_confirmed = False
         if slot_manager:
             slot_manager.update_pool(slots_json)
             lease = slot_manager.request_slot(username, visible_slots)
@@ -1051,6 +1052,7 @@ async def apply_book(acct: dict, posto_id: str, posto_pdf: str,
         if _submit_status == 200 and _looks_ok:
             if lease:
                 slot_manager.confirm(lease)
+                _lease_confirmed = True
             pdf_saved = False
             try:
                 # SubmeterVistoCriaPDF response is an HTML page that embeds MostrarPdf
@@ -1113,7 +1115,7 @@ async def apply_book(acct: dict, posto_id: str, posto_pdf: str,
 
     except Exception as e:
         _log(username, f"EXCEPTION in apply_book: {e}")
-        if slot_manager and lease:
+        if slot_manager and lease and not _lease_confirmed:
             try:
                 slot_manager.release(lease, f"exception:{type(e).__name__}")
             except Exception:

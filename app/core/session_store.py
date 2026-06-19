@@ -32,7 +32,9 @@ def save(username: str, client: Client, proxy: str | None,
         "checkpoint": checkpoint,
         **meta,
     }
-    _path(username).write_text(json.dumps(data, indent=2), encoding="utf-8")
+    _tmp = _path(username).with_suffix(".tmp")
+    _tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    _tmp.replace(_path(username))
 
 
 def load(username: str) -> tuple[Client, str | None] | None:
@@ -40,7 +42,10 @@ def load(username: str) -> tuple[Client, str | None] | None:
     p = _path(username)
     if not p.exists():
         return None
-    data = json.loads(p.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
     proxy   = data.get("proxy")
     cookies = data.get("cookies", {})
 
@@ -69,7 +74,10 @@ def load_meta(username: str) -> dict:
     p = _path(username)
     if not p.exists():
         return {}
-    return json.loads(p.read_text(encoding="utf-8"))
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
 
 
 def probe_session(client: Client) -> str:

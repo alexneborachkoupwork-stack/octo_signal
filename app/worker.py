@@ -33,7 +33,7 @@ CRITICAL_WINDOW_SECS = 2 * 3600   # < 2 h to event -> tighten limits
 WARMUP_MAX_ATTEMPTS  = 3          # retries for generic (non-session_dead) warmup errors — same session/proxy, no new login cost
 KEEPALIVE_INTERVAL   = 4 * 60     # primp GET Schedule.jsp every 4 min keeps both Vistos_sid and form state alive
 DOWN_RETRY_SECS      = 5 * 60     # extra sleep when portal is "down"
-POLL_INTERVAL        = 300        # seconds between slot polls (scout) -- portal kills session ~90s after /slots POST; 5 min interval keeps re-warm stable
+POLL_INTERVAL        = 120        # seconds between slot polls (scout) -- portal kills session ~90s after /slots POST; 5 min interval keeps re-warm stable
 
 # ── Login failure counters ─────────────────────────────────────────────────────
 # Three independent counters replace the old flat attempt limit.
@@ -42,7 +42,7 @@ POLL_INTERVAL        = 300        # seconds between slot polls (scout) -- portal
 # Unknown: unclassified pattern → retire without marking login_failed (need investigation)
 # Global: total safety guard across all types (prevents infinite loops from misclassification)
 HARD_FAIL_LIMIT    = 5    # explicit server rejection → retire permanently
-SOFT_FAIL_LIMIT    = 20   # proxy attrition → pause + retry (reset to 0, hard keeps accumulating)
+SOFT_FAIL_LIMIT    = 15   # proxy attrition → pause + retry (reset to 0, hard keeps accumulating)
 SOFT_FAIL_CRITICAL = 5    # soft limit in critical window (< CRITICAL_WINDOW_SECS to event)
 UNKNOWN_FAIL_LIMIT = 10   # unclassified → retire, flag for investigation
 GLOBAL_FAIL_LIMIT  = 100  # total across all types — safety net against misclassification loops
@@ -395,7 +395,7 @@ class Worker:
             _pre_token: list[str] = [""]   # mutable; pre-solve thread writes here
 
             def _pre_solve() -> None:
-                import solver as _pre_s
+                from app.core import solver as _pre_s
                 try:
                     _pre_token[0] = _pre_s.race_all(
                         _cap.get("capsolver", []), _cap.get("anticaptcha", []),

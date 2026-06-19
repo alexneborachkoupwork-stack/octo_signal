@@ -96,16 +96,23 @@ class NotifyingSignalBus(SlotSignalBus):
             print(f"[scout] db log failed (non-fatal): {e}")
 
         if self._notify_url:
-            try:
-                import urllib.request as _urllib
-                # Pure wake-up POST, no body — matches app.core.signals.SlotSignalBus's
-                # /signal contract exactly (body is ignored there too).
-                req = _urllib.Request(self._notify_url, data=b"", method="POST")
-                with _urllib.urlopen(req, timeout=10):
-                    pass
-                print(f"[scout] notified {self._notify_url}")
-            except Exception as e:
-                print(f"[scout] notify to {self._notify_url} failed: {e}")
+            import urllib.request as _urllib
+            import time as _time
+            _notified = False
+            for _attempt in range(3):
+                try:
+                    req = _urllib.Request(self._notify_url, data=b"", method="POST")
+                    with _urllib.urlopen(req, timeout=10):
+                        pass
+                    print(f"[scout] notified {self._notify_url}")
+                    _notified = True
+                    break
+                except Exception as e:
+                    print(f"[scout] notify attempt {_attempt+1}/3 failed: {e}")
+                    if _attempt < 2:
+                        _time.sleep(2)
+            if not _notified:
+                print(f"[scout] notify failed after 3 attempts — slot signal may be lost")
 
 
 def _load_dotenv(env_file: Path) -> dict[str, str]:

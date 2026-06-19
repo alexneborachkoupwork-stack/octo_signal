@@ -160,7 +160,6 @@ def race_all(capsolver_keys: list[str], anticaptcha_keys: list[str],
     def _run_guarded(label: str, fn: callable, key: str) -> None:
         _thread_stop.stop = stop  # bind this thread's stop event for _poll to check
         try:
-            print(f"[solver] race:{label} starting")
             token = fn(key, action, proxy_info, session_cookies)
             s = score_token(token)
             with lock:
@@ -256,7 +255,6 @@ def _capsolver(api_key: str, action: str, proxy_info: dict | None,
     task_id = data.get("taskId")
     if not task_id:
         raise RuntimeError(f"createTask failed: {data}")
-    print(f"[solver] task_id={task_id}")
     return _poll("https://api.capsolver.com/getTaskResult", api_key, task_id)
 
 
@@ -299,7 +297,6 @@ def _anticaptcha(api_key: str, action: str, proxy_info: dict | None,
     task_id = data.get("taskId")
     if not task_id:
         raise RuntimeError(f"createTask no taskId: {data}")
-    print(f"[solver] task_id={task_id}")
     return _poll("https://api.anti-captcha.com/getTaskResult", api_key, task_id)
 
 
@@ -332,7 +329,6 @@ def _twocaptcha(api_key: str, action: str, proxy_info: dict | None,
     if data.get("errorId", 0) != 0:
         raise RuntimeError(f"createTask error: {data}")
     task_id = data["taskId"]
-    print(f"[solver] task_id={task_id}")
     return _poll("https://api.2captcha.com/getTaskResult", api_key, task_id)
 
 
@@ -365,7 +361,6 @@ def _capmonster(api_key: str, action: str, proxy_info: dict | None,
     if data.get("errorId", 0) != 0:
         raise RuntimeError(f"createTask error: {data}")
     task_id = data["taskId"]
-    print(f"[solver] task_id={task_id}")
     return _poll("https://api.capmonster.cloud/getTaskResult", api_key, task_id)
 
 
@@ -387,7 +382,7 @@ def _poll(url: str, api_key: str, task_id: str) -> str:
             token = data["solution"]["gRecaptchaResponse"]
             print(f"[solver] ready in ~{(i+1)*POLL_DELAY}s  token_len={len(token)}")
             return token
-        print(f"[solver] poll {i+1}/{MAX_POLLS}: {data.get('status', '?')}")
+        pass  # still processing
     raise RuntimeError(f"Solver timeout after {MAX_POLLS * POLL_DELAY}s")
 
 
@@ -527,7 +522,7 @@ def solve_datadome_capsolver(
             return None
         else:
             print(f"[datadome] poll {poll_n} unexpected: {poll}")
-            return None
+            continue
 
     print(f"[datadome] timeout after {timeout}s")
     return None

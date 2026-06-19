@@ -212,10 +212,12 @@ class AccountPool:
 
     def _save(self) -> None:
         with _get_file_lock(self._file):
-            with self._file.open("w", newline="", encoding="utf-8") as f:
+            tmp = self._file.with_suffix(".tmp")
+            with tmp.open("w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=list(_FIELDS))
                 writer.writeheader()
                 writer.writerows(self._accounts)
+            tmp.replace(self._file)
 
 
 # ── Module-level convenience ───────────────────────────────────────────────────

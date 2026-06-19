@@ -1,21 +1,21 @@
 id,username,password,status,account_type,first_name,last_name,gender,birthdate,nationality,traveldoc,email,email_pass,proxy,proxy_idx,registered_at,last_login,appointment_ref,notes
-11,edmern6985,z8obih42RIk6!#,login_failed,real,EDMILSON,ERNANDES BORGES,M,2010/11/01,CPV,PA562094,4kg27dpj0ol9@maillab.live,,proxy.soax.com:5000,,,,,waf_challenge_after_bypass
-12,djedep4155,ivKsr11ib07T!#,login_failed,real,DJEISON,DE PINA TAVARES,M,2020/08/19,CPV,PA457223,fnvb413vvgku@maillab.live,,proxy.soax.com:5000,,,,,rejected type='error' status=200
-13,gabmen8484,rvpnI9n5u3Z4!#,login_failed,real,GABRIEL ANGEL,MENDES SEMEDO,M,2020/12/15,CPV,PA569892,jygjoykckxcq@maillab.live,,proxy.soax.com:5000,,,,,waf_bypass retry exception: 'str' object has no attribute 'get'
+11,edmern6985,z8obih42RIk6!#,verified,real,EDMILSON,ERNANDES BORGES,M,2010/11/01,CPV,PA562094,4kg27dpj0ol9@maillab.live,,proxy.soax.com:5000,,,,,waf_challenge_after_bypass
+12,djedep4155,ivKsr11ib07T!#,verified,real,DJEISON,DE PINA TAVARES,M,2020/08/19,CPV,PA457223,fnvb413vvgku@maillab.live,,proxy.soax.com:5000,,,,,rejected type='error' status=200
+13,gabmen8484,rvpnI9n5u3Z4!#,verified,real,GABRIEL ANGEL,MENDES SEMEDO,M,2020/12/15,CPV,PA569892,jygjoykckxcq@maillab.live,,proxy.soax.com:5000,,,,,waf_bypass retry exception: 'str' object has no attribute 'get'
 14,fatlop2938,W64u5lrj2ydB!#,active,real,ROBSON KEMANUEL,VAZ TEIXEIRA,M,2019/03/28,CPV,PA481641,rt3fqvli3aoh@maillab.live,,proxy.soax.com:5000,,,2026-06-11T15:32:16Z,,regen:3
-15,ciblop2329,A1jsk237Uthq!#,login_failed,real,CIBELE HELENA,LOPES DIAS,F,2020/05/06,CPV,PA568356,9brw9q25ihgx@maillab.live,,proxy.soax.com:5000,,,,,waf_challenge_after_bypass
+15,ciblop2329,A1jsk237Uthq!#,verified,real,CIBELE HELENA,LOPES DIAS,F,2020/05/06,CPV,PA568356,9brw9q25ihgx@maillab.live,,proxy.soax.com:5000,,,,,waf_challenge_after_bypass
 16,marsan7592,u91U4rd0hoUk!#,active,real,MARIA DE FATIMA,SANCHES COSTA DE PINA,F,1975/04/29,CPV,PA469501,x022jyyf2yd0@maillab.live,,proxy.soax.com:5000,,,2026-06-11T15:39:46Z,,regen:1
-17,germen2605,07wq5yZ6iRxg!#,login_failed,real,GERSON,MENDES TAVARES FURTADO,M,1991/03/12,CPV,PA507005,3qclxniec5eh@maillab.live,,proxy.soax.com:5000,,,,,rejected type='error' status=200
-18,erivar3943,b94zuyteU3M8!#,login_failed,real,ERICA,VARELA MENDES,F,2018/04/10,CPV,PA561362,am9ocn850f5r@maillab.live,,proxy.soax.com:5000,,,,,rejected type='error' status=200
+17,germen2605,07wq5yZ6iRxg!#,verified,real,GERSON,MENDES TAVARES FURTADO,M,1991/03/12,CPV,PA507005,3qclxniec5eh@maillab.live,,proxy.soax.com:5000,,,,,rejected type='error' status=200
+18,erivar3943,b94zuyteU3M8!#,verified,real,ERICA,VARELA MENDES,F,2018/04/10,CPV,PA561362,am9ocn850f5r@maillab.live,,proxy.soax.com:5000,,,,,rejected type='error' status=200
 19,josnog5197,05wW5upmCnu1!#,verified,real,JOSEANE,NOGUEIRA MARTINS,F,2022/08/14,CPV,PA378787,vjtszp00uw4z@maillab.live,,proxy.soax.com:5000,,,,,
 20,ebealv7027,ari23ZArg1g0!#,active,real,EBER ISMAEL,ALVES MORENO,M,2020/01/12,CPV,PA535625,akrck5skufd2@maillab.live,,proxy.soax.com:5000,,,2026-06-11T15:51:36Z,,regen:2
 21,evelop7614,4y95mIv8wVoy!#,verified,real,EVELINE SOFIA,LOPES TAVARES,F,1990/03/13,CPV,PA452754,wdbnu24978ej@maillab.live,,proxy.soax.com:5000,,,,,
-22,guasan7137,s00gKcO81bjw!#,login_failed,real,GUALDINA,SANCHES,F,1967/11/27,CPV,PA552852,hyucnoc0pn88@maillab.live,,proxy.soax.com:5000,,,,,rejected type='error' status=200
-23,deiper2333,ojb6oJk457Ya!#,login_failed,real,DEINILSON,PEREIRA BORGES,M,2009/11/09,CPV,PA479335,6mz9gvwiqxgv@maillab.live,,proxy.soax.com:5000,,,,,rejected type='error' status=200
+22,guasan7137,s00gKcO81bjw!#,verified,real,GUALDINA,SANCHES,F,1967/11/27,CPV,PA552852,hyucnoc0pn88@maillab.live,,proxy.soax.com:5000,,,,,rejected type='error' status=200
+23,deiper2333,ojb6oJk457Ya!#,verified,real,DEINILSON,PEREIRA BORGES,M,2009/11/09,CPV,PA479335,6mz9gvwiqxgv@maillab.live,,proxy.soax.com:5000,,,,,rejected type='error' status=200
 24,helgon6266,epms5yS18dH3!#,verified,real,HELLEN ALESSANDRA,GONCALVES DA VEIGA,F,2019/07/18,CPV,PA518045,v20euamls4i5@maillab.live,,proxy.soax.com:5000,,,,,
 25,mardas4167,1a75wPb3prfD!#,verified,real,MARIA JESUS ESTER,DA SILVA FIDALGO,F,1971/06/17,CPV,PA567785,c9895a1lbopw@maillab.live,,proxy.soax.com:5000,,,,,
 26,kelfid6973,e42kZdpBxl70!#,active,real,KELLY PATRICIA,FIDALGO CABRAL,F,2018/05/06,CPV,PA543854,klwglr41zgn1@maillab.live,,proxy.soax.com:5000,,,2026-06-11T16:11:32Z,,regen:3
-27,gelfer5745,lj7J2jZnbv04!#,login_failed,real,GELSON PATRICK,FERNANDES VARELA,M,1994/11/01,CPV,PA551324,fo2u8xk4vpyw@maillab.live,,proxy.soax.com:5000,,,,,empty_body
+27,gelfer5745,lj7J2jZnbv04!#,verified,real,GELSON PATRICK,FERNANDES VARELA,M,1994/11/01,CPV,PA551324,fo2u8xk4vpyw@maillab.live,,proxy.soax.com:5000,,,,,empty_body
 28,laymon4160,i1dK4rZcxk14!#,verified,real,LAYANNE,MONIZ SOARES LOPES,F,2018/05/31,CPV,PA443671,mspnay1jgr34@maillab.live,,proxy.soax.com:5000,,,,,err_attempts:3
 29,leasem4866,9q1ak0p4MniS!#,verified,real,LEANDRA SOFIA,SEMEDO PEREIRA,F,2016/07/11,CPV,PA431171,zlriamrz7rpj@maillab.live,,proxy.soax.com:5000,,,,,
 30,dendep2374,gw4t3cE2Zx5a!#,active,real,DENILTON DANIEL,DE PINA MORENO,M,2022/05/29,CPV,PA568086,3c9t3b7g7wob@maillab.live,,proxy.soax.com:5000,,,2026-06-11T16:16:59Z,,regen:1
@@ -23,7 +23,7 @@ id,username,password,status,account_type,first_name,last_name,gender,birthdate,n
 32,maybri3498,xz1irwxTW749!#,active,real,MAYLLI MILEIDI,BRITO GOMES MONTEIRO,F,2011/03/07,CPV,PA490438,cmsvpjmabvmt@maillab.live,,proxy.soax.com:5000,,,2026-06-11T16:18:22Z,,regen:3
 33,ayltav8435,r9Vxar14eNg2!#,active,real,AYLA YASMIN,TAVARES FERNANDES CARDOSO,F,2021/04/18,CPV,PA550807,l3gi80nuugw4@maillab.live,,proxy.soax.com:5000,,,2026-06-11T16:20:59Z,,regen:3
 34,arimen7599,0L0njxf0mc0F!#,active,real,ARIELLE ALICIA,MENDES CORREIA,F,2019/03/09,CPV,PA412223,67cpbxa6t7ne@maillab.live,,proxy.soax.com:5000,,,2026-06-11T16:24:36Z,,regen:1
-35,solvaz1744,q32QGrqy1m4u!#,login_failed,real,SOLANGELA PATRICIA,VAZ CABRAL,F,1996/10/26,CPV,PA528440,7y8elcjzcce1@maillab.live,,proxy.soax.com:5000,,,,,non_json_body
+35,solvaz1744,q32QGrqy1m4u!#,verified,real,SOLANGELA PATRICIA,VAZ CABRAL,F,1996/10/26,CPV,PA528440,7y8elcjzcce1@maillab.live,,proxy.soax.com:5000,,,,,non_json_body
 36,fatdos4863,9owz04b3UygS!#,active,real,FATIMA,DOS SANTOS,F,1967/05/20,CPV,PA564389,tle7jbordirs@maillab.live,,proxy.soax.com:5000,,,2026-06-11T17:11:47Z,,regen:1 err_attempts:1
 37,waltav8278,mpmM6Xe20aj4!#,verified,real,WALTER GABRIEL,TAVARES MARQUES,M,1989/06/21,CPV,PA572061,pv9iia258zg6@maillab.live,,proxy.soax.com:5000,,,,,
 38,edntav1319,z20uupM8y3Yw!#,verified,real,EDNA AUGUSTA,TAVARES GONCALVES,F,1976/03/27,CPV,PA359271,f8407qh4q9sn@maillab.live,,proxy.soax.com:5000,,,,,
@@ -36,7 +36,7 @@ id,username,password,status,account_type,first_name,last_name,gender,birthdate,n
 45,delmon3977,dRh2bu2fb97X!#,verified,real,DELCIANE ALINE,MONTEIRO PINTO,F,2022/07/14,CPV,PA464715,ks9b986r9pk1@maillab.live,,proxy.soax.com:5000,,,,,403 WAF block
 46,diefre5201,zI6dI4im5nk4!#,verified,real,DIEGO FABRICIO,FREIRE DE OLIVEIRA,M,2013/10/12,CPV,PA443280,zqql592wxa3k@maillab.live,,proxy.soax.com:5000,,,,,err_attempts:3
 47,kelsem8731,9Uh2xfs7mI3q!#,verified,real,KELVIN RICARDO,SEMEDO MONTEIRO,M,2018/01/12,CPV,PA422863,pu4lbd2gzahm@maillab.live,,proxy.soax.com:5000,,,,,regen:1
-48,debvar9823,WxW4yoq21i1e!#,login_failed,real,DEBORA NOEMI,VARELA SEMEDO,F,2016/10/04,CPV,PA423914,1jpgmxuf2b74@maillab.live,,proxy.soax.com:5000,,,,,non_json_body
+48,debvar9823,WxW4yoq21i1e!#,verified,real,DEBORA NOEMI,VARELA SEMEDO,F,2016/10/04,CPV,PA423914,1jpgmxuf2b74@maillab.live,,proxy.soax.com:5000,,,,,non_json_body
 49,kayvar5983,32k0ec5YcvVk!#,active,real,KAYLA MICAELA,VARELA SEMEDO,F,2023/09/26,CPV,PA574561,9c0atkdvftjc@maillab.live,,proxy.soax.com:5000,,,2026-06-11T17:52:31Z,,max_regen_exceeded:PA574561 err_attempts:2
 50,brymon4573,eFlpxIr5j909!#,verified,real,BRYCE NAEL,MONTEIRO TAVARES,M,2020/02/20,CPV,PA569320,9tl8d8xkl549@maillab.live,,proxy.soax.com:5000,,,,,max_regen_exceeded:PA569320
 51,anisil7741,9w0zZO8tpcd2!#,verified,real,ANISE ENEIDA,SILVA CORREIA,F,1989/12/06,CPV,PA339387,4o6l039f7nih@maillab.live,,proxy.soax.com:5000,,,,,

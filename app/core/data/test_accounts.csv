@@ -1,20 +1,8 @@
 id,username,password,status,account_type,first_name,last_name,gender,birthdate,nationality,traveldoc,email,email_pass,proxy,proxy_idx,registered_at,last_login,appointment_ref,notes
-1,isacor7434,hE8c1gofiE71!#,active,test,ISABEL,CORREIA,F,2005/04/12,CPV,PA642445,lz645mnlqe91@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:14:41Z,,err_attempts:1
-2,hellop9862,u6aGc9k4pg0U!#,login_failed,test,HELDER,LOPES,M,1992/11/08,CPV,PA678376,8c1b0ad8em74@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:14:43Z,,login_exhausted at 2026-06-18T04:50:58
-4,felvar9062,cYp77Tii7yz6!#,login_failed,test,FELICIANO,VARELA,M,1977/04/18,CPV,PA233397,5m9smdghvwi2@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:15:37Z,,login_exhausted at 2026-06-18T10:57:19
-6,pauram7704,tT2Rkrt063jd!#,login_failed,test,PAULO,RAMOS,M,1997/05/11,CPV,PA557444,y868quqpu0ip@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:16:45Z,,login_exhausted at 2026-06-18T10:54:15
-7,aldfer4190,11kboJ0gaE0e!#,login_failed,test,ALDINA ROSARIA,FERREIRA RAMOS,F,1999/08/12,CPV,PA855085,bdaxh117rimi@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:18:51Z,,login_exhausted at 2026-06-18T10:57:16
-8,vanbor9970,Tm11x7eWe9ek!#,login_failed,test,VANESSA,BORGES,F,1972/11/10,CPV,PA778353,f65fy4vkz1ba@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:15:27Z,,login_exhausted at 2026-06-18T17:09:09
-9,edslop1266,aj2jjV09F5fs!#,login_failed,test,EDSON,LOPES,M,1975/12/31,CPV,PA328659,yuaadttjyo97@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:16:52Z,,login_exhausted at 2026-06-18T17:06:55
-10,helsem6435,04wBw61mPdmi!#,login_failed,test,HELDER,SEMEDO,M,1978/02/03,CPV,PA843812,zqgigx36048y@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:16:55Z,,login_exhausted at 2026-06-18T17:01:03
-11,carfer2161,5nsP3kb1Lf6d!#,login_failed,test,CARLOS JOSE,FERREIRA,M,1966/07/07,CPV,PA326266,88m2ekp6bk2v@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:16:15Z,,login_exhausted at 2026-06-18T17:03:35
-12,isagom3174,ap77vY4xv0kL!#,login_failed,test,ISABEL,GOMES,F,1988/11/26,CPV,PA539325,olowmvsm5zg9@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:17:48Z,,login_exhausted at 2026-06-18T17:05:13
-13,soflim7098,dy5z31aRtn4B!#,active,test,SOFIA,LIMA CUNHA,F,1969/01/03,CPV,PA403479,to4chik4dy43@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:16:51Z,,err_attempts:1
-14,silfur3211,Jum2gsr593Op!#,login_failed,test,SILVANA,FURTADO,F,1996/08/13,CPV,PA656553,2pmcu3kag49s@maillab.live,,proxy.soax.com:5000,,,,,login_exhausted at 2026-06-18T17:03:33
-16,niltav5616,47kfJFl7rhv7!#,login_failed,test,NILTON,TAVARES,M,2005/02/01,CPV,PA358305,4z316tzhszvz@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:18:48Z,,login_exhausted at 2026-06-18T17:05:43
-17,adicor5845,84rh1a1kzXJn!#,login_failed,test,ADILSON,CORREIA,M,1997/04/05,CPV,PA145277,a9voqe07q1an@maillab.live,,proxy.soax.com:5000,,,,,login_exhausted at 2026-06-18T17:03:33
+16,niltav5616,47kfJFl7rhv7!#,verified,test,NILTON,TAVARES,M,2005/02/01,CPV,PA358305,4z316tzhszvz@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:18:48Z,,login_exhausted at 2026-06-18T17:05:43
+17,adicor5845,84rh1a1kzXJn!#,verified,test,ADILSON,CORREIA,M,1997/04/05,CPV,PA145277,a9voqe07q1an@maillab.live,,proxy.soax.com:5000,,,,,login_exhausted at 2026-06-18T17:03:33
 18,elimor2365,iwwz97pYL74c!#,verified,test,ELISEU EDSON,MOREIRA,M,2000/12/05,CPV,PA551340,sgbojntxw59w@maillab.live,,proxy.soax.com:5000,,,,,regen:1 err_attempts:1
-20,eucgom6577,T8dw99Hxxh9r!#,active,test,EUCLIDES,GOMES,M,1978/03/15,CPV,PA845299,z230tozv5gxj@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:19:22Z,,waf_challenge_after_bypass
+20,eucgom6577,T8dw99Hxxh9r!#,verified,test,EUCLIDES,GOMES,M,1978/03/15,CPV,PA845299,z230tozv5gxj@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:19:22Z,,waf_challenge_after_bypass
 21,josand5837,eQwd6Ig2v16j!#,verified,test,JOSE,ANDRADE,M,1971/08/12,CPV,PA103731,47n807b3rtqm@maillab.live,,proxy.soax.com:5000,,,,,
 22,filcun7120,63d8loZPhm7r!#,verified,test,FILOMENA,CUNHA,F,1976/02/21,CPV,PA366512,1yewj2ier61e@maillab.live,,proxy.soax.com:5000,,,,,regen:2
 23,joatei9217,kG8tc43jcZ6i!#,verified,test,JOAO,TEIXEIRA,M,1994/01/13,CPV,PA324059,5iluqpce75x4@maillab.live,,proxy.soax.com:5000,,,,,

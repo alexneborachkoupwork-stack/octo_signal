@@ -98,7 +98,6 @@ def _get_proxy_timezone(proxy_url: str | None) -> str:
                 return tz
         except Exception as _e:
             pass
-    print(f"[session] tz lookup failed - using {_DEFAULT}")
     return _DEFAULT
 
 
@@ -244,7 +243,10 @@ class _FakeResponse:
         self.cookies     = {}
 
     def json(self):
-        return _json.loads(self.text)
+        try:
+            return _json.loads(self.text)
+        except _json.JSONDecodeError as exc:
+            raise ValueError(f"browser_fetch response is not JSON: {self.text[:120]!r}") from exc
 
 
 # -- PlaywrightSession ---------------------------------------------------------
@@ -340,7 +342,6 @@ class PlaywrightSession:
                 ua, sec_ch_ua, vp_w, vp_h, platform = _pick_fingerprint()
             self._fp = (ua, sec_ch_ua, vp_w, vp_h, platform)
             tz = _get_proxy_timezone(self.proxy)
-            print(f"[session] fp ua=...{ua[55:85]}  tz={tz}  vp={vp_w}x{vp_h}")
 
             pw = sync_playwright().start()
             browser = pw.chromium.launch(
@@ -386,13 +387,11 @@ class PlaywrightSession:
             try:
                 from playwright_stealth import Stealth
                 Stealth().apply_stealth_sync(page)
-                print("[session] playwright-stealth applied")
             except ImportError:
                 print("[session] playwright-stealth not installed - using fallback script only")
             except Exception as _se:
                 print(f"[session] playwright-stealth warning: {_se}")
 
-            print(f"[session] nav -> {HOME_URL}")
             page.goto(HOME_URL, timeout=30000)
             page.wait_for_load_state("networkidle", timeout=15000)
             page.goto(AUTH_URL, timeout=25000)
@@ -437,13 +436,11 @@ class PlaywrightSession:
             if cookie_dict:
                 try:
                     primp_client.set_cookies(AUTH_URL, cookie_dict)
-                    print(f"[session] set_cookies: {cookie_names}")
                 except Exception:
                     # Fallback: cookie header for all requests
                     self._cookie_header = "; ".join(f"{k}={v}" for k, v in cookie_dict.items())
                     print(f"[session] cookies -> header fallback: {cookie_names}")
             self._primp = primp_client
-            print(f"[session] primp client ready  (browser alive for verify)")
             self._ready.set()
 
             # -- Event loop: wait for verify or close commands -----------------
@@ -876,7 +873,7 @@ class PlaywrightSession:
             }}
             """
 
-        result = page.evaluate(js)
+        result = page.evaluate(js, timeout=25000)
         body = result.get("body", "")
         safe_body = body[:80].encode("utf-8", errors="replace").decode("utf-8", errors="replace")
         print(f"[session] browser_fetch {method} {url.split('?')[0].split('/')[-1]} "
@@ -1102,7 +1099,6 @@ class PlaywrightSession:
                 return info;
             }
             """)
-            print(f"[session] rcaptcha_info: {_json.dumps(rc_info)[:600]}")
         except Exception as e:
             print(f"[session] rcaptcha_info error: {e}")
 
@@ -1318,7 +1314,6 @@ class PlaywrightSession:
                 });
             })()
             """)
-            print(f"[session] auth-page forms before submit: {_json.dumps(_form_diag)[:1200]}")
         except Exception as _fde:
             print(f"[session] form diag error: {_fde}")
 
