@@ -1,12 +1,15 @@
 id,username,password,status,account_type,first_name,last_name,gender,birthdate,nationality,traveldoc,email,email_pass,proxy,proxy_idx,registered_at,last_login,appointment_ref,notes
-16,niltav5616,47kfJFl7rhv7!#,verified,test,NILTON,TAVARES,M,2005/02/01,CPV,PA358305,4z316tzhszvz@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:18:48Z,,login_exhausted at 2026-06-18T17:05:43
+16,niltav5616,47kfJFl7rhv7!#,verified,test,NILTON,TAVARES,M,2005/02/01,CPV,PA358305,4z316tzhszvz@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:18:48Z,,login_exhausted at 2026-06-18T17:05:43 err_attempts:3
 17,adicor5845,84rh1a1kzXJn!#,verified,test,ADILSON,CORREIA,M,1997/04/05,CPV,PA145277,a9voqe07q1an@maillab.live,,proxy.soax.com:5000,,,,,login_exhausted at 2026-06-18T17:03:33
 18,elimor2365,iwwz97pYL74c!#,verified,test,ELISEU EDSON,MOREIRA,M,2000/12/05,CPV,PA551340,sgbojntxw59w@maillab.live,,proxy.soax.com:5000,,,,,regen:1 err_attempts:1
 20,eucgom6577,T8dw99Hxxh9r!#,verified,test,EUCLIDES,GOMES,M,1978/03/15,CPV,PA845299,z230tozv5gxj@maillab.live,,proxy.soax.com:5000,,,2026-06-11T18:19:22Z,,waf_challenge_after_bypass
-21,josand5837,eQwd6Ig2v16j!#,verified,test,JOSE,ANDRADE,M,1971/08/12,CPV,PA103731,47n807b3rtqm@maillab.live,,proxy.soax.com:5000,,,,,
+21,josand5837,eQwd6Ig2v16j!#,active,test,JOSE,ANDRADE,M,1971/08/12,CPV,PA103731,47n807b3rtqm@maillab.live,,proxy.soax.com:5000,,,2026-07-03T19:52:59Z,,
 22,filcun7120,63d8loZPhm7r!#,verified,test,FILOMENA,CUNHA,F,1976/02/21,CPV,PA366512,1yewj2ier61e@maillab.live,,proxy.soax.com:5000,,,,,regen:2
-23,joatei9217,kG8tc43jcZ6i!#,verified,test,JOAO,TEIXEIRA,M,1994/01/13,CPV,PA324059,5iluqpce75x4@maillab.live,,proxy.soax.com:5000,,,,,
-24,helmor7986,w32dpY2aoXm0!#,verified,test,HELDER,MOREIRA,M,1971/02/18,CPV,PA861120,3qklevak8dit@maillab.live,,proxy.soax.com:5000,,,,,
+23,joatei9217,kG8tc43jcZ6i!#,login_failed,test,JOAO,TEIXEIRA,M,1994/01/13,CPV,PA324059,5iluqpce75x4@maillab.live,,proxy.soax.com:5000,,,,,"test_login exception: browser_login failed: Page.goto: Timeout 25000ms exceeded.
+Call log:
+  - navigating to ""https://pedidodevistos.mne.gov.pt/VistosOnline/Authentication.jsp"", waiting until ""load""
+"
+24,helmor7986,w32dpY2aoXm0!#,active,test,HELDER,MOREIRA,M,1971/02/18,CPV,PA861120,3qklevak8dit@maillab.live,,proxy.soax.com:5000,,,2026-07-03T19:54:58Z,,
 25,roscun9788,1ulFph8Jg6z3!#,verified,test,ROSARIA,CUNHA,F,1995/02/23,CPV,PA271348,al3m2mdw8rkw@maillab.live,,proxy.soax.com:5000,,,,,regen:1
 26,luivar3632,fjgzBt07mI06!#,verified,test,LUIS,VARELA,M,1981/09/02,CPV,PA028785,5tdkcuu6knbc@maillab.live,,proxy.soax.com:5000,,,,,
 27,clafer8430,z2sKkkz3m33S!#,verified,test,CLAUDIA,FERNANDES,F,1971/03/16,CPV,PA996605,pctk4pmh9jnl@maillab.live,,proxy.soax.com:5000,,,,,regen:1

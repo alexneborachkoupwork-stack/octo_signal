@@ -372,6 +372,13 @@ async def _run_steps_2_to_6(client, posto_id: str, acct: dict,
                 raise RuntimeError(f"quest step {_bi+1} failed: {_qe}") from _qe
         _elapsed(f"quest {len(quest_steps)} steps done")
         _log(username, f"questionnaire: {len(quest_steps)} steps done (nat={nat}) [browser_eval XHR]")
+        # Fast-fail: if the last quest step didn't yield fields, the browser's cookie jar
+        # was desynced from the in-progress questionnaire session (or the proxy got blocked
+        # mid-flow, e.g. 403s on every step) — every downstream Formulario fallback depends
+        # on these same fields/session and is deterministically doomed too. Raise immediately
+        # instead of walking all 4 cascading fallbacks (~40-100s each) before hitting csrf_missing.
+        if not _last_quest_fields:
+            raise RuntimeError("quest_state_stale")
         # Log browser's current session cookie after quest steps (diagnostic)
         try:
             _diag_cookie = await loop.run_in_executor(executor, lambda: client.browser_eval("document.cookie"))

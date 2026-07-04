@@ -556,9 +556,18 @@ class Worker:
             if not ok:
                 self._report("failed", {"reason": "warmup_session_dead_unrecoverable"})
         else:
-            self._log(f"warmup error: {result}", "error")
+            # Exhausted WARMUP_MAX_ATTEMPTS on the SAME proxy/session every time (apply_warmup
+            # is called with client=self.client, proxy=self.proxy unchanged across retries).
+            # A generic failure that survives 3 identical retries is far more likely a blocked/
+            # flagged proxy IP than a transient page-load race — the same class of problem the
+            # session_dead branch above already recovers from via _restore() (fresh proxy).
+            # Give this case the same chance instead of discarding a worker that already paid
+            # the full login cost.
+            self._log(f"warmup error: {result} -- exhausted {WARMUP_MAX_ATTEMPTS} attempts on same proxy, attempting restore", "warning")
             self._close_browser_if_open()
-            self._report("failed", {"reason": f"warmup_{result}"})
+            ok = await self._restore()
+            if not ok:
+                self._report("failed", {"reason": f"warmup_{result}_unrecoverable"})
 
     # -- Restore (session dead) -------------------------------------------------
 
@@ -858,8 +867,13 @@ class Worker:
             r = await loop.run_in_executor(self._executor, lambda: self.client.get(
                 sched_url, headers=sess.HEADERS_NAV, timeout=15, follow_redirects=False))
         except Exception as e:
-            self._log(f"form state check failed: {e}", "warning")
-            return False
+            # Connection-level failure (dead proxy, tunnel error) — not a portal-side
+            # response we can classify by status code. Attempt a full restore (fresh
+            # proxy) rather than giving up: a dead proxy here would otherwise poison
+            # every subsequent signal round for the rest of the run (self.proxy is
+            # only ever rotated via _restore(), and this path previously never called it).
+            self._log(f"form state check failed: {e} — attempting restore", "warning")
+            return await self._restore()
 
         if r.status_code == 200:
             self._log("form state OK (200) — proceeding to apply")

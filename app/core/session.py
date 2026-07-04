@@ -873,7 +873,7 @@ class PlaywrightSession:
             }}
             """
 
-        result = page.evaluate(js, timeout=25000)
+        result = page.evaluate(js)
         body = result.get("body", "")
         safe_body = body[:80].encode("utf-8", errors="replace").decode("utf-8", errors="replace")
         print(f"[session] browser_fetch {method} {url.split('?')[0].split('/')[-1]} "
