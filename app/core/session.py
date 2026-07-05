@@ -277,6 +277,7 @@ class PlaywrightSession:
     _CMD_CLOSE_BROWSER        = "close_browser"   # full shutdown after login; primp lives on
     _CMD_FORM_POST            = "form_post"        # DOM form.submit() -- real page nav, bypasses DataDome
     _CMD_SUBMIT_PAGE_FORM     = "submit_page_form"  # submit existing on-page form (no new form injected)
+    _CMD_SUBMIT_FORM_BINARY   = "submit_form_binary"  # like submit_page_form, but returns raw response bytes
     _CMD_DATADOME_UNBLOCK     = "datadome_unblock"  # solve DataDome challenge for a non-login endpoint
     _CMD_CLOSE           = "close"
 
@@ -682,6 +683,47 @@ class PlaywrightSession:
                             self._res_q.put(("ok", page.url, html))
                     except Exception as exc:
                         self._res_q.put(("err", str(exc), ""))
+
+                elif cmd.get("action") == self._CMD_SUBMIT_FORM_BINARY:
+                    # Same DOM form.submit() trick as submit_page_form (real navigation,
+                    # bypasses DataDome) but for endpoints that respond with a binary
+                    # payload (e.g. MostrarPdf's application/pdf) rather than HTML.
+                    # page.content() can't be used here -- Chromium's built-in PDF viewer
+                    # intercepts the response into its own viewer shell, not raw bytes.
+                    # Playwright's response listener gives the real bytes regardless of
+                    # content-type, so capture that instead of reading the DOM afterward.
+                    try:
+                        target_action = cmd.get("action_contains", "MostrarPdf")
+                        _check_js = f"""(() => {{
+                            const forms = Array.from(document.querySelectorAll('form'));
+                            const f = forms.find(x => x.action && x.action.includes({_json.dumps(target_action)})) || forms[0];
+                            return f ? f.action : null;
+                        }})()"""
+                        _form_action = page.evaluate(_check_js)
+                        print(f"[session] submit_form_binary: target form action={_form_action}")
+                        if not _form_action:
+                            self._res_q.put(("err", "no_form_found"))
+                        else:
+                            _submit_js = f"""(() => {{
+                                const forms = Array.from(document.querySelectorAll('form'));
+                                const f = forms.find(x => x.action && x.action.includes({_json.dumps(target_action)})) || forms[0];
+                                f.submit();
+                                return 'submitted:' + f.action;
+                            }})()"""
+                            with page.expect_response(
+                                lambda r, _a=target_action: _a in r.url, timeout=45000
+                            ) as _resp_info:
+                                page.evaluate(_submit_js)
+                            _response = _resp_info.value
+                            _status = _response.status
+                            _ct = _response.headers.get("content-type", "")
+                            _body = _response.body()
+                            print(f"[session] submit_form_binary -> {_response.url}  status={_status}  "
+                                  f"content-type={_ct}  len={len(_body)}")
+                            self._res_q.put(("ok", {"status": _status, "content_type": _ct,
+                                                     "url": _response.url, "body": _body}))
+                    except Exception as exc:
+                        self._res_q.put(("err", str(exc)))
 
                 elif cmd.get("action") == self._CMD_CLOSE_BROWSER:
                     # Full browser shutdown after login - primp carries the session forward.
@@ -1939,6 +1981,23 @@ class PlaywrightSession:
                 raise RuntimeError(f"submit_page_form failed: {result[1]}")
         except queue.Empty:
             raise RuntimeError(f"submit_page_form timed out after {timeout}s")
+
+    def submit_form_binary(self, action_contains: str = "MostrarPdf",
+                           timeout: int = 45) -> dict:
+        """Submit the existing on-page form via DOM form.submit() (real navigation,
+        bypasses DataDome — same trick as submit_page_form) and return the RAW response
+        bytes, for endpoints that respond with binary content (e.g. MostrarPdf's
+        application/pdf) where page.content() would only return Chromium's built-in
+        PDF-viewer shell, not the actual file.
+        Returns {"status": int, "content_type": str, "url": str, "body": bytes}."""
+        self._cmd_q.put({"action": self._CMD_SUBMIT_FORM_BINARY, "action_contains": action_contains})
+        try:
+            status, result = self._res_q.get(timeout=timeout)
+        except queue.Empty:
+            raise RuntimeError(f"submit_form_binary timed out after {timeout}s")
+        if status == "err":
+            raise RuntimeError(f"submit_form_binary failed: {result}")
+        return result
 
     def screenshot(self, username: str, stage: str, timeout: int = 15) -> str | None:
         """Take a screenshot during the login flow (browser still open). Returns path or None."""

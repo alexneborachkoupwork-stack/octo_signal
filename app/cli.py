@@ -142,38 +142,42 @@ class Manager:
 
         if new_state == "failed" and self._acct_file:
             reason = detail.get("reason", "")
-            if reason == "login_hard_exhausted":
-                # Hard failure = explicit server-side account rejection (wrong credentials,
-                # account suspended, etc.) — mark login_failed so future runs skip this account.
-                # Soft/unknown/global exhaustion is proxy attrition, NOT account failure;
-                # those reasons leave the account as "verified" so it's retried next run
-                # with a healthier proxy pool.
-                try:
-                    from account_pool import AccountPool
-                    AccountPool(self._acct_file).mark_login_failed(
-                        worker_id,
-                        notes=f"hard_exhausted at {datetime.now().isoformat(timespec='seconds')}",
-                    )
-                except Exception as _ue:
-                    log.warning(f"[manager] could not persist login_failed for {worker_id}: {_ue}")
-            elif reason in ("login_soft_exhausted", "login_unknown_exhausted",
-                            "login_global_exhausted"):
-                # Proxy attrition — account is fine. Queue for rehab (fresh proxy next wave).
-                attempts = self._rehab_attempts.get(worker_id, 0)
-                if attempts < self._max_rehab_rounds:
-                    acct = self._account_by_username.get(worker_id)
-                    if acct:
-                        self._rehab_queue.append(acct)
-                        self._rehab_attempts[worker_id] = attempts + 1
-                        log.info(
-                            f"[manager] {worker_id} queued for rehab "
-                            f"(round {attempts + 1}/{self._max_rehab_rounds}, reason={reason})"
-                        )
+            if reason == "identity_login_exhausted":
+                hard_usernames      = set(detail.get("hard_failed_usernames", []))
+                candidate_usernames = detail.get("candidate_usernames", [])
+                # Every candidate got an explicit server-side rejection (wrong
+                # credentials/suspended) — permanent, mark each so future runs skip them.
+                # If only SOME candidates were hard-rejected (others just ran out of
+                # sticky proxy attempts), the identity is proxy attrition, not account
+                # failure — queue it for rehab with a fresh proxy batch instead.
+                all_hard = bool(hard_usernames) and hard_usernames.issuperset(candidate_usernames)
+                if all_hard:
+                    try:
+                        from account_pool import AccountPool
+                        pool = AccountPool(self._acct_file)
+                        for uname in candidate_usernames:
+                            pool.mark_login_failed(
+                                uname,
+                                notes=f"hard_exhausted at {datetime.now().isoformat(timespec='seconds')}",
+                            )
+                    except Exception as _ue:
+                        log.warning(f"[manager] could not persist login_failed for {worker_id}: {_ue}")
                 else:
-                    log.warning(
-                        f"[manager] {worker_id} exhausted {self._max_rehab_rounds} rehab "
-                        f"rounds ({reason}) — retiring permanently"
-                    )
+                    attempts = self._rehab_attempts.get(worker_id, 0)
+                    if attempts < self._max_rehab_rounds:
+                        candidates = self._accounts_by_identity.get(worker_id)
+                        if candidates:
+                            self._rehab_queue.append(candidates)
+                            self._rehab_attempts[worker_id] = attempts + 1
+                            log.info(
+                                f"[manager] {worker_id} queued for rehab "
+                                f"(round {attempts + 1}/{self._max_rehab_rounds}, reason={reason})"
+                            )
+                    else:
+                        log.warning(
+                            f"[manager] {worker_id} exhausted {self._max_rehab_rounds} rehab "
+                            f"rounds ({reason}) — retiring permanently"
+                        )
 
         if new_state == "no_slot_exhausted":
             self._no_slot_round.add(worker_id)
@@ -223,7 +227,12 @@ class Manager:
     # ── Worker creation ────────────────────────────────────────────────────────
 
     def _create_workers(self) -> None:
-        self._account_by_username = {a["username"]: a for a in self._real_accounts}
+        # self._real_accounts is a list of identities; each identity is a list of
+        # candidate accounts (>=1) to try in order — see [[identity-account-rotation]].
+        self._accounts_by_identity = {
+            (candidates[0].get("identity_id") or candidates[0]["username"]): candidates
+            for candidates in self._real_accounts
+        }
 
         def _proxy_req() -> str:
             return self._proxy_pool.advance_unique(self._event_ips, self._event_ip_lock)
@@ -245,10 +254,10 @@ class Manager:
             apply_sem       = self._apply_sem,
             proxy_pool      = self._proxy_pool,
         )
-        for acct in self._real_accounts:
+        for candidates in self._real_accounts:
             # Login proxy = Webshare (the main pool). ISP is not used for login —
             # static ISP IPs are blocked by DataDome on the login POST.
-            w = Worker(account=acct, role="real", proxy_requester=self._proxy_requester,
+            w = Worker(accounts=candidates, role="real", proxy_requester=self._proxy_requester,
                        **self._worker_common)
             self._workers.append(w)
             self._workers_by_id[w.worker_id] = w
@@ -258,18 +267,19 @@ class Manager:
 
     def _spawn_rehab_wave(self) -> None:
         """
-        Respawn workers for accounts that failed due to proxy attrition (soft/unknown
-        exhaustion). Each gets a fresh proxy from the pool. Hard-failed accounts are
-        never queued here — they stay retired.
+        Respawn workers for identities that failed due to proxy attrition (ran out of
+        sticky retries on every candidate account without a hard rejection). Each gets
+        a fresh proxy from the pool. Hard-failed identities are never queued here —
+        they stay retired (see _on_worker_status's all_hard check).
         """
-        accounts = list(self._rehab_queue)
+        identities = list(self._rehab_queue)
         self._rehab_queue.clear()
-        log.info(f"[manager] rehab wave: respawning {len(accounts)} workers")
-        for acct in accounts:
-            username = acct["username"]
-            round_num = self._rehab_attempts[username]
-            old = self._workers_by_id.get(username)
-            w = Worker(account=acct, role="real",
+        log.info(f"[manager] rehab wave: respawning {len(identities)} workers")
+        for candidates in identities:
+            identity_id = candidates[0].get("identity_id") or candidates[0]["username"]
+            round_num = self._rehab_attempts[identity_id]
+            old = self._workers_by_id.get(identity_id)
+            w = Worker(accounts=candidates, role="real",
                        proxy_requester=self._proxy_requester,
                        **self._worker_common)
             # Replace old Worker in-place so the status table stays ordered.
@@ -277,14 +287,14 @@ class Manager:
                 self._workers[self._workers.index(old)] = w
             else:
                 self._workers.append(w)
-            self._workers_by_id[username] = w
-            self._states[username] = "idle"
-            old_task = self._tasks.get(username)
+            self._workers_by_id[identity_id] = w
+            self._states[identity_id] = "idle"
+            old_task = self._tasks.get(identity_id)
             if old_task is not None and not old_task.done():
                 old_task.cancel()
-            task = asyncio.create_task(w.run(), name=f"worker-{username}-r{round_num}")
-            self._tasks[username] = task
-            log.info(f"[manager] rehab: {username} respawned (round {round_num})")
+            task = asyncio.create_task(w.run(), name=f"worker-{identity_id}-r{round_num}")
+            self._tasks[identity_id] = task
+            log.info(f"[manager] rehab: {identity_id} respawned (round {round_num})")
 
     # ── Main run ───────────────────────────────────────────────────────────────
 
@@ -296,8 +306,9 @@ class Manager:
             f"posto={self.posto_id}  nationality={self.nationality}  residence={self.residence}"
         )
         # Prune stale session files; pass active usernames so only known accounts are kept.
+        # Includes every candidate account per identity, not just the currently-active one.
         import session_store as _ss
-        active = {w.username for w in self._workers}
+        active = {a["username"] for w in self._workers for a in w._candidates}
         _ss.cleanup_stale(max_age_days=7, active_usernames=active)
 
         for worker in self._workers:
@@ -438,15 +449,26 @@ def _load_dotenv(env_file: Path) -> dict[str, str]:
     return env
 
 
-def _load_accounts(csv_file: Path, statuses: tuple[str, ...] = ("verified", "active")) -> list[dict]:
+def _load_accounts(csv_file: Path, statuses: tuple[str, ...] = ("verified", "active")) -> list[list[dict]]:
     # "login_failed" deliberately excluded by default — Manager._on_worker_status persists
     # that status on login-exhaustion specifically so these accounts stop being silently
     # re-picked by future runs. Pass statuses=(...,"login_failed") explicitly to retry them
     # (e.g. after getting a fresh proxy pool, since most exhaustions are proxy-luck, not
     # account-specific).
+    #
+    # Returns identities, not accounts: rows sharing the same identity_id are grouped
+    # into one candidate list (try-order = row order in the CSV). Today that's almost
+    # always a list of 1 (one account per identity), but the grouping lets multiple
+    # accounts be registered for the same person and tried in order — see worker.py's
+    # sticky/rotating retry model.
     from account_pool import AccountPool
     pool = AccountPool(csv_file)
-    return [a for a in pool.all() if a.get("status") in statuses]
+    candidates = [a for a in pool.all() if a.get("status") in statuses]
+    identities: dict[str, list[dict]] = {}
+    for a in candidates:
+        iid = a.get("identity_id") or a["username"]
+        identities.setdefault(iid, []).append(a)
+    return list(identities.values())
 
 
 def _kill_stale_browser_procs() -> None:

@@ -133,10 +133,17 @@ def _load_dotenv(env_file: Path) -> dict[str, str]:
     return env
 
 
-def _load_accounts(csv_file: Path, statuses=("verified", "active")) -> list[dict]:
+def _load_accounts(csv_file: Path, statuses=("verified", "active")) -> list[list[dict]]:
+    """Returns identities (candidate-account lists), grouped by identity_id — see
+    app.cli's _load_accounts docstring for the same grouping used by Worker."""
     from account_pool import AccountPool
     pool = AccountPool(csv_file)
-    return [a for a in pool.all() if a.get("status") in statuses]
+    candidates = [a for a in pool.all() if a.get("status") in statuses]
+    identities: dict[str, list[dict]] = {}
+    for a in candidates:
+        iid = a.get("identity_id") or a["username"]
+        identities.setdefault(iid, []).append(a)
+    return list(identities.values())
 
 
 async def _status_printer(workers: list[Worker], states: dict[str, str],
@@ -228,10 +235,10 @@ async def _run(args: argparse.Namespace, env: dict) -> None:
         states[worker_id] = new_state
 
     workers: list[Worker] = []
-    for acct in accounts:
+    for candidates in accounts:
         req = IspFirstRequester(isp_pool, _soax_advance, soax_pool=proxy_pool) if isp_pool is not None else _soax_advance
         w = Worker(
-            account=acct, role="scout",
+            accounts=candidates, role="scout",
             signal_bus=signal_bus, slot_manager=slot_manager,
             proxy_requester=req, status_cb=_status_cb,
             executor=executor, solver_keys=solver_keys,

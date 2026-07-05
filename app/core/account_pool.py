@@ -57,7 +57,7 @@ def _get_file_lock(path: Path) -> threading.Lock:
         return _file_locks[path]
 
 _FIELDS = (
-    "id", "username", "password", "status", "account_type",
+    "id", "identity_id", "username", "password", "status", "account_type",
     "first_name", "last_name", "gender", "birthdate", "nationality", "traveldoc",
     "email", "email_pass",
     "proxy", "proxy_idx",
@@ -208,6 +208,12 @@ class AccountPool:
         with self._file.open(newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             self._accounts = [dict(row) for row in reader]
+        # Backward-compat: older CSVs predate the identity_id column. Default each
+        # row's identity to its own username (1 account = 1 identity), so grouping
+        # by identity_id degrades gracefully to today's 1:1 behavior.
+        for a in self._accounts:
+            if not a.get("identity_id"):
+                a["identity_id"] = a["username"]
         print(f"[accounts] loaded {len(self._accounts)} accounts from {self._file.name}")
 
     def _save(self) -> None:

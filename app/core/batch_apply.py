@@ -359,17 +359,36 @@ async def _run_steps_2_to_6(client, posto_id: str, acct: dict,
                 f"  return {{status: r.status, len: body.length, snippet: body.substring(0, 60)}};"
                 f"}})()"
             )
-            try:
-                _step_result = await loop.run_in_executor(executor, lambda j=_fetch_js: client.browser_eval(j))
+            # A quest step can silently fail to register server-side without a browser
+            # exception — same flakiness a human sees as the page "getting stuck" and
+            # needing a manual refresh to reveal the next question. Verify status==200
+            # per step (not just log it) and retry THIS step a few times before moving
+            # on, instead of only discovering the breakage once the last step comes
+            # back with empty fields (by which point we don't know which step broke).
+            _step_result = None
+            for _step_attempt in range(1, 4):
+                try:
+                    _step_result = await loop.run_in_executor(executor, lambda j=_fetch_js: client.browser_eval(j))
+                except Exception as _qe:
+                    _log(username, f"  quest step {_bi+1} attempt {_step_attempt}/3 failed: {_qe}")
+                    if _step_attempt == 3:
+                        raise RuntimeError(f"quest step {_bi+1} failed: {_qe}") from _qe
+                    await asyncio.sleep(1.5)
+                    continue
+                _status = _step_result.get('status') if isinstance(_step_result, dict) else None
                 _log(username, f"  quest step {_bi+1}/{len(quest_steps)} id={_bstep.get('id_pergunta')} "
-                     f"-> status={_step_result.get('status')} len={_step_result.get('len')} "
+                     f"-> status={_status} len={_step_result.get('len')} attempt={_step_attempt}/3 "
                      f"snippet={str(_step_result.get('snippet',''))[:60]}")
-                if _bi == len(quest_steps) - 1 and isinstance(_step_result, dict):
-                    _last_quest_fields = _step_result.get('fields') or {}
-                    _log(username, f"  last quest fields ({len(_last_quest_fields)}): {list(_last_quest_fields.keys())}")
-            except Exception as _qe:
-                _log(username, f"  quest step {_bi+1} failed: {_qe}")
-                raise RuntimeError(f"quest step {_bi+1} failed: {_qe}") from _qe
+                if _status == 200:
+                    break
+                if _step_attempt == 3:
+                    _log(username, f"  quest step {_bi+1} never returned 200 after 3 attempts — continuing anyway")
+                else:
+                    _log(username, f"  quest step {_bi+1} status={_status} -- retrying (like a manual page refresh)")
+                    await asyncio.sleep(1.5)
+            if _bi == len(quest_steps) - 1 and isinstance(_step_result, dict):
+                _last_quest_fields = _step_result.get('fields') or {}
+                _log(username, f"  last quest fields ({len(_last_quest_fields)}): {list(_last_quest_fields.keys())}")
         _elapsed(f"quest {len(quest_steps)} steps done")
         _log(username, f"questionnaire: {len(quest_steps)} steps done (nat={nat}) [browser_eval XHR]")
         # Fast-fail: if the last quest step didn't yield fields, the browser's cookie jar
@@ -1062,31 +1081,56 @@ async def apply_book(acct: dict, posto_id: str, posto_pdf: str,
                 _lease_confirmed = True
             pdf_saved = False
             try:
-                # SubmeterVistoCriaPDF response is an HTML page that embeds MostrarPdf
-                # in an iframe src / anchor href / object data. Extract the URL from the HTML.
-                _pdf_url: str | None = None
-                _mostrar_patterns = [
-                    r'(?:src|href|data)=["\']([^"\']*MostrarPdf[^"\']*)["\']',
-                    r'(?:src|href|data)=["\']([^"\']*\.pdf[^"\']*)["\']',
-                ]
-                for _pat in _mostrar_patterns:
-                    _m = re.search(_pat, resp_text, re.IGNORECASE)
-                    if _m:
-                        _raw = _m.group(1)
-                        _pdf_url = _raw if _raw.startswith("http") else BASE + (_raw if _raw.startswith("/") else "/" + _raw)
-                        _log(username, f"MostrarPdf URL extracted from SubmeterVisto response: {_pdf_url}")
-                        break
-                if not _pdf_url:
-                    # Fallback: bare MostrarPdf endpoint (params unknown — server may use session)
-                    _pdf_url = BASE + "/VistosOnline/MostrarPdf"
-                    _log(username, f"MostrarPdf URL not found in response, using fallback: {_pdf_url}")
-                r_pdf = await loop.run_in_executor(executor, lambda u=_pdf_url: client.get(
-                    u,
-                    headers={**sess.HEADERS_NAV, "Referer": sched_jsp_url},
-                    timeout=30))
-                ct = (getattr(r_pdf, "headers", {}) or {}).get("content-type", "")
-                _pdf_bytes_raw = r_pdf.content if hasattr(r_pdf, "content") else r_pdf.text.encode()
-                if r_pdf.status_code == 200 and (
+                # SubmeterVistoCriaPDF's response page has <form name="frm_1"
+                # action="MostrarPdf"></form>, auto-submitted via JS (document.frm_1.submit())
+                # after ~1.5s -- a real DOM form submission (browser navigation), which is
+                # what bypasses DataDome. A raw client.get() to MostrarPdf gets 403-blocked
+                # regardless of session health (confirmed live 2026-07-05) even with a
+                # correct Referer -- it must go through the browser as a real navigation.
+                # page.content() can't be used for the browser path either: Chromium's
+                # built-in PDF viewer intercepts application/pdf responses into its own
+                # viewer shell, not raw bytes, so submit_form_binary() captures the response
+                # via Playwright's response listener instead.
+                _pdf_bytes_raw = b""
+                _pdf_status = 0
+                ct = ""
+                if _has_browser and hasattr(client, "submit_form_binary"):
+                    try:
+                        _pdf_result = await loop.run_in_executor(
+                            executor, lambda: client.submit_form_binary(action_contains="MostrarPdf", timeout=45))
+                        _pdf_status   = _pdf_result["status"]
+                        ct            = _pdf_result["content_type"]
+                        _pdf_bytes_raw = _pdf_result["body"]
+                        _log(username, f"MostrarPdf via submit_form_binary: status={_pdf_status} ct={ct} len={len(_pdf_bytes_raw)}")
+                    except Exception as _sfe:
+                        _log(username, f"submit_form_binary failed: {_sfe} — falling back to raw GET")
+                if not _pdf_bytes_raw:
+                    # Fallback: extract a MostrarPdf URL from the response HTML and GET it
+                    # directly. Known to be 403-blocked by DataDome in the common case, but
+                    # kept as a last resort for restored/browser-less sessions.
+                    _pdf_url: str | None = None
+                    _mostrar_patterns = [
+                        r'(?:src|href|data)=["\']([^"\']*MostrarPdf[^"\']*)["\']',
+                        r'(?:src|href|data)=["\']([^"\']*\.pdf[^"\']*)["\']',
+                    ]
+                    for _pat in _mostrar_patterns:
+                        _m = re.search(_pat, resp_text, re.IGNORECASE)
+                        if _m:
+                            _raw = _m.group(1)
+                            _pdf_url = _raw if _raw.startswith("http") else BASE + (_raw if _raw.startswith("/") else "/" + _raw)
+                            _log(username, f"MostrarPdf URL extracted from SubmeterVisto response: {_pdf_url}")
+                            break
+                    if not _pdf_url:
+                        _pdf_url = BASE + "/VistosOnline/MostrarPdf"
+                        _log(username, f"MostrarPdf URL not found in response, using fallback: {_pdf_url}")
+                    r_pdf = await loop.run_in_executor(executor, lambda u=_pdf_url: client.get(
+                        u,
+                        headers={**sess.HEADERS_NAV, "Referer": sched_jsp_url},
+                        timeout=30))
+                    ct = (getattr(r_pdf, "headers", {}) or {}).get("content-type", "")
+                    _pdf_bytes_raw = r_pdf.content if hasattr(r_pdf, "content") else r_pdf.text.encode()
+                    _pdf_status = r_pdf.status_code
+                if _pdf_status == 200 and (
                     "application/pdf" in ct
                     or _pdf_bytes_raw[:4] == b'%PDF'
                     or len(_pdf_bytes_raw) > 5000
@@ -1098,7 +1142,7 @@ async def apply_book(acct: dict, posto_id: str, posto_pdf: str,
                     _log(username, f"PDF saved -> {pdf_path}  ({len(_pdf_bytes_raw)} bytes)")
                     pdf_saved = True
                 else:
-                    _log(username, f"PDF download failed: status={r_pdf.status_code} ct={ct[:60]} len={len(_pdf_bytes_raw)}")
+                    _log(username, f"PDF download failed: status={_pdf_status} ct={ct[:60]} len={len(_pdf_bytes_raw)}")
             except Exception as pdf_err:
                 _log(username, f"PDF download error: {pdf_err}")
 

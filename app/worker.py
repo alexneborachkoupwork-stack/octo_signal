@@ -35,18 +35,16 @@ KEEPALIVE_INTERVAL   = 4 * 60     # primp GET Schedule.jsp every 4 min keeps bot
 DOWN_RETRY_SECS      = 5 * 60     # extra sleep when portal is "down"
 POLL_INTERVAL        = 120        # seconds between slot polls (scout) -- portal kills session ~90s after /slots POST; 5 min interval keeps re-warm stable
 
-# ── Login failure counters ─────────────────────────────────────────────────────
-# Three independent counters replace the old flat attempt limit.
-# Hard: explicit server-side account rejection → retire + mark login_failed in CSV
-# Soft: proxy/network connectivity fault → pause 60s, retry with fresh proxies (account stays verified)
-# Unknown: unclassified pattern → retire without marking login_failed (need investigation)
-# Global: total safety guard across all types (prevents infinite loops from misclassification)
-HARD_FAIL_LIMIT    = 5    # explicit server rejection → retire permanently
-SOFT_FAIL_LIMIT    = 15   # proxy attrition → pause + retry (reset to 0, hard keeps accumulating)
-SOFT_FAIL_CRITICAL = 5    # soft limit in critical window (< CRITICAL_WINDOW_SECS to event)
-UNKNOWN_FAIL_LIMIT = 10   # unclassified → retire, flag for investigation
-GLOBAL_FAIL_LIMIT  = 100  # total across all types — safety net against misclassification loops
-SOFT_PAUSE_SECS    = 60   # sleep between soft-exhaustion retry rounds (releases login_sem during wait)
+# ── Login failure / retry model ────────────────────────────────────────────────
+# Portal policy (confirmed 2026-07-05): ~2 accounts tolerated per IP, and an account
+# gets ~2 login attempts per session (1 retry after a refresh) before the portal
+# imposes a cooldown. Retrying the same account 10-15x (the old model) just burns
+# proxies/CAPTCHA against a wall that was never going to open. The new model retries
+# STICKY_RETRY_MAX times on one account (fresh proxy each time), then rotates to the
+# next candidate account for the same identity (if any) — "sticky" vs "rotating"
+# retry, per identity rather than per account.
+STICKY_RETRY_MAX   = 2    # attempts on ONE account before rotating to the next candidate
+SOFT_FAIL_CRITICAL = 1    # sticky limit in critical window (< CRITICAL_WINDOW_SECS to event)
 
 # Patterns that identify HARD failures (server-side account rejection, unrecoverable).
 # Matched case-insensitively against the full error/rejection string.
@@ -138,7 +136,7 @@ _PDF_DIR  = _CORE_DIR / "data" / "pdfs"
 class Worker:
     def __init__(
         self,
-        account:          dict,
+        accounts:         list[dict],                    # candidate accounts for one identity (>=1)
         role:             str,                           # "real" | "scout"
         signal_bus,                                      # SlotSignalBus
         slot_manager,                                    # SlotManager
@@ -156,9 +154,15 @@ class Worker:
         apply_sem:        asyncio.Semaphore | None = None,
         proxy_pool        = None,
     ):
-        self.account          = account
-        self.username         = account["username"]
-        self.worker_id        = self.username
+        # Candidate accounts for this identity, in try-order. self.account is always
+        # the currently-active one; _advance_candidate() switches to the next when
+        # the current one exhausts its sticky retries (or fails unrecoverably later).
+        self._candidates      = accounts
+        self._acct_idx        = 0
+        self.account          = accounts[0]
+        self.username         = self.account["username"]
+        self.identity_id      = self.account.get("identity_id") or self.username
+        self.worker_id        = self.identity_id
         self.role             = role
         self._signal_bus      = signal_bus
         self._slot_manager    = slot_manager
@@ -193,12 +197,24 @@ class Worker:
         self._stop_event         = asyncio.Event()
         self._stop_requested_at  = 0.0
 
-        # Login failure counters — persisted across soft-pause retry rounds so
-        # hard failures genuinely accumulate even when the outer loop retries.
-        # soft_fail and global_fail stay local to each _phase_login() call
-        # (soft resets by design; global is a per-round safety guard).
-        self._hard_fail    = 0
-        self._unknown_fail = 0
+        # Sticky-retry counter for the CURRENTLY active candidate account. Reset
+        # to 0 by _advance_candidate() whenever we switch to a new account.
+        self._sticky_attempts = 0
+
+    # -- Identity: candidate account rotation -----------------------------------
+
+    def _advance_candidate(self) -> bool:
+        """Switch to the next untried candidate account for this identity.
+        Returns False if no candidates remain (identity exhausted)."""
+        self._acct_idx += 1
+        if self._acct_idx >= len(self._candidates):
+            return False
+        self.account = self._candidates[self._acct_idx]
+        self.username = self.account["username"]
+        self._sticky_attempts = 0
+        self._log(f"rotating to alternate account (candidate {self._acct_idx + 1}/{len(self._candidates)})")
+        return True
+
 
     # -- Entry point -----------------------------------------------------------
 
@@ -206,43 +222,21 @@ class Worker:
         try:
             resumed = await self._try_resume()
             if not resumed:
-                ok     = False
-                reason = "unknown"
-                while True:
-                    async with self._login_sem:
-                        ok, reason = await self._phase_login()
-                    if ok:
-                        break
-
-                    # Soft exhaustion in normal window: pause and retry with fresh proxies.
-                    # The semaphore is released during the sleep so other workers can log in.
-                    if (reason == "soft"
-                            and not self._is_critical_window()
-                            and not self._stop_event.is_set()
-                            and not self._past_lifetime()):
-                        self._log(
-                            f"soft proxy exhaustion — pausing {SOFT_PAUSE_SECS}s "
-                            "before retry with fresh proxies", "warning")
-                        await asyncio.sleep(SOFT_PAUSE_SECS)
-                        if self._stop_event.is_set():
-                            self._report("stopped", {"reason": "stop_during_login_pause"})
-                            return
-                        if self._past_lifetime():
-                            self._report("expired", {"reason": "lifetime_during_login_pause"})
-                            return
-                        continue  # re-enter login with fresh proxy batch
-                    break  # any other reason (hard/unknown/global/soft-critical) → terminal
+                async with self._login_sem:
+                    ok, reason = await self._phase_login()
 
                 if not ok:
-                    _reason_labels = {
-                        "hard":    "login_hard_exhausted",    # → login_failed written to CSV
-                        "soft":    "login_soft_exhausted",    # account stays verified
-                        "unknown": "login_unknown_exhausted", # account stays verified
-                        "global":  "login_global_exhausted",  # account stays verified
-                        "stopped": "stop_requested",
-                    }
+                    if reason == "stopped":
+                        self._report("stopped", {"reason": "stop_requested"})
+                        return
+                    # "exhausted": every candidate account for this identity ran out of
+                    # sticky retries (or got hard-rejected). Manager decides per-account
+                    # CSV status from hard_failed_usernames vs. the full candidate list.
                     self._report("failed", {
-                        "reason": _reason_labels.get(reason, f"login_{reason}_exhausted")})
+                        "reason": "identity_login_exhausted",
+                        "hard_failed_usernames": sorted(self._hard_failed_usernames),
+                        "candidate_usernames": [a["username"] for a in self._candidates],
+                    })
                     return
                 await self._phase_warmup()
                 if self.state in ("failed", "expired", "stopped"):
@@ -337,19 +331,22 @@ class Worker:
 
     async def _phase_login(self) -> tuple[bool, str]:
         """
-        Login loop with hard/soft/unknown failure classification.
+        Sticky/rotating login retry, per identity (see STICKY_RETRY_MAX docstring above).
+
+        Sticky: up to STICKY_RETRY_MAX attempts on the CURRENT candidate account, each
+        with a freshly-rotated proxy. An explicit hard (server-side) rejection skips
+        straight to rotation — retrying the same account against an explicit "wrong
+        credentials"/"suspended" response would never succeed.
+        Rotating: once the current account's sticky attempts are exhausted (or it gets
+        a hard rejection), advance to the next candidate account for this identity.
 
         Returns (True, "ok") on success.
-        Returns (False, reason) on exhaustion:
-          "hard"    — explicit server-side account rejection (HARD_FAIL_LIMIT reached)
-          "soft"    — proxy connectivity attrition (SOFT_FAIL_LIMIT reached); account stays verified
-          "unknown" — unclassified failures (UNKNOWN_FAIL_LIMIT reached); account stays verified
-          "global"  — total safety guard (GLOBAL_FAIL_LIMIT reached); account stays verified
-          "stopped" — _stop_event set before exhaustion
+        Returns (False, "exhausted") once every candidate account has been tried.
+        Returns (False, "stopped") if _stop_event fires mid-loop.
 
-        self._hard_fail and self._unknown_fail are instance variables that accumulate across
-        soft-pause retry rounds. soft_fail and global_fail are reset each call (soft resets
-        by design; global is a per-round safety guard, not a cross-round accumulator).
+        self._hard_failed_usernames accumulates which specific candidate accounts got
+        an explicit server-side rejection (vs. just running out of sticky attempts) —
+        read by the caller to decide CSV status per account once the identity retires.
         """
         import session as sess
         import json as _json
@@ -359,30 +356,28 @@ class Worker:
         self._report("logging_in", {})
         cap = self._solver_keys
 
-        soft_fail   = 0
-        global_fail = 0
-        attempt     = 0   # monotonic for log messages
+        self._hard_failed_usernames: set[str] = set()
+        attempt = 0   # monotonic across the whole identity (all candidates), for log messages
 
         while True:
-            # Recompute soft_limit each iteration so the critical window tightening
+            # Recompute sticky_limit each iteration so the critical window tightening
             # applies the moment event_time crosses the threshold.
-            soft_limit = SOFT_FAIL_CRITICAL if self._is_critical_window() else SOFT_FAIL_LIMIT
+            sticky_limit = SOFT_FAIL_CRITICAL if self._is_critical_window() else STICKY_RETRY_MAX
 
             if self._stop_event.is_set():
                 return False, "stopped"
-            if self._hard_fail    >= HARD_FAIL_LIMIT:
-                self._log(f"hard failure limit reached ({self._hard_fail}) — retiring", "error")
-                return False, "hard"
-            if soft_fail          >= soft_limit:
-                return False, "soft"
-            if self._unknown_fail >= UNKNOWN_FAIL_LIMIT:
-                self._log(f"unknown failure limit reached ({self._unknown_fail}) — retiring", "error")
-                return False, "unknown"
-            if global_fail        >= GLOBAL_FAIL_LIMIT:
-                self._log(f"global failure limit reached ({global_fail}) — retiring", "error")
-                return False, "global"
+
+            if self._sticky_attempts >= sticky_limit:
+                self._log(
+                    f"{self.username} exhausted sticky retries "
+                    f"({self._sticky_attempts}/{sticky_limit})", "warning")
+                if not self._advance_candidate():
+                    self._log("all candidate accounts exhausted — identity retiring", "error")
+                    return False, "exhausted"
+                continue  # retry loop with the newly-rotated-in account
 
             attempt += 1
+            self._sticky_attempts += 1
             login_proxy = self._proxy_req()
             s = None
 
@@ -442,8 +437,9 @@ class Worker:
                     if self.started_at == 0.0:
                         self.started_at = time.time()
                     self._log(
-                        f"login OK (attempt={attempt}  "
-                        f"hard={self._hard_fail} soft={soft_fail} unknown={self._unknown_fail})")
+                        f"login OK  account={self.username}  "
+                        f"(attempt={attempt}  sticky={self._sticky_attempts}/{sticky_limit}  "
+                        f"candidate={self._acct_idx + 1}/{len(self._candidates)})")
                     session_store.save(self.username, self.client, self.proxy)
                     if self._proxy_pool is not None:
                         self._executor.submit(self._proxy_pool.cache_ip, login_proxy)
@@ -455,42 +451,39 @@ class Worker:
                 fail_str = f"type={rtype} desc={_desc}"
                 kind     = _classify_login_failure(fail_str)
                 self._log(
-                    f"login rejected {fail_str!r}  [{kind}]  "
-                    f"(attempt={attempt} hard={self._hard_fail} soft={soft_fail} unk={self._unknown_fail})",
+                    f"login rejected {fail_str!r}  [{kind}]  account={self.username}  "
+                    f"(attempt={attempt} sticky={self._sticky_attempts}/{sticky_limit})",
                     "warning",
                 )
                 if kind == "hard":
-                    self._hard_fail += 1
-                elif kind == "soft":
-                    soft_fail += 1
-                    # JSON rejections mean proxy reached server fine;
-                    # don't penalise the proxy credential for a solver/server issue.
-                else:
-                    self._unknown_fail += 1
-                global_fail += 1
+                    self._hard_failed_usernames.add(self.username)
+                    self._log(f"hard rejection for {self.username} — rotating immediately", "warning")
+                    if not self._advance_candidate():
+                        return False, "exhausted"
+                # soft/unknown: fall through to top of loop, sticky counter already
+                # incremented above — will retry same account or rotate once the
+                # sticky limit is reached, on the next iteration.
 
             except Exception as e:
                 err_str = str(e)
                 kind    = _classify_login_failure(err_str)
                 self._log(
-                    f"login attempt {attempt} failed [{kind}]: {err_str}  "
-                    f"(hard={self._hard_fail} soft={soft_fail} unk={self._unknown_fail})",
+                    f"login attempt {attempt} failed [{kind}]: {err_str}  account={self.username}  "
+                    f"(sticky={self._sticky_attempts}/{sticky_limit})",
                     "warning",
                 )
                 if kind == "hard":
-                    self._hard_fail += 1
-                elif kind == "soft":
-                    soft_fail += 1
-                    if _is_proxy_fault(err_str):
-                        # Route failure to whichever pool actually owns this proxy.
-                        # IspFirstRequester exposes report_failure(); plain callables do not.
-                        if hasattr(self._proxy_req, "report_failure"):
-                            self._proxy_req.report_failure(login_proxy)
-                        elif self._proxy_pool is not None:
-                            self._proxy_pool.report_failure(login_proxy)
-                else:
-                    self._unknown_fail += 1
-                global_fail += 1
+                    self._hard_failed_usernames.add(self.username)
+                    self._log(f"hard rejection for {self.username} — rotating immediately", "warning")
+                    if not self._advance_candidate():
+                        return False, "exhausted"
+                elif _is_proxy_fault(err_str):
+                    # Route failure to whichever pool actually owns this proxy.
+                    # IspFirstRequester exposes report_failure(); plain callables do not.
+                    if hasattr(self._proxy_req, "report_failure"):
+                        self._proxy_req.report_failure(login_proxy)
+                    elif self._proxy_pool is not None:
+                        self._proxy_pool.report_failure(login_proxy)
 
             finally:
                 if s is not None:
@@ -576,7 +569,12 @@ class Worker:
         Attempt to recover a dead session.
         1. Cookie-swap (5 proxy rotations, no browser, no CAPTCHA).
         2. Full re-login (LOGIN_MAX_ATTEMPTS or CRITICAL_LOGIN_MAX).
-        After recovery: re-run warmup to reach "warmed" state.
+        After recovery: skip re-warmup entirely if the checkpoint already gave us a
+        posto_pdf (i.e. we were previously warmed to Schedule.jsp) — same shortcut
+        _try_resume() takes at worker startup, just reached from mid-run recovery
+        instead. _ensure_form_state() re-verifies actual server-side readiness right
+        before the next apply attempt regardless, so skipping the redundant re-warm
+        here is safe: a stale/wrong posto_pdf gets caught and re-warmed there anyway.
         Returns True if worker ends up in "warmed" state.
         """
         import session_store
@@ -586,6 +584,10 @@ class Worker:
         if restored:
             self._log("restore: cookie swap succeeded")
             self._report("logged_in", {"restored": "cookie_swap"})
+            if self.posto_pdf:
+                self._log(f"restore: checkpoint already warmed (posto_pdf={self.posto_pdf}) -- skipping re-warmup")
+                self._report("warmed", {"resumed": "checkpoint_after_restore"})
+                return True
             await self._phase_warmup()
             return self.state == "warmed"
 
