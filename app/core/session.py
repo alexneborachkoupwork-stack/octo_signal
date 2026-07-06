@@ -690,8 +690,18 @@ class PlaywrightSession:
                     # payload (e.g. MostrarPdf's application/pdf) rather than HTML.
                     # page.content() can't be used here -- Chromium's built-in PDF viewer
                     # intercepts the response into its own viewer shell, not raw bytes.
-                    # Playwright's response listener gives the real bytes regardless of
-                    # content-type, so capture that instead of reading the DOM afterward.
+                    #
+                    # expect_response() + response.body() (the first approach tried here)
+                    # is unreliable for a main-frame navigation TO a binary resource --
+                    # confirmed live: "Protocol error (Network.getResponseBody): No
+                    # resource with given identifier found". Chrome can evict the response
+                    # from its network cache before Playwright's CDP call retrieves it,
+                    # especially once the main frame has already navigated/repainted.
+                    # page.route() interception avoids this: route.fetch() performs the
+                    # request itself and returns a completed APIResponse with the body
+                    # already downloaded, then route.fulfill() replays it to the browser
+                    # so the real navigation still happens normally (same WAF-bypass
+                    # characteristics -- one real request/response cycle either way).
                     try:
                         target_action = cmd.get("action_contains", "MostrarPdf")
                         _check_js = f"""(() => {{
@@ -704,24 +714,46 @@ class PlaywrightSession:
                         if not _form_action:
                             self._res_q.put(("err", "no_form_found"))
                         else:
-                            _submit_js = f"""(() => {{
-                                const forms = Array.from(document.querySelectorAll('form'));
-                                const f = forms.find(x => x.action && x.action.includes({_json.dumps(target_action)})) || forms[0];
-                                f.submit();
-                                return 'submitted:' + f.action;
-                            }})()"""
-                            with page.expect_response(
-                                lambda r, _a=target_action: _a in r.url, timeout=45000
-                            ) as _resp_info:
+                            _captured: dict = {}
+
+                            def _handle_route(route, _a=target_action):
+                                _resp = route.fetch()
+                                _captured["status"]  = _resp.status
+                                _captured["headers"] = _resp.headers
+                                _captured["body"]    = _resp.body()
+                                _captured["url"]     = route.request.url
+                                route.fulfill(response=_resp)
+
+                            _route_pattern = f"**/*{target_action}*"
+                            page.route(_route_pattern, _handle_route)
+                            try:
+                                _submit_js = f"""(() => {{
+                                    const forms = Array.from(document.querySelectorAll('form'));
+                                    const f = forms.find(x => x.action && x.action.includes({_json.dumps(target_action)})) || forms[0];
+                                    f.submit();
+                                    return 'submitted:' + f.action;
+                                }})()"""
                                 page.evaluate(_submit_js)
-                            _response = _resp_info.value
-                            _status = _response.status
-                            _ct = _response.headers.get("content-type", "")
-                            _body = _response.body()
-                            print(f"[session] submit_form_binary -> {_response.url}  status={_status}  "
-                                  f"content-type={_ct}  len={len(_body)}")
-                            self._res_q.put(("ok", {"status": _status, "content_type": _ct,
-                                                     "url": _response.url, "body": _body}))
+                                for _ in range(20):  # up to ~10s for the route to fire
+                                    if _captured:
+                                        break
+                                    page.wait_for_timeout(500)
+                            finally:
+                                page.unroute(_route_pattern, _handle_route)
+
+                            if not _captured:
+                                self._res_q.put(("err", "route_never_captured"))
+                            else:
+                                print(f"[session] submit_form_binary -> {_captured['url']}  "
+                                      f"status={_captured['status']}  "
+                                      f"content-type={_captured['headers'].get('content-type','')}  "
+                                      f"len={len(_captured['body'])}")
+                                self._res_q.put(("ok", {
+                                    "status": _captured["status"],
+                                    "content_type": _captured["headers"].get("content-type", ""),
+                                    "url": _captured["url"],
+                                    "body": _captured["body"],
+                                }))
                     except Exception as exc:
                         self._res_q.put(("err", str(exc)))
 

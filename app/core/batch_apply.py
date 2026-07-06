@@ -743,7 +743,351 @@ async def apply_warmup(acct: dict, posto_id: str,
             "sched_url": sched_url}
 
 
-# -- apply_book: steps 7-9 -----------------------------------------------------
+def _tokenize_periods_any(s: str, used: set | None = None) -> list | None:
+    """Backtracking: fully tokenize s into distinct period numbers (1-14), 1-digit for
+    periods 1-9 and 2-digit for 10-14. Returns list of ints, or None if the string can't
+    be fully consumed this way. Needs backtracking (not greedy 2-digit-first) since e.g.
+    "12" at a token boundary could be the number 12, or 1 then 2 -- greedy misreads this."""
+    used = set(used or [])
+    def rec(i, used):
+        if i == len(s):
+            return []
+        for tok_len in (1, 2):
+            if i + tok_len > len(s):
+                continue
+            chunk = s[i:i+tok_len]
+            if chunk[0] == '0':
+                continue
+            cand = int(chunk)
+            if not (1 <= cand <= 14) or cand in used:
+                continue
+            rest = rec(i + tok_len, used | {cand})
+            if rest is not None:
+                return [cand] + rest
+        return None
+    return rec(0, used)
+
+
+def _parse_periodos_ocupados(s: str) -> tuple[list[int], list[int]] | tuple[None, None]:
+    """
+    periodos_ocupados is the list of OCCUPIED period IDs (1-14), concatenated with no
+    separator (1-digit for 1-9, 2-digit for 10-14). Any period number that never appears
+    in the string is FREE -- confirmed live 2026-07-05/06 via same-session cross-check
+    against /slots (which under-reports) and by successfully booking against periods
+    this decoded as free. Empty string = all 14 free. Do not resurrect the earlier
+    "free-prefix + ascending-occupied-suffix" theory -- it was a misread of examples that
+    happened to all be fully-occupied. See CONFIRMED_BOOKING_PIPELINE.md at repo root.
+    """
+    occ = _tokenize_periods_any(s)
+    if occ is None:
+        return None, None
+    free = sorted(set(range(1, 15)) - set(occ))
+    return free, sorted(occ)
+
+
+async def discover_slots_via_calendar(client, posto_id: str, executor: ThreadPoolExecutor,
+                                       num_days: int = 10) -> list[dict]:
+    """
+    Primary slot discovery — CONFIRMED 2026-07-06 to find real availability that /slots
+    misses (same-session cross-check: /slots returned {"data":{}} while this found free
+    periods that then got successfully booked). Requires a real browser (browser_nav) --
+    bare fetch()/primp GETs get DataDome-blocked regardless of session health.
+
+    1. gettime?id_posto=X -> SPECIAL_DAYS[year][month] = closed/holiday days.
+    2. getPeriodosOcupados for the next `num_days` weekdays (skipping SPECIAL_DAYS) ->
+       parse via _parse_periodos_ocupados(), collect any date with a non-empty free list.
+
+    Returns a slots_json-compatible list: [{"date": "YYYY-MM-DD", "periods": [{"id": N}, ...]}]
+    for feeding straight into SlotManager.update_pool()/request_slot(), same shape /slots
+    itself produces. Returns [] if no browser, no free periods found, or on any error --
+    caller should fall through to the existing /slots-based path in that case.
+    """
+    if not hasattr(client, "browser_nav"):
+        return []
+
+    loop = asyncio.get_event_loop()
+
+    def _nav_and_read(url: str) -> str:
+        client.browser_nav(url, timeout=30)
+        return client.browser_eval("document.documentElement.outerHTML") or ""
+
+    try:
+        gt_url = f"https://pedidodevistos.mne.gov.pt/VistosOnline/gettime?id_posto={posto_id}"
+        gt_body = await loop.run_in_executor(executor, _nav_and_read, gt_url)
+    except Exception:
+        return []
+
+    special_days: dict[int, dict[int, set[int]]] = {}
+    for year, month, days_str in re.findall(
+        r"SPECIAL_DAYS\[(\d{4})\]\[(\d+)\]\s*=\s*new Array\((.*?)\);", gt_body
+    ):
+        days = {int(d.strip("'\"")) for d in days_str.split(",") if d.strip()}
+        special_days.setdefault(int(year), {})[int(month)] = days
+
+    candidates = []
+    cur = date.today() + timedelta(days=1)
+    while len(candidates) < num_days:
+        y, m, d = cur.year, cur.month, cur.day
+        if cur.weekday() < 5 and d not in special_days.get(y, {}).get(m, set()):
+            candidates.append(cur)
+        cur += timedelta(days=1)
+
+    found: list[dict] = []
+    for d in candidates:
+        po_url = (f"https://pedidodevistos.mne.gov.pt/VistosOnline/"
+                  f"getPeriodosOcupados?id_posto={posto_id}&data_agendamento={d.strftime('%Y/%m/%d')}")
+        try:
+            po_body = await loop.run_in_executor(executor, _nav_and_read, po_url)
+        except Exception:
+            continue
+        m = re.search(r"periodos_ocupados='(\d*)", po_body)
+        if not m:
+            continue
+        free, _occ = _parse_periodos_ocupados(m.group(1))
+        if free:
+            found.append({"date": d.strftime("%Y-%m-%d"), "periods": [{"id": p} for p in free]})
+
+    return found
+
+
+async def _slots_via_endpoint(client, posto_id: str,
+                              capsolver_keys: list[str], anticaptcha_keys: list[str],
+                              twocaptcha_keys: list[str], capmonster_keys: list[str],
+                              executor: ThreadPoolExecutor,
+                              proxy: str | None, username: str,
+                              sched_jsp_url: str) -> tuple[str, list | None]:
+    """
+    Secondary/fallback slot discovery via the official /slots endpoint (kept for
+    validated-state acquisition — confirmed 2026-07-06 to under-report real availability
+    vs. discover_slots_via_calendar(), which is now the primary path in apply_book()).
+    Returns (status, slots_json): status is one of "ok"/"no_slot"/"error"/"captcha_failed"/
+    "proxy_blocked"; slots_json is the normalized list (see discover_slots_via_calendar's
+    docstring for the shape) when status == "ok", else None.
+    """
+    import session as sess
+    import solver as solvermod
+
+    loop = asyncio.get_event_loop()
+
+    # Step 7: CAPTCHA + /slots
+    _log(username, f"CAPTCHA solve for SCHEDULE_EVISA (proxy={proxy})")
+    try:
+        token = await loop.run_in_executor(
+            executor,
+            lambda: solvermod.race_all(
+                capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
+                "SCHEDULE_EVISA", proxy, min_score=50,
+            ),
+        )
+    except Exception as e:
+        _log(username, f"CAPTCHA failed: {e}")
+        return "captcha_failed", None
+
+    _log(username, f"POST /slots?posto_id={posto_id}")
+    _has_browser = hasattr(client, "browser_fetch")
+
+    # Extract session cookies for proxy-rotation retries
+    import session_store as _ss
+    _primp_c = getattr(client, "client", client)
+    try:
+        _session_cookies = _primp_c.get_cookies(_ss.COOKIES_URL) or {}
+    except Exception:
+        _session_cookies = {}
+
+    slots_text = ""
+    slots_status = 0
+    _dd_unblock_tried = False
+    for _slot_attempt in range(_SLOTS_PROXY_RETRIES + 1):
+        _is_first = (_slot_attempt == 0)
+        _method = ""
+        try:
+            if _is_first and _has_browser and hasattr(client, "browser_form_post"):
+                # Try a real navigation (form.submit()) first — the same trick that
+                # already bypasses DataDome for Formulario/login. fetch()/XHR calls to
+                # this endpoint get blocked because bd.js never runs against them; a
+                # real navigation runs bd.js and is generally trusted, regardless of
+                # whether the body it returns is the raw JSON or an HTML-wrapped page.
+                try:
+                    _fp_url, _fp_html = await loop.run_in_executor(
+                        executor, lambda: client.browser_form_post(
+                            SLOTS_URL + "?posto_id=" + posto_id,
+                            {"posto_id": posto_id, "captcha": token}, timeout=100))
+                    _fp_snip = _fp_html[:300]
+                    _fp_blank = _fp_html.strip() in (
+                        "", "<html><head></head><body></body></html>",
+                    )
+                    if _fp_blank:
+                        # Real navigation landed on chrome-error://chromewebdata/ (a proxy
+                        # connection failure mid-navigation, e.g. ERR_TUNNEL_CONNECTION_FAILED)
+                        # — not a DataDome block, not a real empty-slots answer. Must rotate
+                        # like any other failed attempt, not be accepted as a final response.
+                        _log(username, "slots: browser_form_post landed on blank/chrome-error page (proxy connection failure) — falling back to fetch")
+                        slots_text, slots_status, _method = "", 0, ""
+                    elif not (
+                        "body{margin:0;background:#fff}" in _fp_snip
+                        or "datadome" in _fp_snip.lower()
+                    ):
+                        slots_text = _fp_html
+                        slots_status = 200
+                        _method = "browser_form_post"
+                    else:
+                        _log(username, "slots: browser_form_post also DataDome-blocked — falling back to fetch")
+                        slots_text, slots_status, _method = "", 0, ""
+                except Exception as _fpe:
+                    _log(username, f"slots: browser_form_post failed: {_fpe} — falling back to fetch")
+                    slots_text, slots_status, _method = "", 0, ""
+
+            if _is_first and _has_browser and not _method:
+                raw = await loop.run_in_executor(executor, lambda: client.browser_fetch(
+                    SLOTS_URL, {"posto_id": posto_id, "captcha": token},
+                    params={"posto_id": posto_id},
+                    headers={"X-Requested-With": "XMLHttpRequest", "Referer": sched_jsp_url},
+                    timeout=30))
+                slots_text = raw["body"]
+                slots_status = raw["status"]
+                _method = "browser_fetch"
+            if not _is_first or not _has_browser:
+                import primp as _primp
+                _rot_proxy = _next_slots_proxy()
+                _log(username, f"slots: rotating to fresh proxy (attempt {_slot_attempt}), re-solving CAPTCHA")
+                # Re-solve CAPTCHA — tokens are single-use; the token solved before
+                # the loop is expired by the time any retry runs.
+                try:
+                    token = await loop.run_in_executor(
+                        executor,
+                        lambda: solvermod.race_all(
+                            capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
+                            "SCHEDULE_EVISA", _rot_proxy, min_score=50,
+                        ),
+                    )
+                except Exception as _ce:
+                    _log(username, f"slots: CAPTCHA re-solve failed (attempt {_slot_attempt}): {_ce}")
+                    if _slot_attempt >= _SLOTS_PROXY_RETRIES:
+                        return "captcha_failed", None
+                    continue
+                _tmp = _primp.Client(
+                    proxy=_rot_proxy, impersonate="chrome_131",
+                    verify=True, follow_redirects=False)
+                if _session_cookies:
+                    _tmp.set_cookies(_ss.COOKIES_URL, _session_cookies)
+                r = await loop.run_in_executor(executor, lambda: _tmp.post(
+                    SLOTS_URL, params={"posto_id": posto_id},
+                    data={"posto_id": posto_id, "captcha": token},
+                    headers={**sess.HEADERS_XHR, "Referer": sched_jsp_url}, timeout=30))
+                slots_text, slots_status = r.text, r.status_code
+                _method = f"primp(proxy#{_slot_attempt})"
+        except Exception as _e:
+            _log(username, f"slots: fetch error (attempt {_slot_attempt}): {_e}")
+            if _slot_attempt >= _SLOTS_PROXY_RETRIES:
+                return "error", None
+            continue
+
+        _body_snip = slots_text[:300]
+        if slots_status == 302:
+            _log(username, f"slots: 302 redirect via {_method} (session expired or WAF) (attempt {_slot_attempt})")
+            if _slot_attempt >= _SLOTS_PROXY_RETRIES:
+                return "proxy_blocked", None
+            continue  # rotate proxy and retry
+        if "body{margin:0;background:#fff}" in _body_snip or "datadome" in _body_snip.lower():
+            _log(username, f"slots: DataDome block via {_method} (attempt {_slot_attempt})")
+            if _is_first and _has_browser and not _dd_unblock_tried:
+                _dd_unblock_tried = True
+                # This is DataDome's lightweight "tag" challenge (bd.js + location.reload()),
+                # the same one session.py already handles elsewhere by waiting then re-GETting
+                # the same URL — NOT the interactive slider/CAPTCHA challenge login hits. Try
+                # the cheap fix first: wait for bd.js's timing check to pass, then retry the
+                # exact same request on the same proxy/session before spending a proxy rotation.
+                _log(username, "slots: tag-challenge — waiting 4s then retrying same proxy")
+                await asyncio.sleep(4)
+                try:
+                    raw = await loop.run_in_executor(executor, lambda: client.browser_fetch(
+                        SLOTS_URL, {"posto_id": posto_id, "captcha": token},
+                        params={"posto_id": posto_id},
+                        headers={"X-Requested-With": "XMLHttpRequest", "Referer": sched_jsp_url},
+                        timeout=30))
+                    slots_text = raw["body"]
+                    slots_status = raw["status"]
+                    _body_snip = slots_text[:300]
+                    if slots_status != 302 and not (
+                        "body{margin:0;background:#fff}" in _body_snip
+                        or "datadome" in _body_snip.lower()
+                    ):
+                        break  # wait-and-retry worked — got a real response
+                    _log(username, "slots: still blocked after wait-and-retry — trying interactive unblock")
+                except Exception as _we:
+                    _log(username, f"slots: wait-and-retry failed: {_we}")
+
+                # Fallback: in case this WAS the heavier interactive challenge, try the
+                # iframe-based DatadomeSliderTask solve (same mechanism as the login path).
+                _challenge_url = SLOTS_URL + "?posto_id=" + posto_id
+                _unblocked = await loop.run_in_executor(
+                    executor, lambda: client.unblock_datadome(_challenge_url, capsolver_keys))
+                if _unblocked:
+                    _log(username, "slots: datadome unblocked (interactive) — retrying same proxy")
+                    try:
+                        raw = await loop.run_in_executor(executor, lambda: client.browser_fetch(
+                            SLOTS_URL, {"posto_id": posto_id, "captcha": token},
+                            params={"posto_id": posto_id},
+                            headers={"X-Requested-With": "XMLHttpRequest", "Referer": sched_jsp_url},
+                            timeout=30))
+                        slots_text = raw["body"]
+                        slots_status = raw["status"]
+                        _body_snip = slots_text[:300]
+                        if slots_status != 302 and not (
+                            "body{margin:0;background:#fff}" in _body_snip
+                            or "datadome" in _body_snip.lower()
+                        ):
+                            break  # unblock worked — got a real response
+                        _log(username, "slots: still blocked after interactive unblock")
+                    except Exception as _ue:
+                        _log(username, f"slots: retry after unblock failed: {_ue}")
+            if _slot_attempt >= _SLOTS_PROXY_RETRIES:
+                return "proxy_blocked", None
+            continue  # rotate proxy and retry
+        break  # got a real response
+
+    try:
+        slots_json = json.loads(slots_text)
+    except Exception:
+        # When the response comes via a real browser navigation (browser_form_post),
+        # Chrome wraps a raw JSON response in its built-in viewer HTML: <pre>{...}</pre>.
+        # Unwrap that before giving up.
+        _pre_m = re.search(r"<pre[^>]*>(.*?)</pre>", slots_text, re.DOTALL)
+        if _pre_m:
+            try:
+                slots_json = json.loads(_pre_m.group(1).strip())
+            except Exception:
+                _log(username, f"slots: non-JSON response (pre-unwrap failed): {slots_text[:300]}")
+                return "error", None
+        else:
+            _log(username, f"slots: non-JSON response: {slots_text[:300]}")
+            return "error", None
+
+    _log(username, f"slots raw: {json.dumps(slots_json)[:600]}")
+    await _evidence(client, username, "slots", executor)
+
+    if isinstance(slots_json, dict):
+        if slots_json.get("type") == "error":
+            _log(username, f"slots: server error: {slots_json.get('description', '')}")
+            return "error", None
+        slots_data = slots_json.get("data") or {}
+        if not slots_data:
+            _log(username, "slots: empty data -- no appointments available")
+            return "no_slot", None
+        slots_json = [
+            {"date": d, "periods": [{"id": p} if not isinstance(p, dict) else p
+                                    for p in (ps if isinstance(ps, list) else [ps])]}
+            for d, ps in slots_data.items()
+        ]
+        _log(username, f"slots normalized: {json.dumps(slots_json)[:300]}")
+
+    if not slots_json:
+        _log(username, "slots: empty -- no appointments available")
+        return "no_slot", None
+
+    _log(username, f"slots: {len(slots_json)} dates available")
+    return "ok", slots_json
+
 
 async def apply_book(acct: dict, posto_id: str, posto_pdf: str,
                      slot_manager,
@@ -759,230 +1103,55 @@ async def apply_book(acct: dict, posto_id: str, posto_pdf: str,
     Returns "applied" | "no_slot" | "error" | "captcha_failed".
     """
     import session as sess
-    import solver as solvermod
 
     username      = acct["username"]
     loop          = asyncio.get_event_loop()
     sched_jsp_url = SCHED_JSP + "?posto_id=" + posto_id
 
-    try:
-        # Step 7: CAPTCHA + /slots
-        _log(username, f"CAPTCHA solve for SCHEDULE_EVISA (proxy={proxy})")
+    # A cookie-swap _restore() hands us a primp-only client (no browser). The ENTIRE
+    # confirmed apply path — calendar discovery (browser_nav), SubmeterVisto
+    # (browser_form_post), PDF (submit_form_binary) — needs a real browser, so a
+    # primp-only session silently degrades to raw-primp /slots (which under-reports).
+    # Rebuild a browser from the restored cookies+proxy so restored workers get the
+    # same confirmed path as freshly-warmed ones. Degrades safely: if the rebuild fails
+    # (e.g. proxy flagged), we keep the primp client and fall through to /slots as before.
+    _temp_browser = None
+    if not hasattr(client, "browser_nav") and proxy:
+        import session as _sessmod
+        import session_store as _ss2
+        _primp_for_cookies = getattr(client, "client", client)
         try:
-            token = await loop.run_in_executor(
-                executor,
-                lambda: solvermod.race_all(
-                    capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
-                    "SCHEDULE_EVISA", proxy, min_score=50,
-                ),
-            )
-        except Exception as e:
-            _log(username, f"CAPTCHA failed: {e}")
-            return "captcha_failed"
-
-        _log(username, f"POST /slots?posto_id={posto_id}")
-        _has_browser = hasattr(client, "browser_fetch")
-
-        # Extract session cookies for proxy-rotation retries
-        import session_store as _ss
-        _primp_c = getattr(client, "client", client)
-        try:
-            _session_cookies = _primp_c.get_cookies(_ss.COOKIES_URL) or {}
+            _restore_ck = _primp_for_cookies.get_cookies(_ss2.COOKIES_URL) or {}
         except Exception:
-            _session_cookies = {}
-
-        slots_text = ""
-        slots_status = 0
-        _dd_unblock_tried = False
-        for _slot_attempt in range(_SLOTS_PROXY_RETRIES + 1):
-            _is_first = (_slot_attempt == 0)
-            _method = ""
+            _restore_ck = {}
+        if _restore_ck:
+            _log(username, "apply: primp-only (restored) session — rebuilding browser from cookies for confirmed path")
             try:
-                if _is_first and _has_browser and hasattr(client, "browser_form_post"):
-                    # Try a real navigation (form.submit()) first — the same trick that
-                    # already bypasses DataDome for Formulario/login. fetch()/XHR calls to
-                    # this endpoint get blocked because bd.js never runs against them; a
-                    # real navigation runs bd.js and is generally trusted, regardless of
-                    # whether the body it returns is the raw JSON or an HTML-wrapped page.
-                    try:
-                        _fp_url, _fp_html = await loop.run_in_executor(
-                            executor, lambda: client.browser_form_post(
-                                SLOTS_URL + "?posto_id=" + posto_id,
-                                {"posto_id": posto_id, "captcha": token}, timeout=100))
-                        _fp_snip = _fp_html[:300]
-                        _fp_blank = _fp_html.strip() in (
-                            "", "<html><head></head><body></body></html>",
-                        )
-                        if _fp_blank:
-                            # Real navigation landed on chrome-error://chromewebdata/ (a proxy
-                            # connection failure mid-navigation, e.g. ERR_TUNNEL_CONNECTION_FAILED)
-                            # — not a DataDome block, not a real empty-slots answer. Must rotate
-                            # like any other failed attempt, not be accepted as a final response.
-                            _log(username, "slots: browser_form_post landed on blank/chrome-error page (proxy connection failure) — falling back to fetch")
-                            slots_text, slots_status, _method = "", 0, ""
-                        elif not (
-                            "body{margin:0;background:#fff}" in _fp_snip
-                            or "datadome" in _fp_snip.lower()
-                        ):
-                            slots_text = _fp_html
-                            slots_status = 200
-                            _method = "browser_form_post"
-                        else:
-                            _log(username, "slots: browser_form_post also DataDome-blocked — falling back to fetch")
-                            slots_text, slots_status, _method = "", 0, ""
-                    except Exception as _fpe:
-                        _log(username, f"slots: browser_form_post failed: {_fpe} — falling back to fetch")
-                        slots_text, slots_status, _method = "", 0, ""
+                _temp_browser = await loop.run_in_executor(
+                    executor, lambda: _sessmod.get_session(proxy, inject_cookies=_restore_ck))
+                client = _temp_browser
+            except Exception as _tbe:
+                _log(username, f"apply: browser rebuild failed ({_tbe}) — continuing primp-only (/slots fallback)")
 
-                if _is_first and _has_browser and not _method:
-                    raw = await loop.run_in_executor(executor, lambda: client.browser_fetch(
-                        SLOTS_URL, {"posto_id": posto_id, "captcha": token},
-                        params={"posto_id": posto_id},
-                        headers={"X-Requested-With": "XMLHttpRequest", "Referer": sched_jsp_url},
-                        timeout=30))
-                    slots_text = raw["body"]
-                    slots_status = raw["status"]
-                    _method = "browser_fetch"
-                if not _is_first or not _has_browser:
-                    import primp as _primp
-                    _rot_proxy = _next_slots_proxy()
-                    _log(username, f"slots: rotating to fresh proxy (attempt {_slot_attempt}), re-solving CAPTCHA")
-                    # Re-solve CAPTCHA — tokens are single-use; the token solved before
-                    # the loop is expired by the time any retry runs.
-                    try:
-                        token = await loop.run_in_executor(
-                            executor,
-                            lambda: solvermod.race_all(
-                                capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
-                                "SCHEDULE_EVISA", _rot_proxy, min_score=50,
-                            ),
-                        )
-                    except Exception as _ce:
-                        _log(username, f"slots: CAPTCHA re-solve failed (attempt {_slot_attempt}): {_ce}")
-                        if _slot_attempt >= _SLOTS_PROXY_RETRIES:
-                            return "captcha_failed"
-                        continue
-                    _tmp = _primp.Client(
-                        proxy=_rot_proxy, impersonate="chrome_131",
-                        verify=True, follow_redirects=False)
-                    if _session_cookies:
-                        _tmp.set_cookies(_ss.COOKIES_URL, _session_cookies)
-                    r = await loop.run_in_executor(executor, lambda: _tmp.post(
-                        SLOTS_URL, params={"posto_id": posto_id},
-                        data={"posto_id": posto_id, "captcha": token},
-                        headers={**sess.HEADERS_XHR, "Referer": sched_jsp_url}, timeout=30))
-                    slots_text, slots_status = r.text, r.status_code
-                    _method = f"primp(proxy#{_slot_attempt})"
-            except Exception as _e:
-                _log(username, f"slots: fetch error (attempt {_slot_attempt}): {_e}")
-                if _slot_attempt >= _SLOTS_PROXY_RETRIES:
-                    return "error"
-                continue
+    # Defined here (not only inside _slots_via_endpoint) because Step 9's PDF-download
+    # path references it, and when calendar discovery succeeds _slots_via_endpoint is
+    # skipped entirely — otherwise NameError at the PDF step on the confirmed path.
+    _has_browser  = hasattr(client, "browser_fetch")
 
-            _body_snip = slots_text[:300]
-            if slots_status == 302:
-                _log(username, f"slots: 302 redirect via {_method} (session expired or WAF) (attempt {_slot_attempt})")
-                if _slot_attempt >= _SLOTS_PROXY_RETRIES:
-                    return "proxy_blocked"
-                continue  # rotate proxy and retry
-            if "body{margin:0;background:#fff}" in _body_snip or "datadome" in _body_snip.lower():
-                _log(username, f"slots: DataDome block via {_method} (attempt {_slot_attempt})")
-                if _is_first and _has_browser and not _dd_unblock_tried:
-                    _dd_unblock_tried = True
-                    # This is DataDome's lightweight "tag" challenge (bd.js + location.reload()),
-                    # the same one session.py already handles elsewhere by waiting then re-GETting
-                    # the same URL — NOT the interactive slider/CAPTCHA challenge login hits. Try
-                    # the cheap fix first: wait for bd.js's timing check to pass, then retry the
-                    # exact same request on the same proxy/session before spending a proxy rotation.
-                    _log(username, "slots: tag-challenge — waiting 4s then retrying same proxy")
-                    await asyncio.sleep(4)
-                    try:
-                        raw = await loop.run_in_executor(executor, lambda: client.browser_fetch(
-                            SLOTS_URL, {"posto_id": posto_id, "captcha": token},
-                            params={"posto_id": posto_id},
-                            headers={"X-Requested-With": "XMLHttpRequest", "Referer": sched_jsp_url},
-                            timeout=30))
-                        slots_text = raw["body"]
-                        slots_status = raw["status"]
-                        _body_snip = slots_text[:300]
-                        if slots_status != 302 and not (
-                            "body{margin:0;background:#fff}" in _body_snip
-                            or "datadome" in _body_snip.lower()
-                        ):
-                            break  # wait-and-retry worked — got a real response
-                        _log(username, "slots: still blocked after wait-and-retry — trying interactive unblock")
-                    except Exception as _we:
-                        _log(username, f"slots: wait-and-retry failed: {_we}")
-
-                    # Fallback: in case this WAS the heavier interactive challenge, try the
-                    # iframe-based DatadomeSliderTask solve (same mechanism as the login path).
-                    _challenge_url = SLOTS_URL + "?posto_id=" + posto_id
-                    _unblocked = await loop.run_in_executor(
-                        executor, lambda: client.unblock_datadome(_challenge_url, capsolver_keys))
-                    if _unblocked:
-                        _log(username, "slots: datadome unblocked (interactive) — retrying same proxy")
-                        try:
-                            raw = await loop.run_in_executor(executor, lambda: client.browser_fetch(
-                                SLOTS_URL, {"posto_id": posto_id, "captcha": token},
-                                params={"posto_id": posto_id},
-                                headers={"X-Requested-With": "XMLHttpRequest", "Referer": sched_jsp_url},
-                                timeout=30))
-                            slots_text = raw["body"]
-                            slots_status = raw["status"]
-                            _body_snip = slots_text[:300]
-                            if slots_status != 302 and not (
-                                "body{margin:0;background:#fff}" in _body_snip
-                                or "datadome" in _body_snip.lower()
-                            ):
-                                break  # unblock worked — got a real response
-                            _log(username, "slots: still blocked after interactive unblock")
-                        except Exception as _ue:
-                            _log(username, f"slots: retry after unblock failed: {_ue}")
-                if _slot_attempt >= _SLOTS_PROXY_RETRIES:
-                    return "proxy_blocked"
-                continue  # rotate proxy and retry
-            break  # got a real response
-
-        try:
-            slots_json = json.loads(slots_text)
-        except Exception:
-            # When the response comes via a real browser navigation (browser_form_post),
-            # Chrome wraps a raw JSON response in its built-in viewer HTML: <pre>{...}</pre>.
-            # Unwrap that before giving up.
-            _pre_m = re.search(r"<pre[^>]*>(.*?)</pre>", slots_text, re.DOTALL)
-            if _pre_m:
-                try:
-                    slots_json = json.loads(_pre_m.group(1).strip())
-                except Exception:
-                    _log(username, f"slots: non-JSON response (pre-unwrap failed): {slots_text[:300]}")
-                    return "error"
-            else:
-                _log(username, f"slots: non-JSON response: {slots_text[:300]}")
-                return "error"
-
-        _log(username, f"slots raw: {json.dumps(slots_json)[:600]}")
-        await _evidence(client, username, "slots", executor)
-
-        if isinstance(slots_json, dict):
-            if slots_json.get("type") == "error":
-                _log(username, f"slots: server error: {slots_json.get('description', '')}")
-                return "error"
-            slots_data = slots_json.get("data") or {}
-            if not slots_data:
-                _log(username, "slots: empty data -- no appointments available")
-                return "no_slot"
-            slots_json = [
-                {"date": d, "periods": [{"id": p} if not isinstance(p, dict) else p
-                                        for p in (ps if isinstance(ps, list) else [ps])]}
-                for d, ps in slots_data.items()
-            ]
-            _log(username, f"slots normalized: {json.dumps(slots_json)[:300]}")
-
-        if not slots_json:
-            _log(username, "slots: empty -- no appointments available")
-            return "no_slot"
-
-        _log(username, f"slots: {len(slots_json)} dates available")
+    try:
+        # Step 7: primary discovery via calendar (gettime + getPeriodosOcupados) — confirmed
+        # 2026-07-06 to find real availability /slots misses (see CONFIRMED_BOOKING_PIPELINE.md
+        # and discover_slots_via_calendar's docstring). /slots is kept as the fallback/secondary
+        # check (validated-state acquisition) when the calendar path finds nothing.
+        slots_json = await discover_slots_via_calendar(client, posto_id, executor)
+        if slots_json:
+            _log(username, f"slots (calendar discovery): {len(slots_json)} date(s) with free periods")
+        else:
+            _status, slots_json = await _slots_via_endpoint(
+                client, posto_id, capsolver_keys, anticaptcha_keys, twocaptcha_keys,
+                capmonster_keys, executor, proxy, username, sched_jsp_url)
+            if _status != "ok":
+                return _status
 
         # Step 8: Assign slot
         visible_slots = slots_json
@@ -1146,10 +1315,17 @@ async def apply_book(acct: dict, posto_id: str, posto_pdf: str,
             except Exception as pdf_err:
                 _log(username, f"PDF download error: {pdf_err}")
 
-            _csv_update(username, status="applied",
-                        appointment_ref=f"{slot_date}_{slot_period}",
-                        notes=f"booked:{slot_date} period:{slot_period}"
-                              + (" pdf_saved" if pdf_saved else ""))
+            # The booking already succeeded on the portal at this point — a CSV bookkeeping
+            # failure (e.g. test accounts live in test_accounts.csv, not the default
+            # accounts.csv that _csv_update targets) must NOT demote a real "applied" result
+            # to "error". Wrap so the return value reflects the actual booking outcome.
+            try:
+                _csv_update(username, status="applied",
+                            appointment_ref=f"{slot_date}_{slot_period}",
+                            notes=f"booked:{slot_date} period:{slot_period}"
+                                  + (" pdf_saved" if pdf_saved else ""))
+            except Exception as _cu_err:
+                _log(username, f"applied CSV update failed (non-fatal, booking still succeeded): {_cu_err}")
             _log(username, f"APPLIED  slot={slot_date} period={slot_period}  pdf={pdf_saved}")
             return "applied"
 
@@ -1172,6 +1348,14 @@ async def apply_book(acct: dict, posto_id: str, posto_pdf: str,
             except Exception:
                 pass
         return "error"
+    finally:
+        # Close the browser we rebuilt for a restored primp-only session (if any).
+        # The worker's own _browser_sess / primp client are never touched here.
+        if _temp_browser is not None:
+            try:
+                await loop.run_in_executor(executor, lambda: _temp_browser.close_browser(timeout=10))
+            except Exception:
+                pass
 
 
 # -- poll_slots_once: scout polling (lazy re-warm + /slots) --------------------

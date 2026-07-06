@@ -1,5 +1,11 @@
 # Pipeline Status Report — 2026-07-01
 
+> **SUPERSEDED 2026-07-06**: BLOCKER 3 (PDF/booking never tested) is now RESOLVED — two real
+> appointments booked end-to-end. See `CONFIRMED_BOOKING_PIPELINE.md` at the project root for the
+> current confirmed path, parsing algorithms, bug fixes, and what to avoid. The proxy blockers below
+> (1, 2, 4) were also superseded by a fresh 10,000-session SOAX pool generated 2026-07-04/05 — see
+> that doc's "Proxy pool status" section before treating this report's proxy advice as current.
+
 ## 1. What Is Confirmed / Working
 
 | Area | Status | Evidence |

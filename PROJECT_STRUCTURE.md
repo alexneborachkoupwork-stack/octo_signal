@@ -55,11 +55,11 @@ data/                       ← Identity generation utilities (unrelated root-le
 | Login | ✅ Confirmed | Playwright + external ProxyLess solver; score ≥55 on clean IPs |
 | Questionnaire (steps 1-6) | ✅ Confirmed | 7 steps CPV/IRL, primp HTTP only after login |
 | Schedule.jsp | ✅ Confirmed | ScheduleController multipart body → 302 → Schedule.jsp 200 |
-| Slot polling | ✅ Confirmed | `{"data":{}}` = genuine no-slot; CAPTCHA not enforced server-side |
+| Slot polling | ⚠️ Confirmed working but incomplete | `/slots` itself parses/works correctly, but under-reports real availability — confirmed via same-session cross-check against `gettime`+`getPeriodosOcupados`, which found free slots `/slots` reported as `{"data":{}}`. Use `gettime`+`getPeriodosOcupados` as primary discovery; see `CONFIRMED_BOOKING_PIPELINE.md` |
 | Session restore | ✅ Confirmed | Cookie + proxy URL checkpoint; alive up to ~9 min idle |
 | Scout + signal | ✅ Confirmed | Scouts poll every 300s; `signal_bus.fire()` wakes all real workers |
 | Engine layer | ✅ Confirmed | Manager + Worker + SlotSignalBus all proven in V4-V6 tests |
-| Booking + PDF | ⏳ Untested | Code matches HAR exactly; needs real open slot to test |
+| Booking + PDF | ✅ Confirmed 2026-07-06 | Two real bookings end-to-end via `gettime`+`getPeriodosOcupados` → `SubmeterVistoCriaPDF` → `MostrarPdf`; see `CONFIRMED_BOOKING_PIPELINE.md` |
 
 ---
 

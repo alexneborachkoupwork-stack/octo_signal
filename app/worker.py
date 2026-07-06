@@ -564,17 +564,49 @@ class Worker:
 
     # -- Restore (session dead) -------------------------------------------------
 
+    async def _rebuild_browser_from_cookies(self) -> bool:
+        """Rebuild a live browser session from the current (primp) client's cookies, so
+        the subsequent re-warm and apply run through a real browser rather than primp
+        (ScheduleController/Formulario go via browser_form_post/browser_fetch; a bare
+        primp POST is DataDome-blocked). get_session(inject_cookies=...) lands
+        authenticated on the portal via the restored Vistos_sid, skipping the WAF.
+        Sets self.client to the browser session. Returns False if no cookies/proxy or
+        the browser launch fails (caller degrades gracefully)."""
+        import session as sess
+        import session_store as _ss
+        loop = asyncio.get_event_loop()
+        _primp = getattr(self.client, "client", self.client)
+        try:
+            cookies = _primp.get_cookies(_ss.COOKIES_URL) or {}
+        except Exception:
+            cookies = {}
+        if not cookies or not self.proxy:
+            return False
+        try:
+            browser = await loop.run_in_executor(
+                self._executor, lambda: sess.get_session(self.proxy, inject_cookies=cookies))
+            self.client = browser
+            self._log("restore: rebuilt browser from restored cookies")
+            return True
+        except Exception as e:
+            self._log(f"restore: browser rebuild failed: {e}", "warning")
+            return False
+
     async def _restore(self) -> bool:
         """
-        Attempt to recover a dead session.
-        1. Cookie-swap (5 proxy rotations, no browser, no CAPTCHA).
-        2. Full re-login (LOGIN_MAX_ATTEMPTS or CRITICAL_LOGIN_MAX).
-        After recovery: skip re-warmup entirely if the checkpoint already gave us a
-        posto_pdf (i.e. we were previously warmed to Schedule.jsp) — same shortcut
-        _try_resume() takes at worker startup, just reached from mid-run recovery
-        instead. _ensure_form_state() re-verifies actual server-side readiness right
-        before the next apply attempt regardless, so skipping the redundant re-warm
-        here is safe: a stale/wrong posto_pdf gets caught and re-warmed there anyway.
+        Attempt to recover a dead / form-state-expired session.
+        1. Cookie-swap (5 proxy rotations, no CAPTCHA) — restores Vistos_sid via primp.
+        2. Full re-login if cookie-swap fails.
+
+        After a cookie-swap we MUST re-warm (re-run ScheduleController etc.) to
+        re-establish the server-side form state that gettime/getPeriodosOcupados/slots
+        all depend on — that state expires on its own TTL during the awaiting_signal
+        wait, which is the whole reason _ensure_form_state() calls us. Skipping the
+        re-warm (an earlier optimization) left form state stale and made apply see empty
+        slots. And the re-warm needs a real BROWSER (ScheduleController/Formulario go
+        through browser_form_post/browser_fetch; a bare primp POST is DataDome-blocked),
+        so rebuild one from the restored cookies before re-warming rather than re-warming
+        the primp client (which fails csrf_missing).
         Returns True if worker ends up in "warmed" state.
         """
         import session_store
@@ -584,10 +616,14 @@ class Worker:
         if restored:
             self._log("restore: cookie swap succeeded")
             self._report("logged_in", {"restored": "cookie_swap"})
-            if self.posto_pdf:
-                self._log(f"restore: checkpoint already warmed (posto_pdf={self.posto_pdf}) -- skipping re-warmup")
-                self._report("warmed", {"resumed": "checkpoint_after_restore"})
-                return True
+            # Rebuild a browser from the restored cookies so the re-warm (and the
+            # subsequent apply) run through a real browser, not primp. get_session()
+            # with inject_cookies lands authenticated on the portal, skipping WAF.
+            if await self._rebuild_browser_from_cookies():
+                await self._phase_warmup()
+                return self.state == "warmed"
+            # Browser rebuild failed (e.g. proxy flagged) — re-warm on primp as a last
+            # resort; likely fails, but better than returning True with stale form state.
             await self._phase_warmup()
             return self.state == "warmed"
 
@@ -893,10 +929,17 @@ class Worker:
             self._log("session dead before apply — restoring", "warning")
             return await self._restore()
 
-        self._log("form state expired (302) before apply — re-warming steps 2-6")
+        # Re-warm re-runs ScheduleController etc. to re-establish form state. This MUST
+        # go through the live browser (self._browser_sess, kept alive from warmup) — those
+        # steps use browser_form_post/browser_fetch, and a bare primp POST is DataDome-
+        # blocked (fails csrf_missing). Using self.client (raw primp) here was the bug
+        # that made every form-state re-warm fail and fall through to a restore that then
+        # applied with stale form state → empty slots.
+        self._log("form state expired (302) before apply — re-warming steps 2-6 (via browser)")
+        _rewarm_client = self._browser_sess or self.client
         try:
             info = await _run_steps_2_to_6(
-                self.client, self.posto_id, self.account,
+                _rewarm_client, self.posto_id, self.account,
                 self.nat, self.res, self._executor)
             if info.get("posto_pdf"):
                 self.posto_pdf = info["posto_pdf"]
